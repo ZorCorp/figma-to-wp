@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver to release, e.g. 0.1.1 (no leading v)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (default branch, full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release
+        env:
+          # Pass the input through the environment, never interpolate ${{ }} into
+          # the script body — that would be a shell-injection surface.
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # 1. validate semver x.y.z
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::version '$VERSION' is not semver x.y.z (no leading v)"; exit 1
+          fi
+
+          f=.claude-plugin/plugin.json
+          if [[ ! -f "$f" ]]; then
+            echo "::error::$f not found — not a Claude Code plugin repo?"; exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 2. bump plugin.json (idempotent — no-op if already at VERSION)
+          tmp="$(mktemp)"
+          jq --arg v "$VERSION" '.version=$v' "$f" > "$tmp" && mv "$tmp" "$f"
+          if git diff --quiet -- "$f"; then
+            echo "plugin.json already declares $VERSION — no bump needed"
+          else
+            git add "$f"
+            git commit -m "chore: release v$VERSION"
+          fi
+
+          # 3. tag AT the (bumped) tip so checkout of the tag yields the right version
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::tag v$VERSION already exists — pick a new version"; exit 1
+          fi
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+
+          # 4. push branch + tag (default branch; works for main or master)
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+          git push origin "v$VERSION"
+
+          echo "::notice::Released v$VERSION — the zorskill drift Action will carry it into the marketplace shortly."

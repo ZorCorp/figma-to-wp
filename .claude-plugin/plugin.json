@@ -1,0 +1,9 @@
+{
+  "name": "figma-to-wp",
+  "description": "Turn a Figma design into a page on masterconcept.ai. Pulls the frame's render, its copy verbatim, its colour and type tokens, its box geometry and its images; you write the HTML against those numbers; verify checks every string survived and the site's hard rules hold, diff screenshots the result and compares it to the render band by band; push uploads the media and creates the page as a draft with the right slug and permalink. Runs on your own Mac through a local terminal — the Desktop Commander connector in Cowork, the Bash tool in Claude Code.",
+  "version": "0.3.0",
+  "author": {
+    "name": "ZorCorp",
+    "url": "https://github.com/ZorCorp"
+  }
+}
