@@ -3,6 +3,16 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [0.3.1]
+
+- Move the skill to `skills/figma-to-wp/`. It lived at the repo root, which
+  Claude Code tolerates but Cowork does not: Cowork indexes only `skills/`, so
+  it reported "This plugin doesn't have any skills or agents" and the skill was
+  unusable there.
+- The CLI locator follows the move — `plugin.json` now sits two levels above the
+  script, and `-maxdepth` had to grow because Cowork nests a plugin under two
+  session UUIDs, which put the script one level past the old limit.
+
 ## [0.3.0]
 
 - Runs on the user's own Mac through a local terminal — the Desktop Commander

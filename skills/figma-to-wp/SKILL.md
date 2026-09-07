@@ -58,10 +58,16 @@ FW=$(find "$HOME/Library/Application Support/Claude/local-agent-mode-sessions" \
           "$HOME/.claude/plugins/cache/zorskill/figma-to-wp" \
           "$HOME/.claude/skills/figma-to-wp" \
           ".claude/skills/figma-to-wp" \
-          -maxdepth 6 -path '*/scripts/figma_to_wp.py' 2>/dev/null | while IFS= read -r s; do
+          -maxdepth 8 -path '*/scripts/figma_to_wp.py' 2>/dev/null | while IFS= read -r s; do
   d=${s%scripts/figma_to_wp.py}
-  v=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
-        "${d}.claude-plugin/plugin.json" 2>/dev/null | head -1)
+  v=
+  # In a plugin the script sits at <root>/skills/figma-to-wp/scripts/, so
+  # plugin.json is two levels up; a bare personal skill has none and scores 0.0.0.
+  for j in "${d}../../.claude-plugin/plugin.json" "${d}.claude-plugin/plugin.json"; do
+    [ -f "$j" ] || continue
+    v=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$j" | head -1)
+    [ -n "$v" ] && break
+  done
   printf '%s\t%s\n' "${v:-0.0.0}" "$s"
 done | sort -V | tail -1 | cut -f2)
 [ -n "$FW" ] || { echo "figma-to-wp CLI not found on this Mac" >&2; exit 1; }
@@ -70,7 +76,8 @@ python3 "$FW" doctor
 
 The first path is where an org-managed plugin lands (Claude Desktop and Cowork);
 the second is Claude Code's; the last two are a personal install and a checkout
-you are developing in.
+you are developing in. Cowork nests a plugin under two session UUIDs, which is
+why `-maxdepth` has to be this generous.
 
 `find` is used rather than a shell glob on purpose. Under `zsh` — Desktop
 Commander's default shell — a glob that matches nothing aborts the whole loop,
