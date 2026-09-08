@@ -181,6 +181,15 @@ def walk_visible(node, fn):
         walk_visible(c, fn)
 
 
+def file_version(key, tok):
+    """The file's newest version id, or None if Figma will not say."""
+    try:
+        v = figma_get(f"/v1/files/{key}/versions", tok).get("versions") or []
+        return v[0].get("id") if v else None
+    except SystemExit:
+        return None
+
+
 def load_frame(url, tok):
     key, node = parse_url(url)
     if not node:
@@ -189,14 +198,35 @@ def load_frame(url, tok):
     cache_dir = os.path.join(HOME, "cache")
     os.makedirs(cache_dir, exist_ok=True)
     cache = os.path.join(cache_dir, f"{key}-{node.replace(':', '_')}.json")
+
+    # The cache used to be keyed on nothing but existence, while the render is
+    # always fetched live — so the numbers could describe one version of the
+    # file and design.png show another, and every check downstream would agree
+    # with itself and be wrong. Observed: a cache three hours old still holding
+    # 70 strings and 188 boxes belonging to a different page that had since
+    # been deleted from the same canvas.
+    current = file_version(key, tok)
+    data = None
     if os.path.exists(cache):
         with open(cache) as fh:
             data = json.load(fh)
-        print("cache     reusing the node response", file=sys.stderr)
-    else:
+        cached = data.get("_fw_file_version")
+        if current is None:
+            print(f"cache     reusing the node response — could not reach "
+                  f"/versions, so this may be out of date", file=sys.stderr)
+        elif cached != current:
+            print(f"cache     stale ({cached or 'unversioned'} -> {current}), "
+                  f"refetching", file=sys.stderr)
+            data = None
+        else:
+            print("cache     reusing the node response (file unchanged)",
+                  file=sys.stderr)
+    if data is None:
         data = figma_get(f"/v1/files/{key}/nodes?ids={urllib.parse.quote(node)}", tok)
+        data["_fw_file_version"] = current
         with open(cache, "w") as fh:
             json.dump(data, fh)
+
     entry = (data.get("nodes") or {}).get(node)
     if not entry:
         die("NODE_NOT_FOUND", f"{node} is not in file {key}")
@@ -1434,7 +1464,46 @@ def cmd_setup(args):
 
 
 def cmd_doctor(args):
+    """Credentials AND the local pieces the method depends on.
+
+    Checking only the two APIs is what let a machine with no Pillow report
+    three green lines and then hand back an uncropped canvas as the design
+    reference, silently. Everything below either works or is named.
+    """
     ok = True
+
+    def line(label, value, fatal=True, hint=""):
+        nonlocal ok
+        if value:
+            print(f"{label:<11} ok  ({value})")
+        else:
+            ok = ok and not fatal
+            print(f"{label:<11} {'MISSING' if fatal else 'absent'}  {hint}",
+                  file=sys.stderr)
+
+    # Local first: it costs nothing and a failure here explains the rest.
+    v = sys.version_info
+    line("python", f"{v.major}.{v.minor}.{v.micro}" if v >= (3, 9) else "",
+         hint=f"3.9+ required, this is {v.major}.{v.minor}")
+    try:
+        import PIL
+        pillow = PIL.__version__
+    except ImportError:
+        pillow = ""
+    # Not optional in practice: extract crops the canvas render with it, and
+    # without it design.png is the whole canvas — wrong, and it does not say so
+    # loudly enough to stop anyone building against it.
+    line("pillow", pillow, hint="pip3 install Pillow — extract cannot crop the "
+                               "canvas render and diff cannot run without it")
+    chrome = next((c for c in CHROME if os.path.exists(c)), None)
+    line("chrome", os.path.basename(chrome) if chrome else "",
+         hint="install Chrome or Chromium — diff has no other way to render "
+              "the page")
+    line("cwebp", "yes" if have("cwebp") else "", fatal=False,
+         hint="(optional: Pillow already covers WebP)")
+    line("poppler", "yes" if have("pdftotext") else "", fatal=False,
+         hint="(optional: only needed to import from a PDF export)")
+
     for label, fn in (
         ("figma", lambda: figma_get("/v1/me", env("FIGMA_TOKEN")).get("handle")),
         ("wordpress", lambda: wp("GET", "/wp-json/wp/v2/users/me?context=edit").get("name")),
@@ -1493,10 +1562,153 @@ def resolve_parent(path, creds):
     return parent
 
 
+def wp_meta_path(out):
+    return os.path.join(out, "wp.json")
+
+
+def read_wp_meta(out):
+    p = wp_meta_path(out)
+    return json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+
+
+def write_wp_meta(out, meta):
+    with open(wp_meta_path(out), "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=1)
+
+
+def find_page(target, creds):
+    """Resolve what a person actually typed to one page.
+
+    Nobody remembers a post id; they read a title off the Pages list. But the
+    REST `search` matches post CONTENT too and does not rank by title, so
+    searching "Asana" returns the Superhuman page first — quietly editing the
+    wrong page is the worst outcome this tool has. Titles are therefore matched
+    against post_title only, and anything ambiguous is handed back to be
+    chosen, never guessed.
+    """
+    t = str(target).strip()
+    q = "/wp-json/wp/v2/pages?status=any&per_page=30&_fields=id,slug,title,status,link,parent,modified_gmt"
+
+    if t.isdigit():
+        one = wp("GET", f"/wp-json/wp/v2/pages/{t}?context=edit&_fields="
+                         f"id,slug,title,status,link,parent,modified_gmt", creds=creds)
+        return [one] if one.get("id") else []
+
+    slug = t
+    if t.startswith("http"):
+        slug = [p for p in urllib.parse.urlparse(t).path.split("/") if p][-1:]
+        slug = slug[0] if slug else ""
+    hits = wp("GET", q + f"&slug={urllib.parse.quote(slug)}", creds=creds) or []
+    if hits:
+        return hits
+
+    # a title: search post_title only, then keep exact matches if there are any
+    hits = wp("GET", q + f"&search={urllib.parse.quote(t)}"
+                         f"&search_columns[]=post_title", creds=creds) or []
+    exact = [h for h in hits
+             if h["title"]["rendered"].strip().lower() == t.lower()]
+    return exact or hits
+
+
+def cmd_pull(args):
+    """Bring a page that already exists in WordPress down to a build folder.
+
+    Everything else here starts at Figma, which means a page nobody has a
+    build/ for — someone else's, one edited in the admin, one from before this
+    tool — cannot be touched at all. Reconstructing one by hand from the live
+    body and a manifest is possible; it is also an hour nobody should spend
+    twice.
+    """
+    creds = wp_creds()
+    hits = find_page(args.target, creds)
+    if not hits:
+        die("NO_SUCH_PAGE", f"nothing matches {args.target!r}. Pass the post id, "
+                            f"the URL, the slug, or the exact title.")
+    if len(hits) > 1:
+        print(f"{args.target!r} matches {len(hits)} pages — say which:",
+              file=sys.stderr)
+        for i, h in enumerate(hits, 1):
+            print(f"  {i}  #{h['id']:<7} {h['status']:<8} "
+                  f"{h['title']['rendered'][:44]:<46} /{h['slug']}  "
+                  f"edited {h['modified_gmt'][:10]}", file=sys.stderr)
+        die("AMBIGUOUS", "re-run with the post id.")
+
+    page = wp("GET", f"/wp-json/wp/v2/pages/{hits[0]['id']}?context=edit", creds=creds)
+    body = page["content"]["raw"]
+    slug = args.slug or page["slug"]
+    out = os.path.join(BUILD, slug)
+    os.makedirs(os.path.join(out, "assets"), exist_ok=True)
+
+    print(f"page      #{page['id']} {page['title']['raw'][:44]!r} "
+          f"({page['status']})")
+    print(f"body      {len(body)} bytes from WordPress")
+
+    # Elementor keeps its layout in post meta, not in the body, so what comes
+    # back is a handful of shortcodes that cannot be edited here. Say so rather
+    # than writing a build folder that looks usable and is not.
+    if re.search(r"\[/?elementor", body) or (len(body) < 400 and "[" in body):
+        print("page      this looks like an Elementor page — its layout is not "
+              "in the body, so there is nothing here to edit. Stopping.",
+              file=sys.stderr)
+        die("ELEMENTOR_PAGE", "pull only works on pages whose HTML is the body.")
+
+    styles = re.findall(r"<style[^>]*>.*?</style>", body, re.S)
+    css = "\n\n".join(re.sub(r"</?style[^>]*>", "", x).strip() for x in styles)
+    for x in styles:
+        body = body.replace(x, "{{styles}}" if x is styles[0] else "", 1)
+    if styles:
+        with open(os.path.join(out, "page.css"), "w", encoding="utf-8") as fh:
+            fh.write(css + "\n")
+        print(f"page.css  {len(css)} bytes from {len(styles)} <style> block(s)")
+
+    # Point the markup back at local files and record the mapping, so the next
+    # push reuses the media already in the library instead of uploading it all
+    # again under -1, -2, -3 names.
+    manifest = read_manifest(out)
+    urls = sorted(set(re.findall(r'(?:src|poster)="(' + re.escape(creds[0])
+                                 + r'/wp-content/uploads/[^"]+)"', body)))
+    for u in urls:
+        name = u.rsplit("/", 1)[-1]
+        rel = "assets/" + re.sub(rf"^{re.escape(slug)}-", "", name)
+        local = os.path.join(out, rel)
+        if not os.path.exists(local):
+            download(u, local)
+        manifest[rel] = {"id": manifest.get(rel, {}).get("id"), "url": u,
+                         "sha": hashlib.sha256(open(local, "rb").read()).hexdigest()}
+        body = body.replace(f'"{u}"', f'"{rel}"')
+    if urls:
+        with open(os.path.join(out, "manifest.json"), "w") as fh:
+            json.dump(manifest, fh, indent=1)
+        print(f"assets    {len(urls)} downloaded and rewritten to relative paths")
+
+    with open(os.path.join(out, "page.html"), "w", encoding="utf-8") as fh:
+        fh.write(body if body.endswith("\n") else body + "\n")
+    print(f"page.html {len(body)} bytes")
+
+    write_wp_meta(out, {"post_id": page["id"], "slug": page["slug"],
+                        "title": page["title"]["raw"], "parent": page.get("parent"),
+                        "link": page["link"], "status": page["status"],
+                        "modified_gmt": page["modified_gmt"],
+                        "pulled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                   time.gmtime())})
+    print(f"wp.json   #{page['id']}, edited {page['modified_gmt']} — push will "
+          f"use this, and refuse if WordPress moves ahead of it")
+    print(f"\nbuild/{slug}/ is ready. This is the page as WordPress serves it, "
+          f"not the original source: shortcodes are raw, asset names come from "
+          f"the media library.")
+
+
+def read_manifest(out):
+    p = os.path.join(out, "manifest.json")
+    return json.load(open(p)) if os.path.exists(p) else {}
+
+
 def cmd_push(args):
     # The build directory name and the page's URL slug are different things:
     # you want to try a design at a throwaway URL before it takes the real one.
-    page_slug = args.page_slug or args.slug
+    # For a page that already exists the build name must NOT decide the slug:
+    # pulling a page into build/anything and pushing it back renamed a live
+    # URL to "anything" and 404'd the real one. Only --page-slug may rename.
     out = os.path.join(BUILD, args.slug)
     creds = wp_creds()
     parent_id = args.parent
@@ -1505,8 +1717,43 @@ def cmd_push(args):
         print(f"parent    {args.parent_path} -> #{parent_id}")
     html = assemble(out)
 
+    # Check the page has not moved on BEFORE uploading anything. Finding out
+    # afterwards leaves new attachments in the media library that this run
+    # will never reference and nobody will ever clean up.
+    meta = read_wp_meta(out)
+    post_id = args.post_id or meta.get("post_id")
+    if post_id:
+        if not args.post_id:
+            print(f"page      #{post_id} from wp.json")
+        cur = wp("GET", f"/wp-json/wp/v2/pages/{post_id}?context=edit", creds=creds)
+
+        # Renaming a published page breaks every link to it and leaves no
+        # redirect behind. Never do it as a side effect of a folder name.
+        if args.page_slug and args.page_slug != cur.get("slug") \
+                and cur.get("status") == "publish" and not args.force:
+            die("WOULD_RENAME_LIVE_PAGE",
+                f"#{post_id} is published at /{cur.get('slug')}/ and "
+                f"--page-slug would move it to /{args.page_slug}/. Every "
+                f"existing link would 404 and no redirect is created. Pass "
+                f"--force if that is genuinely what you want.")
+
+        seen, now = meta.get("modified_gmt"), cur.get("modified_gmt")
+        if seen and now and now != seen and not args.force:
+            die("PAGE_MOVED_ON",
+                f"#{post_id} was edited in WordPress after this build last "
+                f"touched it:\n"
+                f"    this build knows   {seen}\n"
+                f"    WordPress now says {now}\n"
+                f"  Pull it again to see what changed, or pass --force to "
+                f"overwrite it. The old body is only recoverable from "
+                f"build/<slug>/backups/ — site revisions are off.")
+
+    # Now that the page is known, the slug follows it — not the folder.
+    page_slug = args.page_slug or (cur.get("slug") if post_id else None) \
+        or args.slug
+
     man_path = os.path.join(out, "manifest.json")
-    manifest = json.load(open(man_path)) if os.path.exists(man_path) else {}
+    manifest = read_manifest(out)
     new = 0
     for rel in sorted(set(re.findall(r'(?:src|poster)="(assets/[^"]+)"', html))):
         local = os.path.join(out, rel)
@@ -1540,10 +1787,10 @@ def cmd_push(args):
     for rel, rec in manifest.items():
         html = html.replace(f'"{rel}"', f'"{rec["url"]}"')
 
-    post_id = args.post_id
     if post_id:
         # Revisions are off site-wide. Keep the old body before overwriting it.
-        cur = wp("GET", f"/wp-json/wp/v2/pages/{post_id}?context=edit", creds=creds)
+
+
         bdir = os.path.join(out, "backups")
         os.makedirs(bdir, exist_ok=True)
         stamp = re.sub(r"\D", "", str(cur.get("modified_gmt") or "prev"))
@@ -1566,6 +1813,16 @@ def cmd_push(args):
 
     ability("mc/set-post-html", {"post_id": int(post_id), "content": html}, creds=creds)
     print(f"body      set via mc/set-post-html ({len(html)} bytes)")
+    after = wp("GET", f"/wp-json/wp/v2/pages/{post_id}"
+                      f"?context=edit&_fields=id,slug,title,status,link,parent,modified_gmt",
+               creds=creds)
+    write_wp_meta(out, {**meta, "post_id": after["id"], "slug": after["slug"],
+                        "title": (after["title"] or {}).get("raw", ""),
+                        "parent": after.get("parent"), "link": after["link"],
+                        "status": after["status"],
+                        "modified_gmt": after["modified_gmt"],
+                        "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                   time.gmtime())})
 
     # page.js rides in post meta and is printed from wp_footer by the plugin —
     # post_content would corrupt it. Always write the key, so removing the file
@@ -1615,6 +1872,12 @@ def main():
                                   "the build's design.png")
     df.set_defaults(fn=cmd_diff)
 
+    pl = sub.add_parser("pull", help="bring a page that already exists in "
+                                     "WordPress down to a build folder")
+    pl.add_argument("target", help="post id, URL, slug, or exact title")
+    pl.add_argument("--slug", help="build folder name (default: the page slug)")
+    pl.set_defaults(fn=cmd_pull)
+
     pv = sub.add_parser("preview")
     pv.add_argument("slug")
     pv.add_argument("--port", type=int, default=8731)
@@ -1632,6 +1895,9 @@ def main():
     u.add_argument("--page-slug", help="the page's URL slug (default: the build slug)")
     u.add_argument("--post-id", type=int, help="update this page instead of creating one")
     u.add_argument("--language", default="en", choices=["en", "zh-hant", "zh-hans"])
+    u.add_argument("--force", action="store_true",
+                   help="push even though WordPress has moved on since this "
+                        "build last touched the page")
     u.add_argument("--no-webp", action="store_true",
                    help="upload PNG/JPEG as-is instead of converting to WebP")
     u.set_defaults(fn=cmd_push)

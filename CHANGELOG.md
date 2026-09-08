@@ -3,6 +3,29 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [0.4.0]
+
+- `pull` brings a page that already exists in WordPress down to a build folder,
+  so a page nobody has a `build/` for — someone else's, one edited in the admin,
+  one from before this tool — can be edited at all. Takes a post id, a URL, a
+  slug or a title; titles match post titles only, because the REST `search` also
+  matches post content and does not rank by title. Round-trip verified
+  byte-identical on a 37KB page.
+- `push` refuses two things it used to do silently. It stops when WordPress has
+  moved ahead of the build, before uploading anything, because site revisions
+  are off and an overwrite is unrecoverable. And the build folder name no longer
+  decides the URL of an existing page: pushing `build/pulltest` back to a live
+  page renamed it to `/pulltest/` and 404'd the real URL.
+- `push` reads the page from `wp.json`, so `--post-id` is no longer needed after
+  a `pull`.
+- The Figma node cache is keyed to the file's version. It had no expiry of any
+  kind while the render was always fetched live, so the numbers could describe
+  one version of a design and `design.png` show another — with every check
+  downstream agreeing with itself and being wrong.
+- `doctor` checks python, Pillow, Chrome, cwebp and poppler as well as the two
+  APIs. Pillow and Chrome read as optional and are not: `extract` crops the
+  canvas render with Pillow, and `diff` cannot render a page without Chrome.
+
 ## [0.3.1]
 
 - Move the skill to `skills/figma-to-wp/`. It lived at the repo root, which

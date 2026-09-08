@@ -123,17 +123,27 @@ publishes looking right but sitting dead, and that reads as a broken build.
 
 ## Prerequisites
 
-- **A Mac that is switched on.** In Cowork it also needs Claude Desktop with the
-  **Desktop Commander** connector installed and connected; that is the only thing
-  the user installs by hand. In Claude Code the Bash tool already is the terminal.
-- **A Figma personal access token** with file read scope, and a **WordPress
-  application password** for an account that can edit pages. `setup` writes both
-  to `~/.figma-wp/.env` at mode 600. Ask for the WordPress username — never guess
-  it; a wrong one fails as an auth error that looks like a server problem.
-- **Python 3.9+.** The script is stdlib only.
-- **Chrome or Chromium, and Pillow**, for `diff` alone. Everything else runs
-  without them; `diff` says so if they are missing.
-- **poppler** (`pdftotext`, `pdftoppm`) only if you import from a PDF export.
+Run `doctor` first. It checks all of this and names whatever is missing:
+
+```
+python      ok  (3.14.3)      3.9+; the script is stdlib only
+pillow      ok  (12.2.0)      pip3 install Pillow
+chrome      ok  (Google Chrome)
+cwebp       ok  (yes)         optional — Pillow already covers WebP
+poppler     ok  (yes)         optional — only to import from a PDF export
+figma       ok  (…)           token in ~/.figma-wp/.env
+wordpress   ok  (…)           application password, and the username — ask, never guess
+abilities   ok  (50)          WP Buddy reachable
+```
+
+Pillow and Chrome read as optional and are not. `extract` crops the canvas
+render with Pillow; without it `design.png` is the whole canvas, which is the
+wrong picture to build against and does not announce itself. `diff` has no way
+to render a page without Chrome, and `diff` is not optional either.
+
+In Cowork the Mac also needs Claude Desktop with the **Desktop Commander**
+connector connected — the only thing anyone installs by hand. In Claude Code
+the Bash tool already is the terminal.
 ## 1. Extract
 
 Two inputs work, and **the export folder is the better one**.
@@ -168,6 +178,13 @@ the copy as real selectable text, so the strings are exact without an API call.
 ```bash
 python3 "$FW" extract "<figma-frame-url>" --slug <slug>
 ```
+
+The node response is cached under `~/.figma-wp/cache/`, keyed to the file's
+version. A cache written before someone edited the file is refetched, not
+reused — the render is always fetched live, so a stale cache would describe one
+version of the design while `design.png` showed another, and every check
+downstream would agree with itself and be wrong. If Figma will not answer
+`/versions` (rate limit, no network) the cache is used and says so.
 
 The URL must point at a **frame** — `?node-id=0-1` is the canvas. This is the
 only path that recovers the shared **style tokens** (named colours, type scale),
@@ -343,6 +360,47 @@ Bands the diff cannot settle, and should not be chased:
 
 `diff` needs Chrome or Chromium installed, and Pillow. It is a development
 check, not part of `push`.
+
+## Editing a page that already exists
+
+```bash
+python3 "$FW" pull "Superhuman"        # or the post id, the URL, or the slug
+```
+
+Everything above starts at Figma, which leaves a page nobody has a `build/`
+for — someone else's, one edited in the admin, one from before this tool —
+untouchable. `pull` brings it down: the `<style>` block becomes `page.css`,
+the body becomes `page.html` with `{{styles}}` where the CSS was, the media
+comes down to `assets/` with a `manifest.json` so the next push reuses it, and
+`wp.json` records the page so `push` needs no `--post-id`.
+
+A title is matched against post titles only. The REST `search` also matches
+post *content* and does not rank by title, so searching "Asana" returns the
+Superhuman page first; anything ambiguous is listed for you to choose, never
+guessed.
+
+What comes back is the page as WordPress serves it, not the original source:
+shortcodes are raw, asset names come from the media library. It is enough to
+edit and push back — verified byte-identical on a 37KB page — but it is not
+the file someone originally wrote.
+
+An Elementor page keeps its layout in post meta, not the body. `pull` says so
+and stops rather than writing a build folder that looks usable and is not.
+
+Without a `design.json` there is no copy to check and no render to diff
+against, so `verify` and `diff` have much less to say. That is the trade for
+being able to touch a page at all.
+
+### Two things push now refuses
+
+- **The page moved on.** `wp.json` records `modified_gmt`; if WordPress is
+  ahead of it, push stops before uploading anything. Site revisions are off,
+  so an overwrite is unrecoverable except from `build/<slug>/backups/`.
+- **A rename.** The build folder name no longer decides the URL of a page that
+  already exists — only an explicit `--page-slug` does, and on a published page
+  even that is refused without `--force`. Pulling a page into
+  `build/anything` and pushing it back used to rename the live URL to
+  `/anything/` and 404 the real one.
 
 ## 4. Push
 
