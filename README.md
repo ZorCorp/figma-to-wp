@@ -4,11 +4,18 @@ Turn a Figma design into a page on masterconcept.ai.
 
 The script fetches; it never guesses layout. It pulls the frame's render, its
 copy verbatim, every box's geometry and its images out of Figma. You write the
-HTML against those numbers. Then three checks that answer different questions:
-`verify` reads the strings, `diff` reads the pixels, and the side-by-side it
-writes is there for you to read yourself.
+HTML against those numbers, one section at a time. Then four checks that answer
+different questions: `verify` reads the strings, `audit` names which element is
+wrong and by how much, `diff` reads the pixels and scores each section against
+the render, and `mobile` runs the phone checks the frame cannot answer. The
+side-by-side and the overlay it writes are there for you to read yourself —
+every section, every time. A number cannot see a container.
 
-    extract → author → verify → diff → push
+    extract → author → verify → preview → audit → diff → mobile → push
+
+`pull` brings a page that already exists in WordPress down into a build folder,
+so an update starts from what is live rather than from scratch. `doctor` checks
+the machine before any of it.
 
 ## Where it runs
 

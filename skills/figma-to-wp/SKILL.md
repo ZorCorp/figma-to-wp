@@ -8,16 +8,21 @@ allowed-tools:
   - Write(*)
   - Edit(*)
 metadata:
-  version: "0.3.0"
+  version: "0.6.0"
 ---
 
 # figma-to-wp
 
 ```
 extract   figma frame  ->  design.png · design.json · assets/
-author    you look at design.png and write page.html
-verify    every string present, site rules respected
+          re-run on a changed file and it prints what moved
+plan      you look at design.png and write down the bands
+author    one section at a time, top to bottom — never the whole page at once
+verify    every string present, site rules respected (--section while building)
 preview   render it, compare against design.png, fix, repeat
+diff      overlay match, per band and per section, with a 90% gate
+audit     which element is wrong, by how much, and has a section drifted
+mobile    the phone checks the frame cannot answer — after desktop is confirmed
 push      media -> draft page -> permalink
 ```
 
@@ -201,7 +206,21 @@ reads for a long while. The node response is cached in `~/.figma-wp/cache/`.
 |---|---|
 | `design.png` | the frame at 1×. **This is the spec.** |
 | `design.json` | `texts` (verbatim, with `case` and `runs` — one text node can hold several type styles), `tokens` (colour + type + effects), `frames` (**every box's x/y/w/h, padding, gap, radius, fills**), `comments`, `assets` |
+| `design.prev.json` | the previous pull, kept whenever `extract` overwrites one |
 | `assets/` | `a*.png` images, `i*.svg` icons |
+
+Re-running `extract` on a file the designer has changed prints what moved:
+strings added, strings gone, boxes added, boxes gone, and anything that kept its
+text but changed position. Read that list before you touch the page — it is the
+implementation brief. A redesign of one section came back as three lines: five
+labels added at x95, the rail's nine nodes deleted, the text column moved from
+x141 to x179.
+
+**A deletion is the change to watch.** Figma is absolutely positioned, so
+removing a node leaves the hole open and nothing below it moves. The same edit
+in HTML collapses everything below by the height of what you removed — 74px, in
+that case — and `verify` cannot see it because the copy still matches. Check the
+`drift` column in `audit` afterwards.
 
 You write three more:
 
@@ -224,6 +243,26 @@ belongs in `wpbuddy-page.js`** — `page.js` is for the genuinely page-specific.
 
 For PDF import: poppler (`pdftotext`, `pdftoppm`) or `pypdf`. Without either,
 the command says so instead of guessing.
+
+## The one hard rule
+
+**The design file is the authority on what the page says.** Copy comes from
+`design.json` → `texts`, verbatim. Not retyped off the render, not improved,
+not written to fill a gap.
+
+When the file is wrong — and it is, often; frames get repurposed and the old
+page's words stay behind — that is a finding to report, not a hole to patch.
+An Asana page shipped with a hero headline and lede that appear nowhere in its
+Figma file, written because the file's own hero still said Superhuman. The
+words read well. Nobody could say who approved them, or check them against the
+partner's guidelines, because they had no source.
+
+`verify` catches this: a string in the file that is not on the page is a FAIL,
+and `push` now refuses to run while any check fails. Copy that is genuinely
+meant to be left out — the site header the frame draws, a block parked outside
+the frame from another page — goes in `build/<slug>/dropped.json` with the
+reason, which is reviewable. `--force` pushes past the checks and leaves no
+record that it did.
 
 ## 2. Read the comments, then author `build/<slug>/page.html`
 
@@ -251,6 +290,114 @@ it are the design's own coordinates.
 Then write the HTML, taking every string from `design.json` — never retype copy
 off the render, especially Chinese, where a substituted character is invisible
 in review and wrong on the live site.
+
+### One section at a time, top to bottom
+
+**Do not build the whole page and then fix it.** Build the first section, get it
+past its gate, freeze it, and only then start the second. The order is forced:
+a section's vertical position depends on every section above it, so section 3
+cannot be checked until 1 and 2 are settled.
+
+The reason is not tidiness. On a page built all at once, every correct fix to a
+section's height moves everything below it, and the whole-page score *falls*:
+
+```
+80.8 -> 78.5   after the case cards were given the frame's own 200px body box
+73.5 -> 69.4   after the FAQ band was restored to the frame's 602px
+87.3 -> 79.9   after the pricing block was given its real 120px top gap
+```
+
+Three correct, sourced fixes, all punished by the number. Anyone following the
+number would have reverted all three. Section by section, a section is compared
+against its own crop and nothing below it can contaminate the reading.
+
+It also means each error is solved once. A gutter that put every block 28px
+right was diagnosed at the very end of one build, and had to be separated from
+five other faults first; caught in section 1, it is one line and never recurs.
+
+```bash
+# while building section k
+python3 "$FW" verify <slug> --section <name>      # only this band's copy
+python3 "$FW" verify <slug> --through <name>      # ...and everything above it
+python3 "$FW" audit  <slug> --url … --section <name>
+python3 "$FW" diff   <slug> --url … --section <name>
+```
+
+`diff --section` crops **both** sides from the same landmark — the section's
+first string — and runs both for the same distance, then prints a gate:
+
+```
+gate      np-pricing passes at 91.3% — freeze it and start the next section down
+```
+
+**A section built to the frame scores 93 or better.** Calibrated against a page
+that was built this way, reviewed band by band and shipped: its six sections
+score 83.6 / 89.9 / 91.7 / 93.8 / 94.1 / 94.8, median 93. The 83.6 was a
+full-height gradient band, where two rasterisers dither differently — that is
+the floor, and it needs a line in `accepted.json` saying so.
+
+**Do not aim for 95.** No section of that shipped page reaches it. The residue
+is glyph rasterisation, a 3px left side bearing that Figma and Chrome disagree
+on, recompressed images and gradient dither. A 95 gate fails a page that is
+right, and a gate that fails everything is a gate nobody reads.
+
+### The number cannot see a container
+
+`match` is a pixel measure. A card 13px too tall moves it by a fraction of a
+point, so a section can gate in the low 90s with three cards the wrong height.
+That happened here: every text run in the pricing section measured within 4px
+while the middle card was short by the height of its own bottom padding, and
+nothing said so.
+
+So the gate also counts what `audit` found in the boxes, and `audit` now reports
+**frames the page has nothing for**. It used to pair a page box to a frame on
+geometry and drop anything too far out — which meant the worse a box was, the
+less likely it was to appear in the report at all. The reverse list is where a
+missing divider, or a container that shrank to its content, actually shows up:
+
+```
+y=3288  'Service Box 25'  372x620  nearest .np-case
+    height 633 vs 620
+```
+
+### Open the overlay. Every section, every time.
+
+Not when the numbers stall — **always, before you call a section done.** On this
+page the score said 90.2 and the overlay showed a trial button at the wrong size
+and a missing rule; it said 92.1 and the overlay showed the middle card ending
+48px above its neighbours. Both times the number was comfortable and the picture
+was not, and both times the picture was right.
+
+```bash
+python3 "$FW" diff <slug> --url … --section <name>   # writes diff/overlay.png
+```
+
+Before you read anything off it, read the one line above the band table:
+
+```
+register  design.png and the page agree sideways to the pixel
+```
+
+If instead it says `REFERENCE_OFF_BY: the whole page fits design.png best -3px
+across`, stop. A shift that is the same in every band is not a layout mistake,
+it is the reference being out of register, and `audit`'s `origin` line settles
+which side is wrong: `audit` reads design.json, `diff` reads design.png, and
+when the two disagree the picture is the one that moved. This exact fault ran
+for a whole page — a canvas render cropped from the children's layout boxes
+while Figma renders from their *rendered* bounds, so one parked card's shadow
+pushed the crop 3px — and it produced three confident "fixes" that each moved
+the page 3px further from the frame while the overlay looked like it agreed.
+Every number in design.json was right the whole time.
+
+Read the colour against the background every time, because it flips: red is
+whichever side holds the *darker* pixel. Dark text on white — red is the page.
+Light text on a dark band — red is the design. Getting this backwards has
+happened three times in one build.
+
+Both crops used to start from different landmarks and run different lengths —
+the design's text span against the page's box height. That fed 602px of design
+to 1052px of page and scored a correct section at 14%. If you are reading old
+notes that say section scores are meaningless, that is why.
 
 Take numbers from `design.json` too, not from the eye: `tokens.text[*].ls` is
 the real letter-spacing, `tokens.effect` the real shadow including its spread.
@@ -289,6 +436,48 @@ was copied from, too. Record every deliberate omission in
 `verify` fails, which is the point: an omission should be a decision someone can
 review, not silent loss.
 
+## Audit before you look
+
+```bash
+python3 "$FW" audit <slug> --url http://127.0.0.1:8731/preview.html
+```
+
+`verify` reads the strings and `diff` reads the pixels; neither says *what* is
+wrong. `audit` reads the rendered page back out of the browser — every run of
+text with its box and its computed type — and compares it to `design.json`
+string by string. It reports a list you have to answer for rather than a score
+you can rationalise:
+
+```
+  24 ×  .(no class)          weight   400 vs 500
+   4 ×  .asana2-h2           size     60 vs 48
+   1 ×  .asana2-plan__price  size     18 vs 20
+```
+
+It also maps each `<section>` on the page to the range its own text occupies in
+the frame, and reports the two numbers separately:
+
+```
+section                   design    page   delta   strings
+  asana2-plans              1415    1109    -306        52
+  asana2-cases               309     215     -94         7
+```
+
+A section that is 306px short is a finding. Everything below it being displaced
+by 306px is not — and in a whole-page comparison the second buries the first.
+`audit --section` and `diff --section` then work on one at a time, each cut to
+its own content.
+
+**Treat its output as candidates, not verdicts.** Two of the fifty-eight it
+first reported on the Asana page were wrong: a colour read off an anti-aliased
+glyph edge, and a line-height for tab labels that have no node in the file at
+all. Check each against `design.json` before changing anything — a confident
+wrong number is worse than no number.
+
+What it cannot see: anything without text to match on. Corner radii, shadows,
+gradients, icons, image crops. That is what `diff` is for; the two are not
+alternatives.
+
 ## 3. Verify, then diff the picture
 
 ```bash
@@ -306,6 +495,41 @@ are free — the check squashes both — but an entity is not: write `’ — �
 `&rsquo; &mdash; &ndash;`. Case is not free either: a string stored `POPULAR`
 has to be `POPULAR` in the markup, `text-transform` notwithstanding, because
 the check reads the markup and the browser applies the transform after it.
+
+Whitespace is free, but a **hard break is not whitespace — it is content.** A
+`\u2028` or a newline inside a text node is the designer saying where the line
+ends, and `verify` now fails if the markup does not break there. Reproduce it
+with `<br>` or a block boundary (`<li>`, `<p>`): writing `&#8232;` into the
+HTML does nothing at all, because browsers treat U+2028 as an ordinary space
+and wrap wherever the column runs out. Both pricing notes on the Asana page
+broke in the wrong place for that reason, one with the character sitting right
+there in the source and every string check passing.
+
+**The preview runs the site's real behaviour script.** `preview` caches the
+live `wpbuddy-page.js` beside the build and serves it, so tabs, accordions and
+carousels respond in the preview exactly as they will on the site — click them
+before calling a page done. `--refresh-site` re-fetches it. If it could not be
+found the preview says so in a comment where the tag would have been, because
+a script tag pointing at nothing looks exactly like a page that has its
+behaviour.
+
+The markup is a contract with that script, and `verify` now fails when the two
+halves do not line up: a `.ptab[data-p="3"]` with no `#p-3`, a `[data-car]`
+naming an id that is not in the page, a `.mc-loop` with no `.mc-loop__track`.
+The symptom of breaking it is silence — the page renders, nothing responds —
+and it reads as a production problem when it is not. What the check cannot see
+is a control that was never declared: the Asana carousel's dots were plain
+`<span>`s with no `data-car`, so they lit up once and never moved again.
+
+**Do not draw an icon the file already exported.** `extract` writes every
+vector to `assets/i*.svg`, and `verify` warns when a shape the frame repeats
+three or more times appears nowhere in the build. Rotated borders and gradient
+crosses are approximations, and their errors are invisible to every geometry
+check because the box around them is the right size in the right place: the
+Asana checklist tick sat 3px low inside its own disc and the cross was grey
+where the file draws white, through four rounds of review. Reference the SVG,
+or inline its path as a data: URI — the warning matches on the path's shape,
+so an inlined copy at a different scale still counts as used.
 
 **`verify` passing means nothing about how the page looks.** Every one of its
 checks is a string check. A page can score 85/85 strings and 0 errors while the
@@ -332,8 +556,147 @@ out 390 when the file says 392, and padding read as 0 when the file says 17.
 Never trust the numbers alone either: they cannot tell you the icon is a plain
 circle where the design has a magnifying glass.
 
-Check a narrow viewport too (`--width 390`): the frame is desktop-only, so
-mobile is your call, not the design's.
+### How the overlay is built
+
+`diff` writes `build/<slug>/diff/overlay.png`: the design in the red channel,
+the page in green and blue. Anything that lines up goes grey; anything that does
+not leaves a coloured ghost whose width is the error. Open it for **every**
+section before calling that section done — see *Open the overlay* above; waiting
+until the numbers stall is too late, because a comfortable number is exactly
+when a container the wrong size hides.
+
+**Read the colour against the background, not off the legend.** Red means *the
+darker pixel is only on one side*. For dark text on white, red is the page and
+cyan the design. For a light element on a dark ground it is the other way round.
+Getting this backwards and reporting a fix in the wrong direction has happened
+twice; decide which case the band is before you say which side is late.
+
+### Loop on `match`, and know what it can never reach
+
+`diff` prints one convergence number and a per-band breakdown:
+
+```
+match     90.9% of the overlay agrees; band median 93.9% over 20 bands
+          bands more than 15 points under this page's own median:
+            y1911-2184  74.4%  (-19.5%)   accepted: Go product switcher …
+```
+
+**Do not chase 99%.** A page built section by section to `dx +0, dy ±2`,
+reviewed band by band and shipped, scores **90.9% whole-sheet and 93.9% at the
+median band**. The missing ten points are two different rasterisers disagreeing
+on every glyph edge, a recompressed WebP where the frame has Figma's own render,
+gradients dithering differently, anti-aliasing on every corner, and a frame
+taller than the page. If you ever see 99%, you are comparing something to
+itself — a stale `live.png`, or the design against the design.
+
+Read it **relative**. What carries signal is a band far below *this page's own*
+median: 40 points down is not anti-aliasing, it is a box the wrong width or a
+row that lost a card. On one page a band at 45.7% turned out to be a heading
+whose box was 900px where the frame says 1051 — so it wrapped to three lines
+instead of two — and a carousel showing three cards where the design shows four.
+`verify` was 140/140, `audit` found nothing there, and a side-by-side at page
+scale looked fine. Only the band number pointed at it.
+
+**Targets for a first delivery:** every section gated at 93 with no box
+findings, whole-sheet `match` in the low 90s, and **zero unexplained bands**. That last one is the
+real gate — a percentage lets you round "I do not know why" up to "close
+enough", and that is where this goes wrong.
+
+Bands that genuinely cannot converge go in `build/<slug>/accepted.json`, keyed
+by any y inside the band, with the reason:
+
+```json
+{
+  "2000": "Go product switcher. The frame draws one still of an auto-advancing
+           panel; the screenshot catches whichever product was up."
+}
+```
+
+`diff` labels those and stops counting them as unexplained. It is the geometry
+counterpart of `dropped.json` — a deviation someone can review rather than one
+that quietly persists.
+
+### The loop
+
+The tool measures; it cannot write CSS. So the loop is you and it, alternating:
+
+Desktop only, and **one section at a time** — see *One section at a time* above
+for why the whole-page number cannot guide this. The phone comes after the whole
+desktop converges and the user has confirmed it.
+
+```
+0  gate       is the measurement trustworthy at all?
+              fonts loaded (audit says so), preview freezing what moves,
+              design.png fresh, origin plausible. If not, stop — do not iterate
+              against a broken instrument.
+1  measure    diff --section (match + gate) · audit --section (per element)
+2  pick       the lowest unexplained band inside THIS section
+3  name       what is in it — which strings, which boxes, from design.json
+4  fix        by a sourced number only. Every change must be able to name its
+              origin: "texts[7].runs[2].lh = 24", "Frame 85725 w=354, pitch 394".
+              A change you cannot source is a guess; make it and the number can
+              improve while the page gets further from the design.
+5  re-measure and go back to 2
+6  freeze     once the section gates at 90+, do not touch it again; start the
+              next section down. Its position depends on this one being right.
+```
+
+**Stop when** every band is explained, or two consecutive rounds do not move
+`match`, or the budget is gone. A stalled loop means step 3 or 4 is wrong, not
+that you need another round: go back and read the file again.
+
+**The trap this exists to prevent** is real and has happened here. A round was
+run against a node's *base* type (20/32) when every character in it carried an
+override (18/24). The page moved further from the design, the fixer added
+compensating padding, and `drift` and `step` both improved. Sourcing each change
+is what makes that visible instead of invisible.
+
+### `audit` reports drift, and `diff` cannot
+
+`audit`'s section table carries two columns `diff` has no way to produce:
+
+- **`drift`** — how far the section's first string sits from where the frame
+  puts it. Same anchor on both sides, so it is the honest running offset.
+- **`step`** — the change in drift against the section above. Anything over a
+  few pixels means something between them changed *height*, not position.
+
+`diff` lets every band find its own best vertical fit, which is what makes its
+numbers readable and is exactly why it cannot see this: a section that starts in
+the wrong place still scores well once the band slides to meet it.
+
+### The phone — after the desktop is confirmed, not alongside it
+
+**Settle the desktop, show it to the user, get it confirmed. Then write the
+phone.** Not because it is quicker, but because every phone rule restates a
+desktop value — the line-heights above all, since each one is an absolute px
+lifted from the frame. A desktop that is still moving invalidates them as fast
+as they are written. On the page this section was written for, a hero lead went
+18/24 → 20/32 → 18/24 across two rounds; every phone override keyed to it was
+written twice for nothing.
+
+The desktop also *converges* and the phone does not: the desktop is a search
+against a reference, run with `match` and the loop above. The phone has no
+reference in Figma at all — it is a checklist against the house spec, done once.
+Interleaving a search with a checklist makes you redo the checklist every pass.
+
+`mobile` says so itself. It reads `diff/state.json` and, if the desktop has
+unexplained bands or `match` under 80%, tells you that reading the phone now is
+fine but writing it now means writing it twice.
+
+The phone layout is **not** your call — the rest of the site has one, and
+`references/site-rules.md` records it: breakpoints 768 and 1024, a 28px gutter,
+50px sections, 16px floor for body copy, and a fixed 81px site header every
+first section has to clear.
+
+```bash
+python3 "$FW" mobile <slug> --url http://127.0.0.1:8731/preview.html
+```
+
+Overflow, body copy under 16px, tap targets under 40px, content jammed against
+the edge. It renders into an **iframe** of the requested width, because headless
+Chrome will not open a window narrower than 500px — `diff --width 390` measured
+500 and every query below that breakpoint stayed shut, which is why it used to
+report a mobile layout that nobody could reproduce.
 
 Three things the reference itself can get wrong, all of which shipped here:
 

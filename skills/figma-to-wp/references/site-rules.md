@@ -117,6 +117,29 @@ The enqueued script is class-driven:
 > `acc-head` — or production is running an older copy without the behaviour you
 > used. Fetch the deployed file and grep it before assuming anything else.
 
+## The theme paints your buttons
+
+`elementor-kit-7676` — the Elementor global kit, on every page on the site —
+styles bare `<button>` elements:
+
+```css
+.elementor-kit-7676 button              { background-color:#FF9E1B }   /* the site's orange */
+.elementor-kit-7676 button:hover,
+.elementor-kit-7676 button:focus        { background-color:#12BF6D; color:#fff }   /* --mc-green */
+```
+
+The rest state loses to any two-class rule of yours, so it never shows and you
+never think about it. **The hover and focus states carry a pseudo-class, which
+outranks a plain two-class rule**, so the first time anyone clicks a control it
+turns green and stays green until focus moves. On the Asana page that was the
+carousel's next arrow, and it survived a build, a review and a push because no
+static render ever enters that state.
+
+So every `<button>` in an AI page must state its own `:hover`, `:focus`,
+`:focus-visible` and `:active` — background *and* colour. `verify` warns when
+one does not. `<a>` elements are not affected; the kit's selector is `button`,
+`input[type=button]`, `input[type=submit]` and `.elementor-button`.
+
 ## Links must be relative
 
 `/solutions/xxx/`, never `https://masterconcept.ai/solutions/xxx/`. Absolute
@@ -153,6 +176,32 @@ expire.
 - SiteGround's WAF sometimes refuses an upload before it reaches WordPress. It
   comes back as an HTML error page rather than JSON — shrink the file or convert
   it, then retry.
+- The media library **normalises what it serves**. Five product shots drawn at
+  five different sizes in Figma (563x520, 597x520, 595x425, 549x448, 598x520)
+  all came back as 1032x898. Read the shipped size off the page, not the frame.
+
+### Every image needs its box pinned in CSS
+
+SiteGround lazy-loads: until an image scrolls into view its `src` is a **1x1
+transparent GIF**. `width`/`height` attributes do not save you — a browser uses
+them only while the image is *unloaded*, and the placeholder counts as loaded —
+so `height:auto` resolves against a 1:1 ratio and reserves a **square**.
+
+This shipped three times on one page before anyone named it:
+
+| Element | Intended | Rendered |
+|---|---|---|
+| watermark SVG 318x280 | 318x280 | 318x318 |
+| hero wordmark 467x67 at `width:280` | 280x40 | 280x280 |
+| product panel image | 337x293 | 390x390, panel 454px tall and empty |
+
+Give every `<img>` an explicit `aspect-ratio` (or both `width` and `height`) in
+the page CSS. `verify` warns about any image whose box still depends on the
+file's own dimensions; `mobile` catches the ones that slipped through by
+comparing the rendered box against `naturalWidth`.
+
+An `<svg>` used as an image is worse: several report `naturalWidth` **1**
+whether or not they have loaded, so they are square from the first paint.
 
 ## URLs are governed by Permalink Manager Pro
 
@@ -189,6 +238,42 @@ visitors are served a cached copy:
 PUT /wp-json/siteground-optimizer/v1/purge-cache
 ```
 
+## The phone layout, since the frame is desktop-only
+
+No Figma frame in this file has a mobile variant. That does not make the phone
+layout a free choice — the rest of the site has one, and these numbers were
+measured off `/solutions/geospatial/` at a real 390px viewport:
+
+| | phone (<=768) | tablet (1024) | desktop |
+|---|---|---|---|
+| h1 | 28 / 36.4 | 36.9 / 47.9 | frame |
+| h2 | 24 / 31.2 | 28.7 / 37.3 | frame |
+| body | 16 / 27.2 | 16 / 27.2 | frame |
+| gutter | 28px each side | 24px | frame |
+| section padding | 50px vertical | 50px | frame |
+
+- **The breakpoints are 768 and 1024**, not 767. geospatial is already on the
+  phone scale at exactly 768.
+- **16px is the floor for body copy.** A frame that says 14 for card text or an
+  accordion answer is a desktop number; raise it. Label pills stay at 14.
+- **The site header is `position: fixed`, 81px tall**, on every page. geospatial
+  puts its `h1` at y105, and `.site-main` starts 9px above the document origin,
+  so a first section needs ~114px of top padding to land in the same place.
+- **A card is inset, a band is not.** geospatial's `.cta-band` sits at x28 w337
+  with a 15px radius and 24px of padding, and its button is content-width
+  (padding 14/34), not a fixed width. A full-bleed background band keeps its
+  edges; a card that bleeds loses its radius and stops reading as a card.
+- Every desktop line-height taken from Figma is an **absolute px value** and
+  will not scale. A 30px heading left in a 72px line box is the single worst
+  thing on a phone. Restate every one of them in the phone query.
+- A desktop rule written as `.page .section .h1` (0,3,0) outranks a phone
+  override written as `.page .h1` (0,2,0). Match the specificity or the
+  override silently does nothing — measure, do not assume.
+
+Run `mobile <slug> --url ...` for the four checks worth automating: sideways
+overflow, body copy under 16px, tap targets under 40px, and content jammed
+against the screen edge.
+
 ## Endpoint reference
 
 | Purpose | Endpoint |
@@ -205,3 +290,13 @@ Abilities available: `mc/brand-guide`, `mc/create-localized-page`,
 `mc/set-post-html`, `mc/set-terms`, plus the `ewpa/*` set.
 
 Auth is Basic with a WordPress **Application Password**.
+
+Two things about talking to this host:
+
+- The credentials file is `~/.figma-wp/.env` and the site key is
+  **`WP_BASE_URL`**. Do not `source` it from a shell — an application password
+  contains spaces and shell metacharacters, and `set -a; . .env` will execute
+  part of it. Parse it, or feed curl through `curl -K -` on stdin so the
+  password never reaches the process list.
+- The site **403s a plain `urllib` request**, including the purge endpoint. Send
+  a browser `User-Agent`, or use `curl`.
