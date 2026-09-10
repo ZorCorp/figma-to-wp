@@ -3,6 +3,21 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [0.6.2]
+
+- The plugin's own description still listed the 0.4.0 pipeline. `audit`,
+  `preview`, `mobile` and `pull` have shipped since, and none of them appeared
+  in `plugin.json`, in the marketplace entry, or in the `SKILL.md` frontmatter
+  the model reads to decide whether the skill applies at all. Named them.
+
+## [0.6.1]
+
+- Tagged, and identical to 0.6.0. The description fix meant for it was
+  committed onto a detached HEAD in the submodule checkout, so `git push
+  origin main` pushed a branch that was already current, said "Everything
+  up-to-date", and the release ran against the unchanged remote. Shipped as
+  0.6.2 instead.
+
 ## [0.6.0]
 
 Five faults, all of them invisible to every check that existed, all found by a

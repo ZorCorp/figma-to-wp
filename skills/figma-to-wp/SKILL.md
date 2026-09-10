@@ -1,6 +1,6 @@
 ---
 name: figma-to-wp
-description: "Build or update a masterconcept.ai WordPress page from a Figma design. Pulls the frame's render, its copy verbatim, its colour and type tokens, its box geometry and its images out of Figma; you write the HTML against those numbers; `verify` confirms every string survived and the site's hard rules hold, and `diff` screenshots the result and compares it to the render band by band; then it uploads the media and creates the page as a draft via mc/set-post-html with the right slug and Permalink Manager URI. Use when someone gives a Figma link and wants it turned into a page on masterconcept.ai, or wants an existing AI-built page refreshed from an updated design."
+description: "Build or update a masterconcept.ai WordPress page from a Figma design. Pulls the frame's render, its copy verbatim, its colour and type tokens, its box geometry and its images out of Figma; you write the HTML against those numbers, one section at a time. `verify` confirms every string survived and the site's hard rules hold, `audit` names which element is wrong and by how much, `diff` screenshots the result and scores each section against the render, and `mobile` runs the phone checks the frame cannot answer; then it uploads the media and creates the page as a draft via mc/set-post-html with the right slug and Permalink Manager URI. `pull` starts from a page that already exists in WordPress. Use when someone gives a Figma link and wants it turned into a page on masterconcept.ai, or wants an existing AI-built page refreshed from an updated design."
 license: MIT
 allowed-tools:
   - Bash(*)
@@ -8,7 +8,7 @@ allowed-tools:
   - Write(*)
   - Edit(*)
 metadata:
-  version: "0.6.0"
+  version: "0.6.2"
 ---
 
 # figma-to-wp
