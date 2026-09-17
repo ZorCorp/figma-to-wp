@@ -117,10 +117,27 @@ The enqueued script is class-driven:
 > `acc-head` — or production is running an older copy without the behaviour you
 > used. Fetch the deployed file and grep it before assuming anything else.
 
-## The theme paints your buttons
+## The theme styles your buttons
 
-`elementor-kit-7676` — the Elementor global kit, on every page on the site —
-styles bare `<button>` elements:
+Two rules reach every bare `<button>` on the site. The first is the theme's
+own, and it sets more than colour:
+
+```css
+[type=button],[type=submit],button{
+  background-color:transparent; border:1px solid #c36; border-radius:3px;
+  color:#c36; display:inline-block; font-size:1rem; font-weight:400;
+  padding:.5rem 1rem; text-align:center; transition:all .3s;
+  user-select:none; white-space:nowrap }
+```
+
+Every one of those is a property your rule has to state, not just the ones
+that look wrong on the day. `white-space:nowrap` is the quiet one: it does
+nothing to a short label, and then an accordion question the frame wraps onto
+two lines runs out on one, under the chevron — on the live site only, because
+the preview had no site CSS. `preview` now caches and serves the site's own
+stylesheet; build against it.
+
+The second is the Elementor global kit:
 
 ```css
 .elementor-kit-7676 button              { background-color:#FF9E1B }   /* the site's orange */
@@ -145,6 +162,33 @@ one does not. `<a>` elements are not affected; the kit's selector is `button`,
 `/solutions/xxx/`, never `https://masterconcept.ai/solutions/xxx/`. Absolute
 links break WPML language switching and any staging copy.
 
+## Every button has a target, and the Figma comments decide which
+
+A design hands you two kinds of button and no third. Which one a button is
+comes from the **Figma comments**, not from its label:
+
+| The comment on that button | What to write |
+|---|---|
+| A URL | that URL, relative, plus `target="_blank" rel="noopener"` |
+| No comment, or a comment that is not a URL | the shared contact popup for that language |
+
+`href="#"` is never an answer. A button left on `#` looks alive and does
+nothing, and it survives every visual check — `diff` scores it a perfect match
+because a dead link and a live one render identically. Both Asana pages shipped
+with seven of them.
+
+Two things the `_blank` rule does **not** cover, and adding it breaks them:
+
+- **In-page anchors** (`#p-3` to switch a tab, `#sh-card-go` to drive a
+  carousel). They are not going anywhere; a new tab makes them a no-op.
+- **Popup triggers** (`#elementor-action…`). The popup opens on the page it
+  was clicked from. `_blank` opens a second, blank copy of the page instead
+  and the form never appears.
+
+So: leave every `href="#…"` alone, and put `target="_blank" rel="noopener"` on
+everything else. `verify` fails a page that still has a bare `href="#"` or an
+off-page link without `_blank`.
+
 ## Dynamic blocks are shortcodes
 
 Never hardcode post cards or author lists — they go stale and they do not
@@ -164,6 +208,42 @@ family). Trigger the existing one; the WP Buddy Header-CTA tool already maps the
 right popup id and label per language. **Never build another form.**
 
 ## Images
+
+**Every `<img>` carries a non-empty `alt` and a non-empty `title`** — product
+shots, logos, decorative icons, the footer watermark, all of them. The two are
+different jobs and one does not stand in for the other: `alt` is what a screen
+reader announces and what search sees, `title` is the tooltip that appears when
+the pointer rests on the image. No current browser shows `alt` on hover, so a
+page whose icons carry only `alt` has no hover text at all.
+
+Write both from the copy already next to the image — a card icon takes its
+card's heading. Mirroring one into the other is fine and is the default.
+
+An icon that now has a real `alt` must lose its `aria-hidden="true"`: the alt is
+written for a reader the attribute tells to skip the element. (The general
+a11y advice to leave decorative images `alt=""` is overridden here — on this
+site the hover text is the point, and the client asked for it on every image.)
+
+`verify` warns about any image missing either attribute.
+
+**`pointer-events:none` silently kills the hover text.** It is the natural thing
+to put on a decorative watermark so it cannot swallow a click meant for the card
+underneath — and it takes the tooltip with it, because hover and click are the
+same pointer. The Asana pages' footer mark had it: correct `alt`, correct
+`title`, and no tooltip, on a page where every other image worked. Before
+reaching for it, check whether anything is actually underneath; if nothing is,
+the rule is not buying you anything. `verify` fails an image that carries both a
+title and a class whose CSS sets `pointer-events:none`.
+
+**The delay is the browser's and you cannot change it.** A native tooltip
+appears about a second after the pointer settles — nearer two, counting the
+stillness the browser waits for — and no HTML, CSS or JS can shorten it. If
+someone wants it faster the answer is a custom tooltip, not a setting: a
+floating element shown on `mouseenter` after a delay you choose, with `title`
+removed on enter and restored on leave so the slow native one never fires and
+still works if the script does not load. Reusable, so it belongs in
+`wpbuddy-page.js` — which serves every AI page on the site, so it is a shared
+change, not a per-page one.
 
 Upload to the media library (`POST /wp-json/wp/v2/media`) and reference the
 uploaded URL. Never hotlink `figma.com` or `s3-alpha-sig.figma.com` — those URLs
@@ -202,6 +282,32 @@ comparing the rendered box against `naturalWidth`.
 
 An `<svg>` used as an image is worse: several report `naturalWidth` **1**
 whether or not they have loaded, so they are square from the first paint.
+
+## A tooltip cannot be verified from the DOM or a screenshot
+
+Nothing about `title` can be confirmed the way the rest of this tool confirms
+things, and three separate checks gave a confident wrong answer in one session:
+
+- **The attribute being present proves nothing.** `pointer-events:none` was in
+  the CSS the whole time.
+- **`elementFromPoint` returning the image proves nothing either.** It says the
+  pointer would land on it, not that anything is drawn.
+- **A headless screenshot can never show one.** The tooltip is drawn by the OS,
+  outside the page, so `Page.captureScreenshot` and `--dump-dom` cannot see it
+  whether or not it appeared.
+
+What works is `screencapture` of the **whole screen**, with the pointer parked
+by a synthetic `CGEventMouseMoved` and three seconds of stillness. Two traps in
+doing that:
+
+- **Chrome draws no tooltip unless its window is frontmost.** Activate it first,
+  or you will photograph an empty page and believe the feature is broken.
+- **Serve the probe from the page's own directory.** A copy of `preview.html`
+  dropped one level up resolves every relative asset against the wrong base, and
+  the resulting broken images look exactly like a page bug.
+
+Run a control — a bare `<img title>` on a scratch page through the same steps.
+If the control shows nothing either, the harness is what is broken.
 
 ## URLs are governed by Permalink Manager Pro
 

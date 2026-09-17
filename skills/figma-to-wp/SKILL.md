@@ -281,6 +281,22 @@ four requirements that were otherwise invisible:
 Every one of them was missed on the first pass and had to be corrected after
 review. `extract` now prints them; do not skip them.
 
+**The comments are also where every button's destination lives.** A comment
+holding a URL is that button's `href`, and the button opens it in a new tab
+(`target="_blank" rel="noopener"`). A button with no URL commented on it goes to
+the shared contact popup for that language. Never leave one on `href="#"` — it
+renders identically to a working button, so `diff` scores it perfect and the
+dead link ships. In-page anchors and popup triggers keep their `#…` href and
+never take `_blank`. See `references/site-rules.md`.
+
+**And every `<img>` needs a non-empty `alt` *and* a non-empty `title`** —
+decorative icons included, since `title` is what shows on hover and `alt` never
+does. Take the words from the copy beside the image. Do not put
+`pointer-events:none` on any of them: it is the obvious rule for a decorative
+watermark and it kills the tooltip along with the click. And do not try to
+confirm a tooltip from the DOM or a headless screenshot — neither can see one.
+`references/site-rules.md` has the way that works, and the two traps in it.
+
 **Then look at `design.png`.** Read it top to bottom and write down the
 structure before writing markup: how many bands, where each one starts and ends,
 which are full-bleed and which are inset boxes, the container width, the column
@@ -504,6 +520,15 @@ HTML does nothing at all, because browsers treat U+2028 as an ordinary space
 and wrap wherever the column runs out. Both pricing notes on the Asana page
 broke in the wrong place for that reason, one with the character sitting right
 there in the source and every string check passing.
+
+**The preview runs the site's real CSS, and you must build against it.**
+`preview` caches the live page's stylesheet beside the build and serves it, so
+the theme's own rules are in play while you work. Without it the page you are
+measuring is not the page that ships: the theme sets `white-space:nowrap` on
+every bare `<button>`, and an accordion whose questions wrapped perfectly in a
+bare preview ran every one of them out on a single line under the chevron the
+moment it reached the site. `--refresh-site` re-fetches. A build folder with no
+`site/site.css` is measuring a page nobody will see.
 
 **The preview runs the site's real behaviour script.** `preview` caches the
 live `wpbuddy-page.js` beside the build and serves it, so tabs, accordions and

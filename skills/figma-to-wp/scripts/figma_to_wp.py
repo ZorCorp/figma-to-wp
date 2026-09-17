@@ -1697,6 +1697,81 @@ def run_checks(out, report=False, section=None, through=None):
                         f'Pin the states or the control changes colour when it '
                         f'is clicked')
 
+    # Two ways a page passes every picture check and is still broken, because
+    # both failures are invisible to a renderer.
+    #
+    # A button left on href="#" draws exactly like a working one, so `diff`
+    # scores it a perfect match; both Asana pages shipped with seven. The
+    # destination belongs in the Figma comments — a URL there means that URL in
+    # a new tab, no URL there means the shared contact popup. An href that
+    # starts with "#" is an in-page anchor or a popup trigger: it stays put and
+    # must not take _blank, which would open a blank second copy of the page.
+    #
+    # And alt is not a tooltip. No current browser shows it on hover, so an
+    # icon carrying only alt="" has no hover text and no accessible name
+    # either. Both attributes, on every image, decorative ones included.
+    for m in re.finditer(r"<a\b[^>]*>", markup, re.I):
+        tag = m.group(0)
+        href = re.search(r'href="([^"]*)"', tag)
+        if not href:
+            continue
+        href = href.group(1)
+        # Name the button by its own text, so the message says which one. Stop
+        # at </a> or the label runs on into whatever follows the link.
+        inner = markup[m.end():m.end() + 400].split("</a>")[0]
+        label = " ".join(strip_tags(inner).split())[:40] or tag[:60]
+        if href == "#":
+            errors.append(f'<a href="#"> goes nowhere: {label!r}. Give it the '
+                          f'URL its Figma comment names, or wire it to the '
+                          f'shared contact popup')
+        elif href.startswith(("/", "http")):
+            if 'target="_blank"' not in tag:
+                errors.append(f'link leaves the page without target="_blank": '
+                              f'{label!r} -> {href}')
+        elif href.startswith("#") and 'target="_blank"' in tag:
+            errors.append(f'in-page target must not open a new tab: {label!r} '
+                          f'-> {href}')
+
+    for m in re.finditer(r"<img\b[^>]*>", markup, re.I):
+        tag = m.group(0)
+        src = re.search(r'src="([^"]*)"', tag)
+        src = src.group(1) if src else tag[:60]
+        def attr(name):
+            m_ = re.search(r'\s%s="([^"]*)"' % name, tag)
+            return m_.group(1).strip() if m_ else ""
+        missing = [a for a in ("alt", "title") if not attr(a)]
+        if missing:
+            warnings.append(f'{src} has no {" and no ".join(missing)} — every '
+                            f'image needs both; title is the hover text, alt '
+                            f'never is')
+        elif 'aria-hidden="true"' in tag:
+            warnings.append(f'{src} has a real alt but is aria-hidden — the '
+                            f'alt is written for a reader told to skip it')
+
+    # pointer-events:none is what you reach for so a decorative watermark cannot
+    # swallow a click meant for the card under it, and it takes the tooltip with
+    # it — hover and click are the same pointer. The Asana footer mark had a
+    # correct alt and a correct title and showed nothing, on a page where every
+    # other image worked. Nothing renders differently, so no picture check can
+    # see it; match the class names instead.
+    dead = set()
+    for sel, decl in re.findall(r"([^{}@]+)\{([^{}]*)\}", btn_css):
+        if re.search(r"pointer-events\s*:\s*none", decl):
+            dead |= set(re.findall(r"\.([A-Za-z0-9_-]+)", sel))
+    for m in re.finditer(r"<img\b[^>]*>", markup, re.I):
+        tag = m.group(0)
+        if not re.search(r'\stitle="[^"]+"', tag):
+            continue
+        cls = re.search(r'class="([^"]*)"', tag)
+        hit = set((cls.group(1) if cls else "").split()) & dead
+        if hit:
+            src = re.search(r'src="([^"]*)"', tag)
+            errors.append(f'{src.group(1) if src else tag[:40]} has a title but '
+                          f'.{sorted(hit)[0]} sets pointer-events:none — the '
+                          f'pointer never reaches it, so the hover text never '
+                          f'appears. Drop the rule unless something really is '
+                          f'underneath it')
+
     # The behaviour classes are a contract with wpbuddy-page.js, and the
     # symptom of breaking it is silence: the page renders, nothing responds to
     # a click, and it reads as a production problem. Check the halves line up.
@@ -1776,6 +1851,33 @@ def run_checks(out, report=False, section=None, through=None):
                         f'page: {r["file"]} — the file exported this path, so '
                         f'use it (or inline it) instead of approximating the '
                         f'shape in CSS')
+
+    # Asset ids are positional: a1, a2, a3 in the order the frame yields them.
+    # Re-extract a file whose image nodes changed and the numbering shifts, so
+    # a page that still says assets/a2.png silently gets a different picture —
+    # on this page the hero's 573x255 dashboard became the 145x62 MC logo, and
+    # the only hint was an "image not used" warning about the other one. The
+    # markup already states the size it expects; hold the asset to it.
+    sizes = {a["file"]: (a.get("w"), a.get("h")) for a in design["assets"]}
+    for m in re.finditer(r"<img\b[^>]*>", html):
+        tag = m.group(0)
+        src = re.search(r'src="([^"?]+)"', tag)
+        if not src or src.group(1) not in sizes:
+            continue
+        dw, dh = sizes[src.group(1)]
+        w = re.search(r'\bwidth="(\d+)"', tag)
+        h_ = re.search(r'\bheight="(\d+)"', tag)
+        bad = [f"{k} {v} vs {d}" for k, v, d in
+               (("width", int(w.group(1)) if w else None, dw),
+                ("height", int(h_.group(1)) if h_ else None, dh))
+               if v is not None and d is not None and v != d]
+        if bad:
+            name = next((a.get("name") for a in design["assets"]
+                         if a["file"] == src.group(1)), "")
+            errors.append(f'{src.group(1)} is {name!r} at {dw}x{dh}, but the '
+                          f'markup asks for {" and ".join(bad)} — the asset '
+                          f'numbering moved under this page; re-check every '
+                          f'src against design.json')
 
     for a in design["assets"]:
         if a["id"].startswith("a") and a["file"] not in html:

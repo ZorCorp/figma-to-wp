@@ -3,6 +3,49 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [0.6.3]
+
+Hover text and button destinations — the two things a design carries that no
+picture check can see.
+
+- **A button left on `href="#"`.** It draws exactly like a working one, so
+  `diff` scores it a perfect match; fourteen of them went out across the two
+  Asana market pages. A button's destination lives in the **Figma comments** — a
+  URL there means that URL, opened in a new tab; no URL there means the shared
+  contact popup for that language. `verify` now fails a bare `href="#"`, fails
+  an off-page link with no `target="_blank"`, and fails `_blank` on an in-page
+  anchor or popup trigger, where it opens a blank second copy of the page and
+  the form never appears.
+
+- **`alt` is not a tooltip.** No current browser shows it on hover, so an icon
+  carrying `alt=""` had no hover text and no accessible name either. Every
+  `<img>` now needs a non-empty `alt` *and* a non-empty `title`, decorative
+  icons included, written from the copy beside the image; `verify` warns on
+  either one missing, and on an image that has a real `alt` while still
+  `aria-hidden="true"` — an alt written for a reader told to skip it.
+
+- **`pointer-events:none` kills a tooltip.** Found when the hover text above
+  shipped and did not appear, on one image, on a page where every other image
+  worked. It was on the footer watermark so the mark could not swallow a click
+  meant for the card — and hover and click are the same pointer. Nothing renders
+  differently, so no picture check could ever see it. `verify` now fails an
+  image that has a `title` and a class whose CSS sets `pointer-events:none`.
+
+- **A tooltip cannot be verified the way this tool verifies everything else.**
+  The attribute being present proves nothing; `elementFromPoint` returning the
+  image proves nothing; and a headless screenshot can never show one, because
+  the tooltip is drawn by the OS outside the page. Chasing this produced three
+  confident wrong answers in a row. `references/site-rules.md` now records the
+  method that works — whole-screen `screencapture` with the pointer parked —
+  and its two traps: Chrome draws no tooltip unless it is frontmost, and a probe
+  page served from the wrong directory 404s every relative asset and looks like
+  a page bug.
+
+- **The tooltip delay is the browser's.** About a second after the pointer
+  settles, and no HTML, CSS or JS can shorten it. Written down so the next
+  person does not go looking for the setting. Making it faster means a custom
+  tooltip in `wpbuddy-page.js`, which is a shared change across every AI page.
+
 ## [0.6.2]
 
 - The plugin's own description still listed the 0.4.0 pipeline. `audit`,
