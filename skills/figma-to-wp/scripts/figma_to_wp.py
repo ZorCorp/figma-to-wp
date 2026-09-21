@@ -1492,6 +1492,41 @@ def cmd_extract(args):
 
 # ------------------------------------------------------------------- assemble
 
+def strip_style_tags(css, path):
+    """page.css holds CSS, not markup — but take it either way.
+
+    `assemble` wraps page.css in <style>…</style>. A page.css that carries its
+    own tags therefore nests them, and a nested <style> is not a no-op: the CSS
+    parser reads "<style> .foo" as the selector of the FIRST rule, the selector
+    is invalid, and that whole rule is dropped. The first rule is where the
+    page wrapper lives, and with it every design token the rest of the file
+    references through var(). Everything still renders — in Times, in black, at
+    the wrong size — and no check that reads the file as text can see it. One
+    build lost 11 tokens, 35 var() references and 1611px of page height to it,
+    and passed `verify` while doing so.
+
+    So normalise rather than refuse: the mistake costs a whole stylesheet and
+    announces nothing. A <style> anywhere other than the ends is genuinely
+    confused input and still stops the build.
+    """
+    body = css.strip()
+    opened = re.match(r"^<style\b[^>]*>\s*", body, re.I)
+    if opened:
+        body = body[opened.end():]
+        closed = re.search(r"\s*</style>\s*$", body, re.I)
+        if closed:
+            body = body[:closed.start()]
+        sys.stderr.write(
+            "warn  %s is wrapped in <style> tags — stripped them. page.css is "
+            "CSS; assemble adds the tag, and nesting it silently kills the "
+            "file's first rule and every token in it.\n" % os.path.basename(path))
+    if re.search(r"<\s*/?\s*style\b", body, re.I):
+        die("CSS_HAS_MARKUP",
+            f"{path} still contains a <style> tag after its outer wrapper was "
+            f"stripped. page.css must be CSS only — assemble supplies the tag.")
+    return body.strip()
+
+
 def assemble(out):
     """page.html + page.css -> the body that ships.
 
@@ -1512,6 +1547,7 @@ def assemble(out):
         if not os.path.exists(css_path):
             die("MISSING", css_path + " (page.html asks for {{styles}})")
         css = open(css_path, encoding="utf-8").read().strip()
+        css = strip_style_tags(css, css_path)
         html = html.replace("{{styles}}", "<style>\n" + css + "\n</style>")
     elif os.path.exists(css_path):
         print("warn  page.css exists but page.html has no {{styles}} placeholder",
@@ -1619,6 +1655,7 @@ def run_checks(out, report=False, section=None, through=None):
             dropped = {squash(k): v for k, v in json.load(fh).items()}
 
     errors, warnings, skipped = [], [], 0
+    used = set()
     texts = design["texts"]
     band = None
     if section or through:
@@ -1634,11 +1671,43 @@ def run_checks(out, report=False, section=None, through=None):
         s = squash(t["text"])
         if not s or s in body:
             continue
-        if any(k and k in s for k in dropped):
+        hit = [k for k in dropped if k and k in s]
+        if hit:
             skipped += 1
+            used |= set(hit)
             continue
         errors.append(f'copy missing (#{t["i"]}, y={t["y"]}): {t["text"].strip()[:70]!r}')
 
+    # A dropped key is matched as a SUBSTRING of a design string, so the file
+    # wants one key per thing left out — not a prose grouping of several. A key
+    # like "Solutions / Resources / About Us (top nav)" is a substring of
+    # nothing and silently drops nobody: one build wrote its whole header and
+    # footer that way and took 36 copy-missing errors while dropped.json sat
+    # there looking correct. The report's "0 dropped on purpose" was the only
+    # hint, and it reads like a fact rather than a fault.
+    #
+    # Ask this of every key against the WHOLE design, not only the strings that
+    # went missing — a key whose copy the page does happen to carry is still a
+    # valid entry, and the loop above never reaches it. And dropped.json names
+    # assets too: an icon or logo left out on purpose is recorded the same way,
+    # matching a file name rather than any string.
+    assetish = set()
+    for a in design.get("assets", []):
+        f_, nm = a.get("file"), a.get("name")
+        if f_:
+            assetish.add(squash(str(f_)))
+            if nm:
+                assetish.add(squash("%s (%s)" % (f_, nm)))
+    all_copy = [squash(t["text"]) for t in design["texts"]]
+    for k in sorted(dropped):
+        if not k or k in assetish:
+            continue
+        if any(k in c for c in all_copy):
+            continue
+        warnings.append(f'dropped.json key matches nothing in the design: '
+                        f'{k[:56]!r} — a key is matched as a substring of one '
+                        f'design string (or an asset file name), so write one '
+                        f'key per thing left out, not a list of them')
     # A hard break in the file is content, not styling: it decides where the
     # line ends, and the copy check cannot see it because U+2028 is whitespace
     # to Python and squashes away. Writing it into the markup as &#8232; does

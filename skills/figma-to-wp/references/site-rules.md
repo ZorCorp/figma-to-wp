@@ -69,6 +69,17 @@ wrapper's rendered width on the live page — it should equal the viewport.
 
 ## CSS lives in the page
 
+**`page.css` holds CSS, not markup.** `assemble` wraps it in `<style>…</style>`
+itself, so a page.css that carries its own tags nests them — and a nested
+`<style>` is not harmless. The CSS parser reads `<style> .foo` as the selector
+of the first rule, finds it invalid, and drops that whole rule. The first rule
+is the page wrapper, which is where the design tokens live, so every later
+`var(--…)` resolves to nothing: the page renders in Times, in black, at the
+wrong size, and every check that reads the file as text still passes. One build
+lost 11 tokens, 35 `var()` references and 1611px of height this way. The tool
+now strips the outer tags and warns, so the mistake cannot ship — but write the
+file without them.
+
 `<style>` inside the body survives, so each page carries its own scoped
 stylesheet. Scope every rule under your wrapper class — the site's Elementor
 header, footer and mega-menu share the document.
@@ -282,6 +293,57 @@ comparing the rendered box against `naturalWidth`.
 
 An `<svg>` used as an image is worse: several report `naturalWidth` **1**
 whether or not they have loaded, so they are square from the first paint.
+
+## `preview` blocks, and `preview.html` is a snapshot
+
+Two things about the preview that cost a session each, neither of them obvious
+from the command.
+
+**`preview` never returns.** It writes `build/<slug>/preview.html`, then serves
+it, and serving does not end. Run it in the foreground and you wait forever —
+an agent will sit there until something kills it. Start it in the background
+and stop it once the file is written:
+
+```sh
+(nohup python3 "$FW" preview <slug> --port 8901 >/dev/null 2>&1 &)
+sleep 20
+pkill -f "figma_to_wp.py preview"
+```
+
+You do not need `preview` running to look at the page. Serve the build
+directory with anything — `python3 -m http.server 8777` from `build/` — and
+point `diff` and `mobile` at `http://127.0.0.1:8777/<slug>/preview.html`.
+`file://` URLs are refused, so a local server is not optional.
+
+**`preview.html` does not track `page.html`.** It is a generated snapshot: the
+build wrapped in the live site's CSS and chrome, frozen at the moment `preview`
+ran. Editing `page.html` or `page.css` does nothing to it. Since `diff` and
+`mobile` both score the *URL* you hand them, and that URL serves the snapshot,
+a stale one means you are scoring a page you are no longer writing — and it
+will not look stale, because it looks exactly like the page did an hour ago.
+Regenerate it after every edit, and confirm your change is actually in it
+before you read any number off it.
+
+## `dropped.json` takes one key per string
+
+Copy left out on purpose goes in `build/<slug>/dropped.json` as
+`{"<the string>": "<why>"}`. The key is matched as a **substring of a single
+design string**, so it must be one string per key:
+
+```json
+{
+  "CONTACT US": "Site header chrome; the theme renders its own header.",
+  "HONG KONG HEAD OFFICE": "Site footer chrome.",
+  "+852 3589 6700": "Site footer chrome."
+}
+```
+
+A key that groups several strings into one line of prose — `"Solutions /
+Resources / About Us (top nav)"` — is a substring of nothing and drops nobody.
+One build wrote its entire header and footer that way and took 36
+`copy missing` errors with a dropped.json that looked right; the only signal
+was `0 dropped on purpose` in the report, which reads like a fact rather than a
+fault. `verify` now warns about a key that matches nothing.
 
 ## A tooltip cannot be verified from the DOM or a screenshot
 

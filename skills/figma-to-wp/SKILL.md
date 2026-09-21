@@ -496,6 +496,15 @@ alternatives.
 
 ## 3. Verify, then diff the picture
 
+**Before your first `diff`: `preview` never returns.** It writes
+`build/<slug>/preview.html` and then serves it forever, so running it in the
+foreground hangs the session. Start it in the background and kill it once the
+file exists, or skip it entirely and serve `build/` with
+`python3 -m http.server 8777`. And `preview.html` is a **snapshot** — it does
+not change when you edit `page.html`, so regenerate it after every edit and
+check your change is in it before you trust any number `diff` or `mobile`
+prints. `references/site-rules.md` has both in full.
+
 ```bash
 python3 "$FW" verify <slug>
 python3 "$FW" diff   <slug> --url http://127.0.0.1:8731/preview.html

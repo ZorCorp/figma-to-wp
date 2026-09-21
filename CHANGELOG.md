@@ -3,6 +3,38 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [0.6.4]
+
+Found by handing the skill to an agent that had never seen it and watching
+where it fell over. It fell over in four places, two of which had already cost
+a session each without being written down.
+
+- **`page.css` wrapped in its own `<style>` tags destroys the stylesheet.**
+  `assemble` adds the tag, so carrying one nests it, and a nested `<style>` is
+  read by the CSS parser as the selector of the first rule — invalid, so that
+  rule is dropped. The first rule is the page wrapper, where the design tokens
+  live, so every later `var()` dies with it: Times, black text, collapsed
+  spacing. The build still passed `verify`, because nothing that reads the file
+  as text can see it. `assemble` now strips the outer tags and warns; a
+  `<style>` anywhere else still fails the build.
+
+- **`preview` never returns, and nothing said so.** It serves until killed, so
+  a foreground call hangs. Both the agent under test and the session that wrote
+  this lost time to it. Documented, with the background-and-kill form.
+
+- **`preview.html` is a snapshot, not a view.** It does not track `page.html`,
+  and `diff`/`mobile` score the URL you give them — so an un-regenerated
+  preview means scoring a page you are no longer writing, with numbers that
+  look perfectly normal. This produced a confidently wrong "nothing moved"
+  earlier in the same session that shipped 0.6.3.
+
+- **`dropped.json` takes one key per string.** Keys match as a substring of a
+  single design string; a key that groups several into a line of prose matches
+  nothing and drops nobody. One build wrote its whole header and footer that
+  way and took 36 `copy missing` errors with a file that looked right — the
+  only signal was `0 dropped on purpose`, which reads like a fact. `verify` now
+  warns about a key that matches nothing, and site-rules shows the shape.
+
 ## [0.6.3]
 
 Hover text and button destinations — the two things a design carries that no
