@@ -1841,6 +1841,30 @@ def run_checks(out, report=False, section=None, through=None):
                           f'appears. Drop the rule unless something really is '
                           f'underneath it')
 
+    # The page is 1440 and only backgrounds go past it; content stays in a
+    # centred 1440 band. A fixed negative HORIZONTAL margin breaks that: it is
+    # an offset someone measured at 1440, and it does not move when the page
+    # centres, so the element stays pinned near the window's left edge while
+    # everything else slides right. Nothing else here can catch it — verify,
+    # audit and diff all render at the design's own width, so the layout is
+    # perfect at exactly 1440 and wrong at every other width. One carousel
+    # scored 96.2% with no box findings while sitting 382px off at 1920.
+    #
+    # Vertical negative margins are fine — nothing about them depends on the
+    # viewport — and small horizontal ones are optical nudges, not layout.
+    # Full-bleed is calc(50% - 50vw), which is not a fixed px and not flagged.
+    for m in re.finditer(r"margin(-left|-right)?\s*:\s*(-\d+)px", btn_css):
+        px = int(m.group(2))
+        if px > -24:
+            continue
+        which = (m.group(1) or "")[1:] or "shorthand"
+        warnings.append(f'{which} margin {px}px is a fixed horizontal offset — '
+                        f'it was measured at 1440 and will not move when the '
+                        f'page centres, so this element sits {abs(px)}px off on '
+                        f'any wider window while the rest of the page slides '
+                        f'right. Use calc(50% - 50vw) to break out, or centre '
+                        f'the element on the 1440 page')
+
     # The behaviour classes are a contract with wpbuddy-page.js, and the
     # symptom of breaking it is silence: the page renders, nothing responds to
     # a click, and it reads as a production problem. Check the halves line up.
@@ -1990,8 +2014,12 @@ def run_checks(out, report=False, section=None, through=None):
     # Walk the markup keeping the open elements' classes, so a rule written
     # against the wrapper (.sh-card__icon img) still counts for an <img> that
     # carries no class of its own.
+    # `markup`, not `html`: the stylesheet is inlined into the document by
+    # assemble, so walking the raw text reads a CSS comment mentioning <img> as
+    # an image with no alt and fails the build for it. The button check above
+    # learned this already — this loop had not.
     stack, void = [], {"img", "br", "hr", "input", "meta", "link", "source"}
-    for m in re.finditer(r"<(/?)([A-Za-z][\w-]*)([^>]*?)(/?)>", html):
+    for m in re.finditer(r"<(/?)([A-Za-z][\w-]*)([^>]*?)(/?)>", markup):
         closing, tag, attrs, selfclose = m.groups()
         tag = tag.lower()
         if closing:

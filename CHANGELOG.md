@@ -3,6 +3,38 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [0.6.5]
+
+The page is 1440 wide and only its backgrounds go past that — and nothing in
+this tool could see a layout that got it wrong.
+
+- **A fixed negative horizontal margin pins an element to the window.** It is
+  an offset someone measured at 1440, and it does not move when the page
+  centres: the element stays near the window's left edge while everything else
+  slides right. A card carousel built that way scored 96.2% with no box
+  findings while sitting 190px off at 1728 and 382px off at 1920, with its
+  first card clipped past legibility at every width. A person opening the page
+  in a browser found it. `verify` now warns about them; both Asana builds carry
+  one — `-152px` and `-414px`, on the same `.np-crow__track` — and have since
+  they shipped.
+
+- **Written down: what 1440 actually means.** It is the page, not a maximum.
+  Backgrounds run to the viewport's edges; text, cards and carousels stay in a
+  centred 1440 band. The gutter inside it comes from the frame, not a house
+  value — AI Governance puts its content at x80, superhuman at x95, and the CSS
+  can express either as `max-width:1440` with padding or as a narrower
+  `max-width` centred. An element the frame runs to the page's edges takes the
+  full 1440, not the content column.
+
+- **`verify`, `audit` and `diff` render at the design's width and `mobile` at
+  390, and nothing looks between or above them.** site-rules now says so, and
+  says to check 1280 / 1512 / 1728 / 1920 once the desktop settles.
+
+- **The alt check read a CSS comment as markup.** `assemble` inlines the
+  stylesheet, so a comment mentioning `<img>` failed the build as an image with
+  no alt. The button check had already learned to scan `markup` rather than the
+  raw document; this loop had not.
+
 ## [0.6.4]
 
 Found by handing the skill to an agent that had never seen it and watching

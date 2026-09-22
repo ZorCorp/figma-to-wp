@@ -29,6 +29,53 @@ Wrap the whole body:
 **Never open one of these pages with "Edit with Elementor."** It converts the
 page to an Elementor document and hides the HTML body. There is no undo.
 
+## The page is 1440; only backgrounds go past it
+
+Every frame this site is designed against is **1440 wide** — superhuman, both
+Asana markets, AI Governance, all of them — and that number is the page, not a
+maximum. On a browser wider than 1440 the layout does not grow:
+
+- **Section backgrounds run to the viewport's edges.** The hero's gradient, the
+  grey bands behind stats and approach: without this a wide screen shows white
+  strips down both sides and the page reads as broken. `.<slug>-page` carries
+  `margin-left:calc(50% - 50vw)` and the same on the right to do it.
+- **Everything else stays inside a centred 1440 band.** Text, cards, images,
+  carousels — none of them move when the window widens. A reader at 1920 sees
+  the same layout as one at 1440 with more background either side.
+
+Inside that 1440 the content sits in a narrower column with a gutter each side,
+and **the gutter comes from the frame, not from a house value**: AI Governance
+puts its content at x80, superhuman at x95. Both are right, because both are
+what their own file says. The CSS can express it either way — `max-width:1440`
+with `padding:0 80`, or `max-width:1296` centred, which is the same 1440 minus
+72 a side — so read the container's arithmetic before assuming a page is built
+to a different width.
+
+**An element that sits at the frame's edges takes the full 1440, not the
+content column.** The AI Governance card carousel is the case: its track runs
+from x-60 to x1500 in the frame, past the gutters and over both edges. Its
+window is therefore the 1440 page, with the track overflowing and scrolling
+inside it — not the 1280 content column, and not a 1560 box that an ancestor
+clips, which leaves 60px of the first and last card permanently unreachable.
+
+### Nothing in this tool can see a layout that only works at 1440
+
+`verify`, `audit` and `diff` all render at the design's own width, and `mobile`
+renders at 390. Between and above those, nothing is ever looked at. A row
+pinned to the viewport instead of the centred page passes every check with a
+perfect score: the AI Governance carousel scored 96.2% with zero box findings
+while sitting 190px off at 1728 and 382px off at 1920, with its first card
+clipped past legibility at every width. It was found by a person opening the
+page in a browser.
+
+So: after the desktop settles, render the page at 1280, 1512, 1728 and 1920 and
+check that each section's background still reaches both edges and each
+section's content still starts at `(viewport - 1440) / 2`. A fixed negative
+horizontal margin is the usual culprit — it is an offset measured at 1440, and
+it does not move when the page centres. `verify` warns about them; the two
+Asana builds each carry one (`-152px` and `-414px`) and have since they
+shipped.
+
 ## Raw post_content pages are clamped; break out or they render narrow
 
 The theme caps the content column on every page that Elementor did not build:
