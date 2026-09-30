@@ -3,6 +3,27 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [0.7.0]
+
+Claude Design → WordPress, and posts.
+
+- **`extract --from claude-design`** builds from a Claude Design static export.
+  The export is checked against a WP export contract (one root with an id, CSS
+  scoped to it, no preview harness, no expiring Claude URLs); if it fails,
+  nothing is written and the fix is printed for Claude Design.
+- **`wpsafe.py`** cleans the export for WordPress: wraps it in `wp:html` so
+  wpautop leaves it alone, and injects a reset for the theme rules that broke
+  post 78436 — Raleway `!important`, form-label padding, the 1140px cap.
+- **`push` and `pull` take `--post-type post`**; `push` can create a post with
+  `--category` and `--region`, and after every push counts the `<p>` WordPress
+  added.
+- **`preview` takes the site CSS from a public sample page** when the build's
+  own is private or behind a password (`--site-sample`).
+
+- **`--parent-path` resolves in the page's language.** WPML keeps one
+  `solutions` per language, and the lookup answered in English, so a zh-hant
+  page landed under the English parent.
+
 ## [0.6.5]
 
 The page is 1440 wide and only its backgrounds go past that — and nothing in

@@ -215,6 +215,17 @@ So every `<button>` in an AI page must state its own `:hover`, `:focus`,
 one does not. `<a>` elements are not affected; the kit's selector is `button`,
 `input[type=button]`, `input[type=submit]` and `.elementor-button`.
 
+### Which page the preview takes its CSS from
+
+The theme's CSS is not the same on every page: post 78436's password page
+loaded no `form label{padding:20px 0 10px}`, the Asana page does. A preview
+built on the wrong sample passes `diff` and breaks on the site. `preview`
+takes the CSS from the build's own `link` when it is public, and from
+`SITE_SAMPLE` (the zh-hant Asana page) when it is new, private or behind a
+password; `preview --site-sample <url>` overrides both. `mobile` takes no
+`--site-sample` of its own: it measures the running preview, so it uses
+whichever CSS that `preview` was started with.
+
 ## Links must be relative
 
 `/solutions/xxx/`, never `https://masterconcept.ai/solutions/xxx/`. Absolute

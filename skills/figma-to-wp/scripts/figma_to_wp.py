@@ -58,6 +58,9 @@ import urllib.parse
 from urllib.parse import unquote
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import wpsafe  # noqa: E402
+
 HOME = os.path.expanduser(os.environ.get("FIGMA_WP_HOME", "~/.figma-wp"))
 BUILD = os.path.join(os.getcwd(), "build")
 # some hosts refuse a bare urllib request
@@ -853,7 +856,25 @@ def extract_from_export(args):
 
 CHROME = ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
           "/Applications/Chromium.app/Contents/MacOS/Chromium",
-          "/usr/bin/google-chrome", "/usr/bin/chromium")
+          "/usr/bin/google-chrome", "/usr/bin/chromium",
+          "/usr/bin/chromium-browser")
+
+# The flags every headless run needs, wherever it runs. --no-sandbox because a
+# container session is root and Chrome will not start its own sandbox as root;
+# --disable-dev-shm-usage because /dev/shm in a container is 64MB and the
+# viewports below are far taller than that. Both are harmless on a Mac, so one
+# list serves either host. --hide-scrollbars belongs here too: `audit` and
+# `diff` have to measure the same width or they disagree about where things are.
+CHROME_FLAGS = ("--headless=new", "--disable-gpu", "--no-sandbox",
+                "--disable-dev-shm-usage", "--hide-scrollbars")
+
+
+def chrome(what):
+    """The browser executable, or die naming what wanted it."""
+    exe = next((c for c in CHROME if os.path.exists(c)), None)
+    if not exe:
+        die("NO_BROWSER", f"{what} needs Chrome or Chromium installed.")
+    return exe
 
 
 def shoot(url, png, width, tall=14000):
@@ -864,11 +885,8 @@ def shoot(url, png, width, tall=14000):
     That also forces every lazy image into view, which a fold-height capture
     would leave unloaded and silently blank in the comparison.
     """
-    exe = next((c for c in CHROME if os.path.exists(c)), None)
-    if not exe:
-        die("NO_BROWSER", "render diff needs Chrome or Chromium installed.")
     tmp = png + ".raw.png"
-    subprocess.run([exe, "--headless=new", "--disable-gpu", "--hide-scrollbars",
+    subprocess.run([chrome("render diff"), *CHROME_FLAGS,
                     "--force-device-scale-factor=1", "--virtual-time-budget=5000",
                     f"--window-size={width},{tall}", f"--screenshot={tmp}", url],
                    check=True, capture_output=True, timeout=300)
@@ -1349,7 +1367,136 @@ def report_design_change(prev, new):
               "does shorten yours — check the section tops in `audit`.")
 
 
+def serve_dir(path):
+    """Serve a folder on a free localhost port for one headless render."""
+    import functools
+    import http.server
+    import threading
+
+    class Quiet(http.server.SimpleHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+    srv = http.server.ThreadingHTTPServer(
+        ("127.0.0.1", 0), functools.partial(Quiet, directory=path))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def stop_server(srv):
+    """Undo serve_dir(): shutdown() only stops serve_forever()'s loop, it
+    does not close the listening socket, so a bare shutdown() leaks an fd
+    (ResourceWarning: unclosed socket) every time extract runs."""
+    srv.shutdown()
+    srv.server_close()
+
+
+# src="data:…" is only meaningful on the tags a browser actually loads media
+# from; poster="data:…" is checked on any tag because cmd_push's own upload
+# scan (`(?:src|poster)="(assets/…)"`) is not tag-restricted either.
+DATA_SRC = re.compile(r'(<(?:img|source|video)\b[^>]*?\ssrc=")data:image/([\w+.-]+);base64,([^"]+)(")', re.I)
+DATA_POSTER = re.compile(r'(<[a-zA-Z][\w-]*\b[^>]*?\sposter=")data:image/([\w+.-]+);base64,([^"]+)(")', re.I)
+
+
+def cd_extract_images(html, out):
+    """<img>/<source>/<video> src="data:…" and poster="data:…" on any tag ->
+    assets/cd-<sha8>.<ext>. CSS url(data:…) stays inline: push only uploads
+    src/poster targets (see cmd_push)."""
+    os.makedirs(os.path.join(out, "assets"), exist_ok=True)
+    assets, seen = [], {}
+
+    def repl(m):
+        raw = base64.b64decode(m.group(3))
+        sha = hashlib.sha256(raw).hexdigest()[:8]
+        ext = {"jpeg": "jpg", "svg+xml": "svg"}.get(m.group(2).lower(), m.group(2).lower())
+        rel = f"assets/cd-{sha}.{ext}"
+        if rel not in seen:
+            with open(os.path.join(out, rel), "wb") as fh:
+                fh.write(raw)
+            # m.string, not the outer html: it is whichever string this
+            # particular .sub() pass is scanning, so this stays correct
+            # across both passes even though the second rewrites the first's
+            # output.
+            tag_end = m.string.find(">", m.end())
+            alt = re.search(r'\salt="([^"]*)"', m.string[m.start():tag_end])
+            seen[rel] = {"id": f"a{len(seen) + 1}", "file": rel,
+                         "name": alt.group(1) if alt else "", "w": None, "h": None}
+            assets.append(seen[rel])
+        return m.group(1) + rel + m.group(4)
+    html = DATA_SRC.sub(repl, html)
+    html = DATA_POSTER.sub(repl, html)
+    return html, assets
+
+
+def extract_claude_design(args):
+    with open(args.source, encoding="utf-8") as fh:
+        src = fh.read()
+    findings = wpsafe.check(src)
+    for f in findings:
+        print(f"{f['level']:5} {f['rule']:<16} {f['where']}: {f['detail']}")
+    if any(f["level"] == "error" for f in findings):
+        print("\n" + wpsafe.fix_prompt([f for f in findings if f["level"] == "error"]))
+        die("NOT_WP_SAFE", "the export does not meet the WP export contract — "
+                           "paste the text above into Claude Design and export again.")
+    slug = args.slug or slugify(os.path.splitext(os.path.basename(args.source))[0])
+    out = os.path.join(BUILD, slug)
+    dj = os.path.join(out, "design.json")
+    page = os.path.join(out, "page.html")
+    if os.path.exists(page) and not args.force:
+        prev = {}
+        if os.path.exists(dj):
+            with open(dj, encoding="utf-8") as fh:
+                prev = json.load(fh).get("source", {})
+        # A build/<slug> that is missing design.json, or whose design.json
+        # says something other than claude-design, was never made by this
+        # path (most likely a Figma build sharing the slug) — overwriting its
+        # page.html would silently destroy work this extract knows nothing
+        # about. Only a claude-design build's own page.html gets the
+        # HAND_EDITED check below.
+        if prev.get("type") != "claude-design":
+            why = "no design.json" if not os.path.exists(dj) else f"source.type={prev.get('type')!r}"
+            die("NOT_A_CD_BUILD",
+                f"{page} exists but is not a claude-design build ({why}); "
+                f"re-extracting would overwrite it. Pass --force to overwrite.")
+        with open(page, "rb") as fh:
+            now = hashlib.sha256(fh.read()).hexdigest()
+        if prev.get("page_sha256") and prev["page_sha256"] != now:
+            die("HAND_EDITED", f"{page} was edited after the last extract; "
+                               f"re-extracting would lose that. Pass --force to overwrite.")
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "cd-export.html"), "w", encoding="utf-8") as fh:
+        fh.write(src)
+
+    body, assets = cd_extract_images(wpsafe.clean(src), out)
+    with open(page, "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+    # The reference is the export itself, rendered bare: no theme, no WordPress.
+    srv = serve_dir(os.path.dirname(os.path.abspath(args.source)))
+    try:
+        url = f"http://127.0.0.1:{srv.server_port}/{urllib.parse.quote(os.path.basename(args.source))}"
+        shoot(url, os.path.join(out, "design.png"), 1440)
+    finally:
+        stop_server(srv)
+
+    with open(page, "rb") as fh:
+        page_sha256 = hashlib.sha256(fh.read()).hexdigest()
+    write_json(dj, {
+        "source": {"type": "claude-design", "project": args.cd_project,
+                   "file": args.cd_file, "width": 1440,
+                   "sha256": hashlib.sha256(src.encode()).hexdigest(),
+                   "page_sha256": page_sha256},
+        "texts": [{"i": i, "text": t, "y": 0}
+                  for i, t in enumerate(wpsafe.visible_texts(src), 1)],
+        "assets": assets, "frames": [], "tokens": {}, "comments": []})
+    print(f"page.html {len(body)} bytes, root {wpsafe.root_selector(body)}")
+    print(f"assets    {len(assets)} image(s) out of data URIs")
+    print(f"design    design.png rendered from the export at 1440")
+    print(f"\nbuild/{slug}/ is ready. Next: verify {slug}, preview, diff.")
+
+
 def cmd_extract(args):
+    if getattr(args, "from_", None) == "claude-design":
+        return extract_claude_design(args)
     if os.path.isdir(args.source):
         return extract_from_export(args)
     args.url = args.source
@@ -1541,12 +1688,14 @@ def assemble(out):
     hp = os.path.join(out, "page.html")
     if not os.path.exists(hp):
         die("MISSING", hp)
-    html = open(hp, encoding="utf-8").read()
+    with open(hp, encoding="utf-8") as fh:
+        html = fh.read()
     css_path = os.path.join(out, "page.css")
     if "{{styles}}" in html:
         if not os.path.exists(css_path):
             die("MISSING", css_path + " (page.html asks for {{styles}})")
-        css = open(css_path, encoding="utf-8").read().strip()
+        with open(css_path, encoding="utf-8") as fh:
+            css = fh.read().strip()
         css = strip_style_tags(css, css_path)
         html = html.replace("{{styles}}", "<style>\n" + css + "\n</style>")
     elif os.path.exists(css_path):
@@ -1643,6 +1792,7 @@ def run_checks(out, report=False, section=None, through=None):
     with open(dj) as fh:
         design = json.load(fh)
     html = assemble(out)
+    is_cd = (design.get("source") or {}).get("type") == "claude-design"
     body = squash(strip_tags(html))
 
     # Copy left out on purpose — site header/footer, blocks left over from
@@ -1991,11 +2141,30 @@ def run_checks(out, report=False, section=None, through=None):
     for pat, msg in (
         (r"https?://(?:www\.)?figma\.com", "leftover figma.com URL"),
         (r"s3-alpha-sig\.figma\.com|figma-alpha-api", "leftover Figma CDN URL"),
-        (r"https?://(?:www\.)?masterconcept\.ai",
-         "absolute site link — use a relative path so WPML can localise it"),
     ):
         if re.search(pat, html, re.I):
             errors.append(msg)
+
+    # Links must be relative so WPML can localise them — that holds for
+    # every build, Claude Design included, and it is the ONLY check here (or
+    # in push) that would ever catch an absolute <a href="https://
+    # masterconcept.ai/…">. What design spec 4.1 actually allows a Claude
+    # Design export to do is point an <img>/<source> src, srcset or <video>
+    # poster straight at an already-published masterconcept.ai/wp-content/
+    # URL — that is the asset, not a link. So only those three attributes'
+    # wp-content URLs are exempt; an absolute masterconcept.ai URL anywhere
+    # else — a href, page text, a CSS url() outside wp-content — still fails
+    # this check for both workflows.
+    scan = html
+    if is_cd:
+        WPCONTENT_MEDIA = re.compile(
+            r"https?://(?:www\.)?masterconcept\.ai/wp-content/[^\s\"'()]*", re.I)
+
+        def _blank_cd_media(m):
+            return f'{m.group(1)}="{WPCONTENT_MEDIA.sub("", m.group(2))}"'
+        scan = re.sub(r'\b(src|srcset|poster)="([^"]*)"', _blank_cd_media, scan, flags=re.I)
+    if re.search(r"https?://(?:www\.)?masterconcept\.ai", scan, re.I):
+        errors.append("absolute site link — use a relative path so WPML can localise it")
 
     # Which selectors pin an image's box so it never depends on the file's
     # own dimensions — either an explicit aspect-ratio, or both width and
@@ -2114,13 +2283,16 @@ def run_checks(out, report=False, section=None, through=None):
     # Figma applies textCase at render time, so the stored characters look
     # unchanged and the copy check passes either way. If the design asks for a
     # case the stylesheet never mentions, the page ships in the wrong case and
-    # nothing complains.
-    flat = html.replace(" ", "")
-    for case in sorted({t["case"] for t in design.get("texts", []) if t.get("case")}):
-        if f"text-transform:{case}" not in flat:
-            n = sum(1 for t in design["texts"] if t.get("case") == case)
-            warnings.append(f"design sets text-transform {case} on {n} "
-                            f"strings, but the CSS never uses it")
+    # nothing complains. A Claude Design export has no such render-time
+    # transform — its texts never carry a "case" — so this has nothing to
+    # check there.
+    if not is_cd:
+        flat = html.replace(" ", "")
+        for case in sorted({t["case"] for t in design.get("texts", []) if t.get("case")}):
+            if f"text-transform:{case}" not in flat:
+                n = sum(1 for t in design["texts"] if t.get("case") == case)
+                warnings.append(f"design sets text-transform {case} on {n} "
+                                f"strings, but the CSS never uses it")
 
     # A named font renders only if something actually loads it. masterconcept.ai
     # names Raleway in every stylesheet and loads it nowhere, so visitors without
@@ -2130,10 +2302,17 @@ def run_checks(out, report=False, section=None, through=None):
     # Both the property and any custom property holding a stack — a page that
     # sets --x-font once and refers to it with var() everywhere would otherwise
     # slip through.
-    stacks = re.findall(r"font-family\s*:\s*([^;}]+)", html, re.I)
-    stacks += re.findall(r"--[\w-]*font[\w-]*\s*:\s*([^;}]+)", html, re.I)
+    # The data-wpsafe reset is not the page's own font choice: its comment
+    # quotes the theme's "Raleway…!important" and its rules say
+    # "inherit!important", and reading those as font names put two false
+    # warnings on every Claude Design build. Drop it, and comments, first.
+    fonts_src = re.sub(r"<style[^>]*data-wpsafe[^>]*>.*?</style>", "", html, flags=re.S | re.I)
+    fonts_src = re.sub(r"/\*.*?\*/", "", fonts_src, flags=re.S)
+    stacks = re.findall(r"font-family\s*:\s*([^;}]+)", fonts_src, re.I)
+    stacks += re.findall(r"--[\w-]*font[\w-]*\s*:\s*([^;}]+)", fonts_src, re.I)
     first = []
     for st in stacks:
+        st = re.sub(r"\s*!\s*important\s*", "", st, flags=re.I)
         f = st.split(",")[0].strip().strip("\"'")
         if f and not f.startswith("var(") and f.lower() not in (
                 "inherit", "initial", "unset", "sans-serif", "serif", "monospace"):
@@ -2147,6 +2326,16 @@ def run_checks(out, report=False, section=None, through=None):
     for m in re.finditer(r"(?<!max-)(?<!min-)\bwidth\s*:\s*(\d{3,})px", html):
         if int(m.group(1)) > 480:
             warnings.append(f"fixed width:{m.group(1)}px — prefer max-width")
+
+    # A Claude Design build carries no frames, tokens or comments to check —
+    # its own contract is the WP export spec in wpsafe.py, and that is what
+    # `clean()` already enforced once at extract time. Check it again here:
+    # a hand edit after extract can just as easily put a <style> outside the
+    # root or reintroduce a claudeusercontent.com URL.
+    if is_cd:
+        for f in wpsafe.check(html):
+            (errors if f["level"] == "error" else warnings).append(
+                f"[{f['rule']}] {f['where']}: {f['detail']}")
 
     for e in errors:
         print(f"FAIL  {e}")
@@ -2167,25 +2356,17 @@ def run_checks(out, report=False, section=None, through=None):
 # editor: a call to a helper that did not exist parsed fine, ran fine, and
 # surfaced as "no fw-measure node in the DOM" — a silent failure that reads
 # like a browser problem. `doctor` syntax-checks the file now.
-MEASURE_JS = ("<script>\n"
-              + open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                  "measure.js"), encoding="utf-8").read()
-              + "</script>")
+with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "measure.js"), encoding="utf-8") as _fh:
+    MEASURE_JS = "<script>\n" + _fh.read() + "</script>"
 
 
 def dump_dom(url, width=1440, timeout=180):
     """The page's DOM after its scripts have run."""
-    exe = next((c for c in CHROME if os.path.exists(c)), None)
-    if not exe:
-        die("NO_BROWSER", "audit needs Chrome or Chromium installed.")
     # Without a window size Chrome uses its default width, the page reflows to
     # something no one will ever see, and every measurement describes that
     # instead. The design's own width is the only one worth measuring at.
-    # --hide-scrollbars so this measures the same width the screenshot in
-    # `diff` does. Without it audit read 1425 and diff drew 1440, and the two
-    # tools disagreed about where everything was.
-    r = subprocess.run([exe, "--headless=new", "--disable-gpu",
-                        "--hide-scrollbars",
+    r = subprocess.run([chrome("audit"), *CHROME_FLAGS,
                         f"--window-size={width},20000",
                         "--virtual-time-budget=6000", "--dump-dom", url],
                        capture_output=True, timeout=timeout)
@@ -2231,6 +2412,9 @@ def cmd_audit(args):
     """
     out = os.path.join(BUILD, args.slug)
     design = json.load(open(os.path.join(out, "design.json"), encoding="utf-8"))
+    if (design.get("source") or {}).get("type") == "claude-design":
+        print("audit     Claude Design build: no frames in design.json, so only "
+              "text and type are compared — boxes are diff's job here")
     dom = dump_dom(args.url)
     m = re.search(r'<script type="application/json" id="fw-measure">(.*?)</script>',
                   dom, re.S)
@@ -2896,27 +3080,69 @@ def site_behaviour_js(out, refresh=False):
     return dst
 
 
-def site_shell(out, refresh=False):
+# A public page that loads the theme's global rules, including the two that
+# broke post 78436 (Raleway !important, form label padding). A private or
+# password-protected page serves a 404 or a password form whose CSS is not the
+# page's — 78436's own password page had no form-label rule at all.
+SITE_SAMPLE = "https://masterconcept.ai/zh-hant/partners/work-collaboration/asana/"
+
+
+def site_shell_url(out, sample=None):
+    if sample:
+        return sample
+    link = (read_wp_meta(out) or {}).get("link") or ""
+    if not link or "?p=" in link or "?page_id=" in link:
+        return SITE_SAMPLE
+    try:
+        req = urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=60) as r:
+            html = r.read().decode("utf-8", "replace")
+    except Exception:
+        return SITE_SAMPLE
+    return SITE_SAMPLE if "post-password-form" in html else link
+
+
+def site_shell(out, refresh=False, sample=None):
     """The live page's own CSS, body classes and wrappers, cached locally.
 
     Without this the preview is a bare .mc-page on an empty body, so every
     rule the site puts on the page is invisible while you build. It shipped a
     heading 10px lower than the preview showed, because the theme pads every
     h1-h6 and nothing in the build ever saw that rule.
+
+    The build's own page is new, private or password-protected more often
+    than not, and its `link` then serves a 404 or a password form instead of
+    the theme — 78436 shipped built against that empty CSS. `site_shell_url`
+    falls back to SITE_SAMPLE, a public page known to carry the theme's rules,
+    whenever the build's own link cannot be trusted.
+
+    The cache is keyed on which URL it came from, not just its presence: a
+    `--site-sample` passed today, or a build link that went private since the
+    last fetch, must not be silently shadowed by yesterday's cached CSS from a
+    different source.
     """
     d = os.path.join(out, "site")
     css, meta = os.path.join(d, "site.css"), os.path.join(d, "shell.json")
+    # Resolving the URL is what notices a `sample` override or a link that
+    # went private since the cache was written, so it runs even on a cache
+    # hit. When no `sample` is passed this fetches the build's own link to
+    # check for a password form — a network round-trip on every cache hit,
+    # not just on a miss. That is the price of not shipping a stale cache
+    # silently; see site-rules.md and the task-7 fix report.
+    link = site_shell_url(out, sample)
     if not refresh and os.path.exists(css) and os.path.exists(meta):
-        return open(css, encoding="utf-8").read(), json.load(open(meta))
-    wp = os.path.join(out, "wp.json")
-    if not os.path.exists(wp):
-        return "", {}
-    link = (json.load(open(wp)) or {}).get("link")
-    if not link:
-        return "", {}
+        with open(meta, encoding="utf-8") as fh:
+            shell = json.load(fh)
+        if shell.get("source") == link:
+            print(f"site      CSS from {link} (cached)")
+            with open(css, encoding="utf-8") as fh:
+                return fh.read(), shell
+        # Cache is for a different source, or predates `source` — refetch.
+    print(f"site      CSS from {link}")
     try:
         req = urllib.request.Request(link, headers={"User-Agent": "Mozilla/5.0"})
-        html = urllib.request.urlopen(req, timeout=60).read().decode("utf-8", "replace")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            html = r.read().decode("utf-8", "replace")
     except Exception as e:
         sys.stderr.write(f"site shell: could not fetch {link}: {e}\n")
         return "", {}
@@ -2928,9 +3154,10 @@ def site_shell(out, refresh=False):
             continue
         href = urllib.parse.urljoin(link, m.group(1))
         try:
-            parts.append(urllib.request.urlopen(
-                urllib.request.Request(href, headers={"User-Agent": "Mozilla/5.0"}),
-                timeout=60).read().decode("utf-8", "replace"))
+            with urllib.request.urlopen(
+                    urllib.request.Request(href, headers={"User-Agent": "Mozilla/5.0"}),
+                    timeout=60) as r:
+                parts.append(r.read().decode("utf-8", "replace"))
         except Exception as e:
             sys.stderr.write(f"site shell: {href}: {e}\n")
     parts += re.findall(r"<style[^>]*>(.*?)</style>", html, re.S)
@@ -2939,7 +3166,7 @@ def site_shell(out, refresh=False):
     # preview does not silently drop backgrounds the site actually draws.
     sheet = re.sub(r'url\(\s*["\']?(?!data:|https?:|//)([^"\')]+)["\']?\s*\)',
                    lambda m: f'url("{urllib.parse.urljoin(link, m.group(1))}")', sheet)
-    shell = {}
+    shell = {"source": link}
     b = re.search(r'<body[^>]*class="([^"]*)"', html)
     if b:
         shell["body_class"] = b.group(1)
@@ -3171,7 +3398,8 @@ def cmd_preview(args):
     site_css, shell, site_js = ("", {}, None)
     if not getattr(args, "bare", False):
         refresh = getattr(args, "refresh_site", False)
-        site_css, shell = site_shell(root, refresh=refresh)
+        site_css, shell = site_shell(root, refresh=refresh,
+                                     sample=getattr(args, "site_sample", None))
         site_js = site_behaviour_js(root, refresh=refresh)
     body_cls = shell.get("body_class", "")
     wraps = shell.get("wrappers") or []
@@ -3356,8 +3584,8 @@ def cmd_doctor(args):
     # loudly enough to stop anyone building against it.
     line("pillow", pillow, hint="pip3 install Pillow — extract cannot crop the "
                                "canvas render and diff cannot run without it")
-    chrome = next((c for c in CHROME if os.path.exists(c)), None)
-    line("chrome", os.path.basename(chrome) if chrome else "",
+    exe = next((c for c in CHROME if os.path.exists(c)), None)
+    line("chrome", os.path.basename(exe) if exe else "",
          hint="install Chrome or Chromium — diff has no other way to render "
               "the page")
     line("cwebp", "yes" if have("cwebp") else "", fatal=False,
@@ -3405,16 +3633,20 @@ def to_webp(path, quality=85):
     return dest
 
 
-def resolve_parent(path, creds):
+def resolve_parent(path, creds, language="en"):
     """'partners/work-collaboration' -> the id of the deepest page on that path.
 
     Walking it segment by segment matters: slugs are only unique among
     siblings, so looking up the last segment alone can land on the wrong page.
+    So does the language: WPML keeps one `solutions` per language (46209 en,
+    46211 zh-hant) and answers in the default one unless asked, which parked
+    a zh-hant page under the English parent.
     """
     parent = 0
     for seg in [s for s in path.strip("/").split("/") if s]:
         hits = wp("GET", f"/wp-json/wp/v2/pages?slug={urllib.parse.quote(seg)}"
-                         f"&status=any&per_page=20&_fields=id,slug,parent", creds=creds)
+                         f"&status=any&per_page=20&lang={language}"
+                         f"&_fields=id,slug,parent", creds=creds)
         match = next((p for p in hits if p["parent"] == parent), None)
         if not match:
             die("PARENT_NOT_FOUND",
@@ -3429,7 +3661,10 @@ def wp_meta_path(out):
 
 def read_wp_meta(out):
     p = wp_meta_path(out)
-    return json.load(open(p, encoding="utf-8")) if os.path.exists(p) else {}
+    if not os.path.exists(p):
+        return {}
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def write_wp_meta(out, meta):
@@ -3437,7 +3672,22 @@ def write_wp_meta(out, meta):
         json.dump(meta, fh, ensure_ascii=False, indent=1)
 
 
-def find_page(target, creds):
+def rest_base(post_type):
+    return "posts" if post_type == "post" else "pages"
+
+
+def resolve_terms(tax_rest, slugs, creds):
+    ids = []
+    for s in slugs:
+        hit = wp("GET", f"/wp-json/wp/v2/{tax_rest}?slug={urllib.parse.quote(s)}&_fields=id",
+                 creds=creds) or []
+        if not hit:
+            die("NO_SUCH_TERM", f"{tax_rest} {s!r} does not exist — nothing was written")
+        ids.append(hit[0]["id"])
+    return ids
+
+
+def find_page(target, creds, post_type="page"):
     """Resolve what a person actually typed to one page.
 
     Nobody remembers a post id; they read a title off the Pages list. But the
@@ -3448,10 +3698,11 @@ def find_page(target, creds):
     chosen, never guessed.
     """
     t = str(target).strip()
-    q = "/wp-json/wp/v2/pages?status=any&per_page=30&_fields=id,slug,title,status,link,parent,modified_gmt"
+    rest = rest_base(post_type)
+    q = f"/wp-json/wp/v2/{rest}?status=any&per_page=30&_fields=id,slug,title,status,link,parent,modified_gmt"
 
     if t.isdigit():
-        one = wp("GET", f"/wp-json/wp/v2/pages/{t}?context=edit&_fields="
+        one = wp("GET", f"/wp-json/wp/v2/{rest}/{t}?context=edit&_fields="
                          f"id,slug,title,status,link,parent,modified_gmt", creds=creds)
         return [one] if one.get("id") else []
 
@@ -3481,7 +3732,7 @@ def cmd_pull(args):
     twice.
     """
     creds = wp_creds()
-    hits = find_page(args.target, creds)
+    hits = find_page(args.target, creds, args.post_type)
     if not hits:
         die("NO_SUCH_PAGE", f"nothing matches {args.target!r}. Pass the post id, "
                             f"the URL, the slug, or the exact title.")
@@ -3494,7 +3745,8 @@ def cmd_pull(args):
                   f"edited {h['modified_gmt'][:10]}", file=sys.stderr)
         die("AMBIGUOUS", "re-run with the post id.")
 
-    page = wp("GET", f"/wp-json/wp/v2/pages/{hits[0]['id']}?context=edit", creds=creds)
+    page = wp("GET", f"/wp-json/wp/v2/{rest_base(args.post_type)}/{hits[0]['id']}?context=edit",
+              creds=creds)
     body = page["content"]["raw"]
     slug = args.slug or page["slug"]
     out = os.path.join(BUILD, slug)
@@ -3549,7 +3801,7 @@ def cmd_pull(args):
     write_wp_meta(out, {"post_id": page["id"], "slug": page["slug"],
                         "title": page["title"]["raw"], "parent": page.get("parent"),
                         "link": page["link"], "status": page["status"],
-                        "modified_gmt": page["modified_gmt"],
+                        "modified_gmt": page["modified_gmt"], "post_type": args.post_type,
                         "pulled_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                    time.gmtime())})
     print(f"wp.json   #{page['id']}, edited {page['modified_gmt']} — push will "
@@ -3561,7 +3813,10 @@ def cmd_pull(args):
 
 def read_manifest(out):
     p = os.path.join(out, "manifest.json")
-    return json.load(open(p)) if os.path.exists(p) else {}
+    if not os.path.exists(p):
+        return {}
+    with open(p, encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def cmd_push(args):
@@ -3574,7 +3829,7 @@ def cmd_push(args):
     creds = wp_creds()
     parent_id = args.parent
     if args.parent_path:
-        parent_id = resolve_parent(args.parent_path, creds)
+        parent_id = resolve_parent(args.parent_path, creds, args.language)
         print(f"parent    {args.parent_path} -> #{parent_id}")
     html = assemble(out)
 
@@ -3600,11 +3855,41 @@ def cmd_push(args):
     # afterwards leaves new attachments in the media library that this run
     # will never reference and nobody will ever clean up.
     meta = read_wp_meta(out)
+    post_type = args.post_type or meta.get("post_type") or "page"
+    if args.post_type and meta.get("post_type") and args.post_type != meta.get("post_type"):
+        die("POST_TYPE_MISMATCH",
+            f"wp.json says this build is a {meta['post_type']!r}, but "
+            f"--post-type {args.post_type!r} was passed. Pull it again, or "
+            f"drop --post-type to use what wp.json already knows.")
+    rest = rest_base(post_type)
     post_id = args.post_id or meta.get("post_id")
+    created = False
+
+    if not post_id and not args.title:
+        die("NO_TITLE", "--title is required when creating a page")
+
+    # Resolve every taxonomy term ONCE, before the page-moved-on check, the
+    # media upload, or any write. Catching a bad slug after ewpa/create-post
+    # or mc/set-post-html has already run means the post exists (or its body
+    # is already overwritten) and "nothing was written" would be a lie.
+    cats = (resolve_terms("categories", args.category, creds)
+            if post_type == "post" and args.category else [])
+    regions = (resolve_terms("region", args.region, creds)
+               if post_type == "post" and args.region else [])
+
+    if args.category:
+        if post_type != "post":
+            print("warn  --category ignored: post-type is page")
+        elif post_id:
+            print("warn  --category ignored: categories are only set when a "
+                  "post is created, not on an update")
+    if args.region and post_type != "post":
+        print("warn  --region ignored: post-type is page")
+
     if post_id:
         if not args.post_id:
             print(f"page      #{post_id} from wp.json")
-        cur = wp("GET", f"/wp-json/wp/v2/pages/{post_id}?context=edit", creds=creds)
+        cur = wp("GET", f"/wp-json/wp/v2/{rest}/{post_id}?context=edit", creds=creds)
 
         # Renaming a published page breaks every link to it and leaves no
         # redirect behind. Never do it as a side effect of a folder name.
@@ -3678,31 +3963,56 @@ def cmd_push(args):
             fh.write((cur.get("content") or {}).get("raw", ""))
         print(f"backup    {bpath}")
     else:
-        if not args.title:
-            die("NO_TITLE", "--title is required when creating a page")
-        res = ability("mc/create-localized-page", {
-            "title": args.title, "language": args.language, "status": "draft",
-            "slug": page_slug,
-            **({"parent_id": parent_id} if parent_id else {}),
-        }, creds=creds)
-        post_id = (res.get("output") or res).get("id") or res.get("id")
+        if post_type == "post":
+            res = ability("ewpa/create-post", {
+                "title": args.title, "content": "", "status": "draft",
+                "language": args.language, "slug": page_slug,
+                **({"categories": cats} if cats else {})}, creds=creds)
+        else:
+            res = ability("mc/create-localized-page", {
+                "title": args.title, "language": args.language, "status": "draft",
+                "slug": page_slug,
+                **({"parent_id": parent_id} if parent_id else {}),
+            }, creds=creds)
+        # The ability may answer {"output": {...}} or the object itself, and
+        # name the id "id" or "post_id" either way. Missing one shape here
+        # died CREATE_FAILED with the post already created — an orphan draft.
+        o = res.get("output") or res
+        post_id = o.get("id") or o.get("post_id") or res.get("id") or res.get("post_id")
         if not post_id:
             die("CREATE_FAILED", json.dumps(res)[:300])
-        print(f"page      created #{post_id} (draft, {args.language})")
+        created = True
+        print(f"{post_type:<10}created #{post_id} (draft, {args.language})")
+        # Record the new id NOW. If set-post-html, set-terms, the page js or
+        # the permalink call fails below, wp.json must already point at this
+        # post, or the next push creates a second one. No modified_gmt yet:
+        # that is also how the next push knows this one never finished.
+        meta = {**meta, "post_id": int(post_id), "post_type": post_type,
+                "slug": page_slug}
+        write_wp_meta(out, meta)
 
     ability("mc/set-post-html", {"post_id": int(post_id), "content": html}, creds=creds)
     print(f"body      set via mc/set-post-html ({len(html)} bytes)")
+
+    if post_type == "post" and regions:
+        ability("mc/set-terms", {"post_id": int(post_id), "taxonomy": "region",
+                                 "terms": regions,
+                                 "language": args.language}, creds=creds)
 
     # page.js rides in post meta and is printed from wp_footer by the plugin —
     # post_content would corrupt it. Always write the key, so removing the file
     # removes the script from the page too.
     js = page_js(out)
-    wp("POST", f"/wp-json/wp/v2/pages/{post_id}",
+    wp("POST", f"/wp-json/wp/v2/{rest}/{post_id}",
        body={"meta": {"_wpbuddy_page_js": js}}, creds=creds)
     print(f"page js   {len(js)} bytes -> post meta" if js else "page js   none")
-    perm = ability("mc/regenerate-permalink",
-                   {"post_id": int(post_id), "slug": page_slug}, creds=creds)
-    print(f"permalink {(perm.get('output') or perm).get('permalink', '')}")
+    # A build whose wp.json has a post_id but no modified_gmt was created by
+    # a push that failed before finishing — its permalink may never have run.
+    unfinished = bool(meta.get("post_id")) and not meta.get("modified_gmt")
+    if post_type == "page" or created or unfinished or args.page_slug:
+        perm = ability("mc/regenerate-permalink",
+                       {"post_id": int(post_id), "slug": page_slug}, creds=creds)
+        print(f"permalink {(perm.get('output') or perm).get('permalink', '')}")
 
     # Read modified_gmt LAST. It used to be read straight after set-post-html,
     # but the post-meta write and the permalink call each bump it again, so the
@@ -3710,17 +4020,31 @@ def cmd_push(args):
     # push tripped its own PAGE_MOVED_ON guard. A guard that cries wolf every
     # time gets waved through with --force, which is the one thing it exists to
     # prevent.
-    after = wp("GET", f"/wp-json/wp/v2/pages/{post_id}"
-                      f"?context=edit&_fields=id,slug,title,status,link,parent,modified_gmt",
+    after = wp("GET", f"/wp-json/wp/v2/{rest}/{post_id}"
+                      f"?context=edit&_fields=id,slug,title,status,link,parent,modified_gmt,content",
                creds=creds)
     write_wp_meta(out, {**meta, "post_id": after["id"], "slug": after["slug"],
                         "title": (after["title"] or {}).get("raw", ""),
                         "parent": after.get("parent"), "link": after["link"],
                         "status": after["status"],
-                        "modified_gmt": after["modified_gmt"],
+                        "modified_gmt": after["modified_gmt"], "post_type": post_type,
                         "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
                                                    time.gmtime())})
-    print("\nDraft is up. After publishing, purge the cache:")
+
+    rendered = (after.get("content") or {}).get("rendered", "")
+    delta = wpsafe.autop_delta(html, rendered)
+    if not rendered:
+        note = "  — could not compare: WordPress returned no rendered body"
+    elif delta > 0:
+        note = ("  — WordPress added paragraphs: either the body is not inside "
+                "<!-- wp:html -->, or a plugin filtering the_content adds <p>")
+    elif delta < 0:
+        note = "  — could not compare: the rendered body has fewer <p> than expected"
+    else:
+        note = ""
+    print(f"postcheck wpautop {delta:+d} <p>{note}")
+
+    print(f"\n{post_type} #{post_id} is {after['status']}. After publishing, purge the cache:")
     print("  PUT /wp-json/siteground-optimizer/v1/purge-cache")
 
 
@@ -3736,6 +4060,12 @@ def main():
                                    "(default: the largest)")
     e.add_argument("--no-assets", action="store_true")
     e.add_argument("--no-render", action="store_true")
+    e.add_argument("--from", dest="from_", choices=["figma", "claude-design"],
+                   default="figma", help="what SOURCE is (default: figma)")
+    e.add_argument("--cd-project", help="Claude Design project id, recorded in design.json")
+    e.add_argument("--cd-file", help="the export's path inside the project")
+    e.add_argument("--force", action="store_true",
+                   help="overwrite a page.html edited since the last extract")
     e.set_defaults(fn=cmd_extract)
 
     v = sub.add_parser("verify")
@@ -3768,6 +4098,7 @@ def main():
                                      "WordPress down to a build folder")
     pl.add_argument("target", help="post id, URL, slug, or exact title")
     pl.add_argument("--slug", help="build folder name (default: the page slug)")
+    pl.add_argument("--post-type", choices=["page", "post"], default="page")
     pl.set_defaults(fn=cmd_pull)
 
     au = sub.add_parser("audit", help="name every element that does not match "
@@ -3799,6 +4130,8 @@ def main():
                          "build in isolation, which is not what ships")
     pv.add_argument("--refresh-site", action="store_true",
                     help="re-fetch the live page's CSS and wrappers")
+    pv.add_argument("--site-sample", help="take the site's CSS from this public "
+                    "page instead of the build's own link")
     pv.set_defaults(fn=cmd_preview)
 
     sub.add_parser("setup").set_defaults(fn=cmd_setup)
@@ -3818,6 +4151,12 @@ def main():
                         "build last touched the page")
     u.add_argument("--no-webp", action="store_true",
                    help="upload PNG/JPEG as-is instead of converting to WebP")
+    u.add_argument("--post-type", choices=["page", "post"],
+                   help="default: wp.json's post_type, else page")
+    u.add_argument("--category", action="append", default=[],
+                   help="post category slug, repeatable")
+    u.add_argument("--region", action="append", default=[],
+                   help="post region slug (hong-kong, taiwan, …), repeatable")
     u.set_defaults(fn=cmd_push)
 
     args = p.parse_args()
