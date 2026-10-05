@@ -3,8 +3,12 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
-## [Unreleased]
+## [0.7.1]
 
+- **No more Claude Tag.** The skill runs in Claude Code and Cowork on the
+  user's Mac; the Slack-channel host, its sandbox rules and its setup-script
+  troubleshooting are gone from SKILL.md. The commit-at-every-boundary rule now
+  applies to any page repo that keeps `build/` in git.
 - **Develop in place from the page repo.** `mcailab/figma-page-build` now carries
   this repo as a submodule at `figma-to-wp/`, so the skill is edited and committed
   here directly instead of through a copy. The real-page test fixtures stay in

@@ -35,29 +35,20 @@ answer: the copy, the hex values, the type scale, where each asset went.
 > confident and completely wrong page. Outside auto-layout subtrees the only
 > honest source of layout is the render. Do not rebuild that machinery.
 
-Same behaviour in Claude Code, Claude Cowork and a Claude Tag channel: stdlib
-Python over HTTPS, no MCP server needed.
+Same behaviour in Claude Code and Claude Cowork: stdlib Python over HTTPS, no
+MCP server needed.
 
 ## Where commands run
 
-Three hosts. They differ in exactly three things: where the credentials sit,
-which browser `diff` drives, and whether the work survives the session.
+Both hosts run on the user's own Mac:
 
-| Host | The terminal is | Credentials | The work survives because |
-|---|---|---|---|
-| Claude Code on the user's Mac | the **Bash** tool | `~/.figma-wp/.env` | the disk is the user's own |
-| Claude Cowork on the user's Mac | the **Desktop Commander** connector | `~/.figma-wp/.env` | same machine |
-| A **Claude Tag** channel in Slack | the **Bash** tool in the session's sandbox | `.env` in the cloned build repo | **you commit and push it** |
+| Host | The terminal is | Credentials |
+|---|---|---|
+| Claude Code | the **Bash** tool | `~/.figma-wp/.env`, or the folder `$FIGMA_WP_HOME` names |
+| Claude Cowork | the **Desktop Commander** connector | `~/.figma-wp/.env` |
 
 In Cowork, use Desktop Commander and never Cowork's own sandboxed shell: that
 shell reaches a different machine from the one holding `~/.figma-wp/.env`.
-
-The Claude Tag sandbox is a different proposition from that one. It *is* the
-machine: it has its own Chromium, it can serve and reach `127.0.0.1`, and the
-build repo is checked out inside it. The one thing it does not have is a disk
-that outlives the conversation — it is discarded when the thread goes idle.
-Everything under [Where the work lands](#where-the-work-lands) about committing
-exists for that reason, and applies there and nowhere else.
 
 ## Locating the CLI
 
@@ -87,44 +78,34 @@ python3 "$FW" doctor
 ```
 
 The first path is where an org-managed plugin lands (Claude Desktop and Cowork);
-the second is Claude Code's; the last two are a personal install and a checkout
-you are developing in. Cowork nests a plugin under two session UUIDs, which is
-why `-maxdepth` has to be this generous.
-
-In a Claude Tag sandbox only the last one exists, and it resolves as long as you
-run from the build repo's root — which is where everything else expects you to
-be anyway. The skill itself arrives the same way the CLI does: it is committed in
-that repo under `.claude/skills/`, and cloning the repo is what loads it.
+the second is Claude Code's; the third is a personal install; the last two are a
+page repo that carries this skill as a submodule (`figma-to-wp/`) and symlinks it
+into `.claude/skills/` — `-H` makes `find` follow that link. Cowork nests a
+plugin under two session UUIDs, which is why `-maxdepth` has to be this generous.
 
 `find` is used rather than a shell glob on purpose. Under `zsh` — Desktop
 Commander's default shell — a glob that matches nothing aborts the whole loop,
 so a Mac that has Cowork but not Claude Code would report the CLI missing when
 it is in fact installed.
 
-If nothing is found, the skill has not reached this host yet. On a Mac, say so
-and ask the user to reopen the session or refresh plugins. In a Claude Tag
-channel it means the build repo was never cloned — name the repository and clone
-it before anything else. Either way, do not try to work around it.
+If nothing is found, the skill has not reached this host yet: say so and ask the
+user to reopen the session or refresh plugins. In a page repo that carries the
+skill as a submodule, `git submodule update --init` brings it in. Do not try to
+work around it.
 
 ## Where the work lands
 
 The script keeps no state of its own. Each page's working files go in
 `build/<slug>/` **relative to the directory you run from**, not next to the
-script. Credentials sit in `~/.figma-wp/.env` (mode 600) on a Mac, and in the
-build repo's own `.env` in a Claude Tag sandbox.
+script. Credentials sit in `~/.figma-wp/.env` (mode 600), or in the folder
+`$FIGMA_WP_HOME` points at — a page repo keeps its own `.figma-wp/.env`.
 
 On a Mac, pick a working directory with the user and stay in it — `~/figma-to-wp`
 is a reasonable default on a Mac that has no repo for this.
 
-In a Claude Tag channel the working directory is the root of the cloned build
-repo, and there is one more rule, which has no equivalent on a Mac:
-
-> **Uncommitted work does not exist.** The sandbox is discarded when the thread
-> goes idle. A section you authored and never pushed is a section nobody will
-> ever see again.
-
-Commit at each of these five boundaries, `git pull --rebase` first so two pages
-being built at once never collide:
+When the working directory is a git repo that keeps `build/` — a team's page
+repo — commit at each of these five boundaries, `git pull --rebase` first so two
+pages being built at once never collide:
 
 | After | Message | What lands |
 |---|---|---|
@@ -191,17 +172,8 @@ render with Pillow; without it `design.png` is the whole canvas, which is the
 wrong picture to build against and does not announce itself. `diff` has no way
 to render a page without Chrome, and `diff` is not optional either.
 
-Who provides each of these depends on the host:
-
-| Host | How the dependencies get there |
-|---|---|
-| Mac | installed by hand once (`brew install`, `pip3 install Pillow`, Chrome) |
-| Claude Tag sandbox | the cloud environment's **setup script**, run before Claude starts and then cached in the environment snapshot |
-
-If `doctor` reports a gap in a Claude Tag channel, that is a setup-script bug and
-an Owner has to fix it at `claude.ai/admin-settings` → **Cloud environments**.
-Do not install it by hand in the session: the sandbox is thrown away, so the next
-thread would hit the same gap.
+They are installed by hand once on the Mac (`brew install`, `pip3 install
+Pillow`, Chrome).
 
 In Cowork the Mac also needs Claude Desktop with the **Desktop Commander**
 connector connected — the only thing anyone installs by hand. In Claude Code
@@ -940,14 +912,13 @@ separate, explicit step.
   not go on the page.
 - **Do not re-upload assets already in `manifest.json`** — the media library
   fills with duplicates and the WAF starts refusing uploads.
-- **Never print a credential into a thread.** A Slack channel is not a terminal;
-  what Claude echoes there is visible to everyone in the channel and stays in the
-  history. This holds for both hosts.
-- **Never commit the Mac's `~/.figma-wp/.env`.** The build repo's own `.env` is a
+- **Never print a credential into the conversation.** What Claude echoes stays
+  in the transcript.
+- **Never commit the Mac's `~/.figma-wp/.env`.** A page repo's own `.env` is a
   different file and is committed on purpose — which is why **that repo has to
   stay private**. If it is ever made public, both credentials are burnt and have
   to be rotated, not just deleted.
-- **In a Claude Tag channel, never end a reply on uncommitted work.** See
+- **In a page repo, never end a reply on uncommitted work.** See
   [Where the work lands](#where-the-work-lands).
 
 ## Troubleshooting
