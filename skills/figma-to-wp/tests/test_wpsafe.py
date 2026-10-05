@@ -6,16 +6,13 @@ import wpsafe  # noqa: E402
 
 FIX = os.path.join(HERE, "fixtures", "cd-78436")
 
-# export.html, pushed-before.html and expected-body.html are a real page (post
-# 78436). They live in the Figma-to-WP build repo only; the published plugin
-# ships without them, and every test that reads them skips there.
-PAGE_FIXTURES = all(os.path.exists(os.path.join(FIX, n)) for n in
-                    ("export.html", "pushed-before.html", "expected-body.html"))
-needs_page = unittest.skipUnless(PAGE_FIXTURES, "page fixtures are not shipped with the plugin")
+sys.path.insert(0, HERE)
+from page_fixtures import PAGE_FIX, PAGE_FIXTURES, needs_page, NAMES as PAGE_NAMES  # noqa: E402
 
 
 def fixture(name):
-    with open(os.path.join(FIX, name), encoding="utf-8") as fh:
+    base = PAGE_FIX if name in PAGE_NAMES else FIX
+    with open(os.path.join(base, name), encoding="utf-8") as fh:
         return fh.read()
 
 

@@ -65,10 +65,11 @@ The script ships with the skill and is already on disk. **Never download it.**
 Resolve it by version so the newest wins when several copies exist:
 
 ```sh
-FW=$(find "$HOME/Library/Application Support/Claude/local-agent-mode-sessions" \
+FW=$(find -H "$HOME/Library/Application Support/Claude/local-agent-mode-sessions" \
           "$HOME/.claude/plugins/cache/zorskill/figma-to-wp" \
           "$HOME/.claude/skills/figma-to-wp" \
           ".claude/skills/figma-to-wp" \
+          "figma-to-wp/skills/figma-to-wp" \
           -maxdepth 8 -path '*/scripts/figma_to_wp.py' 2>/dev/null | while IFS= read -r s; do
   d=${s%scripts/figma_to_wp.py}
   v=

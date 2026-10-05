@@ -17,7 +17,19 @@ sha="$(shasum -a 256 "$src" | cut -d' ' -f1)"
   echo "# sha256: $sha"
   cat "$src"
 } > "$dest/app/wpsafe.py"
-mkdir -p "$dest/tests/fixtures"
-rm -rf "$dest/tests/fixtures/cd-78436"
-cp -R "$here/../tests/fixtures/cd-78436" "$dest/tests/fixtures/"
+# Fixtures: the synthetic bad-*.html ship with this repo; the real-page ones
+# (export, pushed-before, expected-body) are page data and live in the private
+# page repo — pass their folder as FIGMA_WP_PAGE_FIXTURES, or run from inside
+# mcailab/figma-page-build, where they are found automatically. Existing copies
+# in mcp-wp are kept when they cannot be found.
+fx="$dest/tests/fixtures/cd-78436"
+mkdir -p "$fx"
+cp "$here"/../tests/fixtures/cd-78436/bad-*.html "$fx/"
+page="${FIGMA_WP_PAGE_FIXTURES:-$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import page_fixtures as p; print(p.PAGE_FIX)' "$here/../tests")}"
+if [ -n "$page" ] && [ -d "$page" ]; then
+  cp "$page"/export.html "$page"/pushed-before.html "$page"/expected-body.html "$fx/"
+  echo "page fixtures from $page"
+else
+  echo "page fixtures not found — kept whatever $fx already had" >&2
+fi
 echo "synced wpsafe.py @ $commit ($sha) and fixtures into $dest"

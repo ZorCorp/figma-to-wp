@@ -5,12 +5,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SCRIPT = os.path.join(HERE, "..", "scripts", "figma_to_wp.py")
 FIX = os.path.join(HERE, "fixtures", "cd-78436")
 
-# export.html, pushed-before.html and expected-body.html are a real page (post
-# 78436). They live in the Figma-to-WP build repo only; the published plugin
-# ships without them, and every test that reads them skips there.
-PAGE_FIXTURES = all(os.path.exists(os.path.join(FIX, n)) for n in
-                    ("export.html", "pushed-before.html", "expected-body.html"))
-needs_page = unittest.skipUnless(PAGE_FIXTURES, "page fixtures are not shipped with the plugin")
+sys.path.insert(0, HERE)
+from page_fixtures import PAGE_FIX, PAGE_FIXTURES, needs_page, NAMES as PAGE_NAMES  # noqa: E402
 sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 
 
@@ -24,7 +20,7 @@ class ExtractClaudeDesign(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
-        cls.res = run(cls.tmp, "extract", os.path.join(FIX, "export.html"),
+        cls.res = run(cls.tmp, "extract", os.path.join(PAGE_FIX, "export.html"),
                       "--slug", "cd", "--from", "claude-design",
                       "--cd-project", "00000000-0000-4000-8000-000000000000",
                       "--cd-file", "export/wp-ai-in-motion.html")
@@ -62,7 +58,7 @@ class ExtractClaudeDesign(unittest.TestCase):
         p = os.path.join(self.out, "page.html")
         with open(p, "a", encoding="utf-8") as fh:
             fh.write("<!-- hand edit -->\n")
-        r = run(self.tmp, "extract", os.path.join(FIX, "export.html"),
+        r = run(self.tmp, "extract", os.path.join(PAGE_FIX, "export.html"),
                 "--slug", "cd", "--from", "claude-design")
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("HAND_EDITED", r.stderr + r.stdout)
@@ -89,7 +85,7 @@ class ExtractClaudeDesign(unittest.TestCase):
             with open(os.path.join(out, "page.html"), encoding="utf-8") as fh:
                 before = fh.read()
 
-            r = run(tmp, "extract", os.path.join(FIX, "export.html"),
+            r = run(tmp, "extract", os.path.join(PAGE_FIX, "export.html"),
                     "--slug", "figstuff", "--from", "claude-design")
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("NOT_A_CD_BUILD", r.stderr + r.stdout)
@@ -108,7 +104,7 @@ class ExtractClaudeDesign(unittest.TestCase):
             with open(os.path.join(out, "page.html"), "w", encoding="utf-8") as fh:
                 fh.write("<div id=\"whatever\">hi</div>")
 
-            r = run(tmp, "extract", os.path.join(FIX, "export.html"),
+            r = run(tmp, "extract", os.path.join(PAGE_FIX, "export.html"),
                     "--slug", "nodj", "--from", "claude-design")
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("NOT_A_CD_BUILD", r.stderr + r.stdout)

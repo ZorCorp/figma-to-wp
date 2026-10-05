@@ -3,6 +3,17 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [Unreleased]
+
+- **Develop in place from the page repo.** `mcailab/figma-page-build` now carries
+  this repo as a submodule at `figma-to-wp/`, so the skill is edited and committed
+  here directly instead of through a copy. The real-page test fixtures stay in
+  the page repo (`build/ai-in-motion-cd/test-fixtures/`); `tests/page_fixtures.py`
+  finds them there or via `$FIGMA_WP_PAGE_FIXTURES`, and the tests that need them
+  skip otherwise. `sync-wpsafe.sh` takes them from the same place.
+- **The CLI is found through a symlinked skill folder** (`find -H`), and in the
+  page repo's `figma-to-wp/skills/figma-to-wp`.
+
 ## [0.7.0]
 
 Claude Design → WordPress, and posts.
