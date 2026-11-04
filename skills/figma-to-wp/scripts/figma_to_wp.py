@@ -1912,13 +1912,21 @@ def _font_get(url):
     """Body of a font or stylesheet URL, or None. Only http(s) is fetched (a
     page's CSS can name file: or data: URLs), and anything that goes wrong —
     InvalidURL, a non-ASCII URL, a cut-off read — is a skip, not a traceback."""
-    if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
-        return None
     try:
+        if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+            return None
         return http_get(url)
     except Exception as e:
         print(f"fonts     download failed: {url} ({type(e).__name__}: {e})",
               file=sys.stderr)
+        return None
+
+
+def _join(base, url):
+    """urljoin that answers None for a URL it cannot parse (http://[bad)."""
+    try:
+        return urllib.parse.urljoin(base, url)
+    except ValueError:
         return None
 
 
@@ -1942,12 +1950,14 @@ def el_fonts(out, html, base, families):
         sheets.append((css, final))
         if depth == 0:
             for imp in elementor.css_imports(css):
-                add(urllib.parse.urljoin(final, imp), 1)
+                if _join(final, imp):
+                    add(_join(final, imp), 1)
     for href in links:
-        add(urllib.parse.urljoin(base, href), 0)
+        if _join(base, href):
+            add(_join(base, href), 0)
 
     want = {f.lower(): f for f in families}
-    chosen, nolatin = {}, set()      # (family, weight, style) -> (rank, url, ext)
+    chosen, nolatin = {}, {}         # (family, weight, style) -> (rank, url, ext)
     for css, where in sheets:
         for face in elementor.font_faces(css):
             fam = want.get(face["family"].lower())
@@ -1957,13 +1967,14 @@ def el_fonts(out, html, base, families):
             rng = face["range"].upper().replace(" ", "")
             rank = 0 if not rng or "U+0000-00FF" in rng else 1
             key = (fam, face["weight"], face["style"])
-            if key not in chosen or rank < chosen[key][0]:
-                chosen[key] = (rank, urllib.parse.urljoin(where, best[0]), best[1])
+            url = _join(where, best[0])
+            if url and (key not in chosen or rank < chosen[key][0]):
+                chosen[key] = (rank, url, best[1])
     written, why = {}, {}
     d = os.path.join(out, "assets", "fonts")
     for (fam, weight, style), (rank, url, ext) in sorted(chosen.items()):
         if rank:
-            nolatin.add(fam)
+            nolatin.setdefault(fam, []).append(weight)
             continue
         name = (f"{font_slug(fam)}-{weight}" + ("-italic" if style == "italic" else "")
                 + "." + ext)
@@ -1979,13 +1990,18 @@ def el_fonts(out, html, base, families):
             continue
         written.setdefault(fam, []).append(name)
     for fam in families:
-        if fam in nolatin:
-            why[fam] = (f"{fam!r} is split by unicode-range with no latin slice (CJK?), so "
-                        "nothing was downloaded — the preview falls back to the "
-                        "system face, as the live site does")
-        elif fam not in written:
-            why[fam] = (f"no @font-face file found for {fam!r} that could be downloaded "
-                        f"from the page's styles — the preview will not have its glyph widths")
+        if fam not in written:
+            if fam in nolatin:
+                why[fam] = (f"{fam!r} is split by unicode-range with no latin slice (CJK?), "
+                            f"so nothing was downloaded — the preview falls back to the "
+                            f"system face, as the live site does")
+            else:
+                why[fam] = (f"no @font-face file found for {fam!r} that could be downloaded "
+                            f"from the page's styles — the preview will not have its glyph widths")
+        elif fam in nolatin:
+            why[fam] = (f"{fam!r} weight(s) {', '.join(sorted(set(nolatin[fam])))} have no "
+                        f"latin slice (CJK?) and were not downloaded — the preview falls "
+                        f"back to the system face for them")
     return written, why
 
 
@@ -2168,7 +2184,7 @@ def extract_elementor(args):
     n = sum(len(v) for v in got.values())
     if n:
         print(f"fonts     {n} file(s) -> build/{slug}/assets/fonts "
-              f"({', '.join(sorted(got))}); the preview serves them, no network")
+              f"({', '.join(sorted(got))}); the preview serves them from the build")
     for fam, why in lacking.items():
         print(f"warn      fonts: {why}")
     if not {"Roboto", "Raleway"} & set(fonts):

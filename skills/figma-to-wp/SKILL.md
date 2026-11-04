@@ -945,7 +945,9 @@ Raleway, declared after the site's cached CSS so they win over its own gstatic
 URLs; Figma builds still get Raleway. Only http(s) URLs are fetched, and a
 family split by script with no latin slice (CJK) is not downloaded. A family
 `extract` printed a `warn fonts:` line for has no file and the preview cannot
-reproduce its glyph widths: put a `<family>.woff2` in that folder by hand. When a whole block is off by the same few px, check which face the
+reproduce its glyph widths: put a `<family>.woff2` in that folder by hand.
+A family with no file can still fall back to the Google Fonts link in a normal
+browser. When a whole block is off by the same few px, check which face the
 preview actually rendered before moving anything; the draft's front end has
 the last word.
 

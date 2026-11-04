@@ -532,7 +532,10 @@ def font_ext(url, fmt=""):
     """The file extension of a font source: the URL's own when it is a font
     one, else what its format() hint says (a css?id=7 URL declared as
     format('truetype') is a .ttf), else ''."""
-    ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lstrip(".").lower()
+    try:
+        ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lstrip(".").lower()
+    except ValueError:                   # http://[bad
+        return ""
     return ext if ext in FONT_PREFERENCE else _FMT_EXT.get(fmt, "")
 
 

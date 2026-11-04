@@ -2090,6 +2090,28 @@ class ExtractElementorFonts(ExtractFixture):
         self.assertEqual([c for c in self.calls if str(c[1]).startswith(("file:", "data:"))], [])
         self.assertTrue(os.path.exists(os.path.join(self.out, "design.json")))
 
+    def test_bad_ipv6_urls_are_skipped_like_any_other_failure(self):
+        self.page("@font-face{font-family:Roboto;font-weight:100;src:url(http://[bad/x.woff2)}"
+                  "@font-face{font-family:Roboto;font-weight:400;src:url(https://f.example.test/ok.woff2)}",
+                  ["http://[bad", self.GF])
+        self.http_files[self.GF] = b"@import url(http://[bad/m.css);"
+        self.http_files["https://f.example.test/ok.woff2"] = b"OK"
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.extract()
+        self.assertEqual(self.fonts(), ["roboto-400.woff2"])
+
+    def test_latin_for_some_weights_and_cjk_only_for_others_is_not_nothing_downloaded(self):
+        self.page("@font-face{font-family:Roboto;font-weight:400;src:url(https://f.example.test/r4.woff2)}"
+                  "@font-face{font-family:Roboto;font-weight:700;unicode-range:U+4E00-9FFF;"
+                  "src:url(https://f.example.test/c7.woff2)}")
+        printed = self.extract()
+        self.assertEqual(self.fonts(), ["roboto-400.woff2"])
+        w = [l for l in printed.splitlines() if l.startswith("warn") and "fonts" in l]
+        self.assertEqual(len(w), 1, printed)
+        self.assertIn("700", w[0])
+        self.assertNotIn("nothing was downloaded", w[0])
+        self.assertNotIn("no network", printed)
+
     def test_every_download_failing_is_a_warn_for_the_family(self):
         self.page("@font-face{font-family:Roboto;font-weight:400;src:url(https://f.example.test/r 4.ttf)}")
         self.http_files["https://f.example.test/r 4.ttf"] = http.client.InvalidURL("x")
