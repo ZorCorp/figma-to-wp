@@ -492,6 +492,71 @@ def snapshot(html, origin, post_id, measure_js):
     return html + script if i < 0 else html[:i] + script + html[i:]
 
 
+# --- fonts --------------------------------------------------------------------
+
+_FACE = re.compile(r"@font-face\s*\{([^{}]*)\}", re.I)
+_WEIGHT_WORDS = {"normal": "400", "bold": "700"}
+FONT_PREFERENCE = ("woff2", "woff", "ttf", "otf")      # eot and svg never
+
+
+def _decl(body, prop):
+    m = re.search(r"(?:^|[;\s])" + prop + r"\s*:\s*([^;]+)", body, re.I)
+    return m.group(1).strip() if m else ""
+
+
+def font_faces(css):
+    """Every @font-face in css: {family, style, weight, srcs [(url, format)],
+    range}. A weight range ("100 900") is spelled "100-900"; comments are not
+    rules; unicode-range is kept because a family is often split by script."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    faces = []
+    for m in _FACE.finditer(css):
+        body = m.group(1)
+        fam = _decl(body, "font-family").strip("'\" ")
+        if not fam:
+            continue
+        w = " ".join(_decl(body, "font-weight").lower().split()) or "400"
+        w = "-".join(_WEIGHT_WORDS.get(x, x) for x in w.split())
+        srcs = [(u.strip().strip("'\""), (f or "").strip().strip("'\"").lower())
+                for u, f in re.findall(r"url\(\s*([^)]*?)\s*\)\s*(?:format\(\s*([^)]*?)\s*\))?",
+                                      _decl(body, "src"), re.I)]
+        faces.append({"family": fam, "style": _decl(body, "font-style").lower() or "normal",
+                      "weight": w, "srcs": srcs, "range": _decl(body, "unicode-range")})
+    return faces
+
+
+def _font_ext(url, fmt=""):
+    ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lstrip(".").lower()
+    if ext in FONT_PREFERENCE:
+        return ext
+    return {"truetype": "ttf", "opentype": "otf"}.get(fmt, fmt)
+
+
+def best_font_src(face):
+    """The url to download for a face: woff2, else woff, else ttf/otf. None when
+    it only offers eot or svg."""
+    ranked = [(FONT_PREFERENCE.index(e), u) for u, f in face["srcs"]
+              for e in [_font_ext(u, f)] if e in FONT_PREFERENCE]
+    return min(ranked)[1] if ranked else None
+
+
+def style_sources(html):
+    """([inline <style> css], [stylesheet <link> hrefs]) of a page, in order."""
+    inline = re.findall(r"<style\b[^>]*>(.*?)</style>", html, re.S | re.I)
+    links = []
+    for tag in re.findall(r"<link\b[^>]*>", html, re.I):
+        a = {k.lower(): v for k, _, v in re.findall(r"""([\w-]+)\s*=\s*(["'])(.*?)\2""", tag)}
+        if "stylesheet" in a.get("rel", "").lower().split() and a.get("href"):
+            links.append(a["href"])
+    return inline, links
+
+
+def css_imports(css):
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    return [a or b for a, b in re.findall(
+        r"""@import\s+(?:url\(\s*["']?([^"')]+)["']?\s*\)|["']([^"']+)["'])""", css, re.I)]
+
+
 # --- viewport height ----------------------------------------------------------
 
 # A number followed by vh (or dvh/svh/lvh), not one glued to a name: the

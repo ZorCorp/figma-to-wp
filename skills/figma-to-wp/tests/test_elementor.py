@@ -1215,6 +1215,44 @@ class ElementorPageDoc(unittest.TestCase):
         self.assertTrue(html[s:].startswith("<div data-elementor-type"))
 
 
+class ElementorFontFaces(unittest.TestCase):
+    CSS = (
+        "@font-face{font-family:'Roboto';font-style:normal;font-weight:400;"
+        "src:url(https://f.test/r4.ttf) format('truetype')}\n"
+        "@font-face {\n font-family: \"Roboto\";\n font-style: italic;\n"
+        " font-weight: 100 900;\n src: url(../fonts/ri.eot?#iefix) format('embedded-opentype'),"
+        " url(../fonts/ri.woff) format('woff'), url('../fonts/ri.woff2') format('woff2');\n}\n"
+        "@font-face{font-family:eicons;src:url(e.svg#x) format('svg')}\n"
+        "/* @font-face{font-family:Gone;src:url(g.woff2)} */")
+
+    def test_faces_carry_family_style_weight_and_sources(self):
+        f = el.font_faces(self.CSS)
+        self.assertEqual([(x["family"], x["style"], x["weight"]) for x in f],
+                         [("Roboto", "normal", "400"), ("Roboto", "italic", "100-900"),
+                          ("eicons", "normal", "400")])
+        self.assertEqual(f[0]["srcs"], [("https://f.test/r4.ttf", "truetype")])
+
+    def test_comments_are_not_faces(self):
+        self.assertFalse([x for x in el.font_faces(self.CSS) if x["family"] == "Gone"])
+
+    def test_best_source_prefers_woff2_then_woff_then_ttf_and_never_eot_or_svg(self):
+        f = el.font_faces(self.CSS)
+        self.assertEqual(el.best_font_src(f[1]), "../fonts/ri.woff2")
+        self.assertEqual(el.best_font_src(f[0]), "https://f.test/r4.ttf")
+        self.assertIsNone(el.best_font_src(f[2]))
+
+    def test_style_sources_are_inline_blocks_and_stylesheet_links(self):
+        html = ('<head><style>.a{}</style><link rel="stylesheet" href="/a.css">'
+                '<link rel=preload href="/n.css"><link href="/b.css" rel="stylesheet"></head>')
+        inline, links = el.style_sources(html)
+        self.assertEqual(inline, [".a{}"])
+        self.assertEqual(links, ["/a.css", "/b.css"])
+
+    def test_css_imports(self):
+        self.assertEqual(el.css_imports('@import url("a.css"); @import "b.css" screen;'),
+                         ["a.css", "b.css"])
+
+
 class ElementorInventory(unittest.TestCase):
     def setUp(self):
         self.inv = el.inventory(LIVE, 1234, mini("elementor-data.json"))
@@ -1608,6 +1646,7 @@ class ExtractFixture(unittest.TestCase):
         self.calls, self.dumps, self.shots = [], [], []
         self.grow = {}        # dump_dom window width -> px the page grows by on the shot run
         self.no_ink = set()   # dump_dom window widths whose shot has nothing where the text is
+        self.http_files = {}  # url -> bytes (or an exception) for http_get, ahead of the defaults
         for name, repl in (
                 ("BUILD", self.build),
                 ("wp_creds", lambda: ("https://example.test", "u", "p")),
@@ -1650,6 +1689,10 @@ class ExtractFixture(unittest.TestCase):
 
     def fake_http_get(self, url, timeout=60):
         self.calls.append(("http_get", url))
+        if url in self.http_files:
+            if isinstance(self.http_files[url], Exception):
+                raise self.http_files[url]
+            return url, self.http_files[url]
         if url.endswith("post-1234.css"):
             return url, mini("post-1234.css").encode()
         return url, b"\x89PNG fake " + url.encode()
@@ -1951,6 +1994,77 @@ class ExtractElementorRender(ExtractFixture):
         printed = self.extract(no_render=True, no_assets=True)
         self.assertIn("ignored with --from elementor", printed)
         self.assertNotIn("ignored with --from elementor", self.extract())
+
+
+class ExtractElementorFonts(ExtractFixture):
+    """The faces the reference loaded are downloaded into the build, so the
+    preview needs no network."""
+
+    ORIGIN = "https://example.test"
+    GF = ORIGIN + "/wp-content/uploads/elementor/google-fonts/css/roboto.css"
+
+    def page(self, inline="", links=()):
+        head = "<style>" + inline + "</style>" + "".join(
+            '<link rel="stylesheet" href="%s">' % h for h in links)
+        self.html = LIVE.replace("<head>", "<head>" + head, 1)
+
+    def fonts(self):
+        d = os.path.join(self.out, "assets", "fonts")
+        return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+    def test_downloads_declared_weights_from_inline_style_links_and_imports(self):
+        self.page("@font-face{font-family:'Roboto';font-style:normal;font-weight:400;"
+                  "src:url(https://f.example.test/r4.ttf) format('truetype')}"
+                  "@font-face{font-family:'Roboto';font-weight:700;"
+                  "src:url(https://f.example.test/r7.woff2) format('woff2'),"
+                  "url(https://f.example.test/r7.ttf) format('truetype')}"
+                  "@font-face{font-family:eicons;src:url(https://f.example.test/e.woff2)}",
+                  [self.GF])
+        self.http_files[self.GF] = (
+            b"@import url('roboto-more.css');"
+            b"@font-face{font-family:\"Roboto\";font-style:italic;font-weight:400;"
+            b"src:url(../fonts/ri.woff2) format(\"woff2\")}")
+        self.http_files[self.GF.replace("roboto.css", "roboto-more.css")] = (
+            b"@font-face{font-family:Roboto;font-weight:300;src:url(/m/r3.woff2)}"
+            b"@import url(too-deep.css);")
+        for u in ("https://f.example.test/r4.ttf", "https://f.example.test/r7.woff2",
+                  self.ORIGIN + "/wp-content/uploads/elementor/google-fonts/fonts/ri.woff2",
+                  self.ORIGIN + "/m/r3.woff2"):
+            self.http_files[u] = b"FAKE " + u.encode()
+        printed = self.extract()
+        self.assertEqual(self.fonts(), ["roboto-300.woff2", "roboto-400-italic.woff2",
+                                        "roboto-400.ttf", "roboto-700.woff2"])
+        self.assertEqual(_read(os.path.join(self.out, "assets", "fonts", "roboto-700.woff2"), "rb"),
+                         b"FAKE https://f.example.test/r7.woff2")
+        self.assertNotIn(("http_get", "https://f.example.test/e.woff2"), self.calls)  # icon face
+        self.assertFalse([c for c in self.calls if c[1].endswith("too-deep.css")])    # one level
+        self.assertIn("4 file(s)", [l for l in printed.splitlines() if l.startswith("fonts")][-1])
+        self.assertNotRegex(printed, r"(?i)warn.*font")
+
+    def test_family_with_no_declared_face_warns_and_does_not_die(self):
+        self.page("")
+        printed = self.extract()
+        self.assertEqual(self.fonts(), [])
+        self.assertRegex(printed, r"(?m)^warn\s+fonts: no @font-face file found for 'Roboto'")
+        self.assertTrue(os.path.exists(os.path.join(self.out, "design.json")))
+
+    def test_a_download_that_fails_warns_for_the_family(self):
+        self.page("@font-face{font-family:Roboto;font-weight:400;src:url(https://f.example.test/r4.ttf)}")
+        self.http_files["https://f.example.test/r4.ttf"] = urllib.error.URLError("boom")
+        printed = self.extract()
+        self.assertEqual(self.fonts(), [])
+        self.assertRegex(printed, r"(?m)^warn\s+fonts: no @font-face file found for 'Roboto'")
+
+    def test_duplicate_weight_subsets_keep_the_latin_one(self):
+        self.page("@font-face{font-family:Roboto;font-weight:400;unicode-range:U+0400-045F;"
+                  "src:url(https://f.example.test/cyr.woff2)}"
+                  "@font-face{font-family:Roboto;font-weight:400;unicode-range:U+0000-00FF,U+0131;"
+                  "src:url(https://f.example.test/lat.woff2)}")
+        self.http_files["https://f.example.test/lat.woff2"] = b"LATIN"
+        self.http_files["https://f.example.test/cyr.woff2"] = b"CYR"
+        self.extract()
+        self.assertEqual(_read(os.path.join(self.out, "assets", "fonts", "roboto-400.woff2"), "rb"),
+                         b"LATIN")
 
 
 class ElementorCopyTexts(unittest.TestCase):
@@ -2425,11 +2539,31 @@ class PreviewFonts(unittest.TestCase):
         self.assertIn("assets/fonts/roboto.woff2", css)
         self.assertNotIn("raleway", css.lower())
 
+    def test_elementor_build_points_at_the_downloaded_files_with_no_network_link(self):
+        for n in ("roboto-400.ttf", "roboto-700.woff2", "roboto-400-italic.woff2",
+                  "roboto-100-900.woff2"):
+            self.face(n)
+        html = fw.preview_font_html(self.out, self.elementor(["Roboto"]))
+        self.assertNotIn("googleapis", html)
+        self.assertIn("font-family:'Roboto';src:url('assets/fonts/roboto-400.ttf') "
+                      "format('truetype');font-weight:400;font-style:normal", html)
+        self.assertIn("url('assets/fonts/roboto-700.woff2') format('woff2');"
+                      "font-weight:700;font-style:normal", html)
+        self.assertIn("url('assets/fonts/roboto-400-italic.woff2') format('woff2');"
+                      "font-weight:400;font-style:italic", html)
+        self.assertIn("font-weight:100 900;font-style:normal", html)
+
+    def test_a_family_without_files_still_gets_the_link(self):
+        self.face("roboto-400.ttf")
+        html = fw.preview_font_html(self.out, self.elementor(["Roboto", "Inter"]))
+        self.assertIn("family=Inter", html)
+        self.assertNotIn("family=Roboto", html)
+
     def test_elementor_build_that_loaded_raleway_keeps_it(self):
         self.face("raleway.woff2")
         html = fw.preview_font_html(self.out, self.elementor(["Raleway", "Roboto"]))
-        self.assertIn("family=Raleway", html)
-        self.assertIn("assets/fonts/raleway.woff2", html)
+        self.assertIn("assets/fonts/raleway.woff2", html)     # the hand-shipped face still works
+        self.assertIn("family=Roboto", html)                  # no file for this one
 
     def test_figma_and_claude_design_builds_are_unchanged(self):
         self.face("raleway.woff2")

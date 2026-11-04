@@ -934,14 +934,19 @@ these pages: the Elementor original and the raw page both render in
 **Roboto**, which the site's Elementor header and kit load on every page. So the
 raw page needs to load no font of its own — but it depends on the header
 loading Roboto, and if that ever stops, the page falls back with it. For
-an Elementor build `preview` therefore loads the faces `extract` recorded in
-`design.json` → `source.fonts` (Roboto if it recorded none; icon faces left
-out), not Raleway, so the preview resolves the font stack the way the site
-does; Figma builds still get Raleway. Headless Chrome does not fetch the
-Google Fonts file, so put the face in `build/<slug>/assets/fonts/<family>.woff2`
-(`roboto.woff2`) for the measurement to use it. When a whole block is off by
-the same few px, check which face the preview actually rendered before moving
-anything; the draft's front end has the last word.
+an Elementor build `extract` downloads the files behind `design.json` →
+`source.fonts` (icon faces left out; Roboto if it recorded none) into
+`build/<slug>/assets/fonts/<family>-<weight>[-italic].<ext>`, taking the
+URLs from the page's own `@font-face` rules — its inline `<style>` and the
+stylesheets it links, one `@import` deep — and only the weights and styles
+those declare (woff2 preferred; masterconcept.ai declares Roboto as ttf from
+fonts.gstatic.com). `preview` then serves exactly those files, with no
+network, instead of Raleway; Figma builds still get Raleway. A family `extract`
+printed `warn fonts: no @font-face file found` for has no file and the preview
+cannot reproduce its glyph widths: put a `<family>.woff2` in that folder by
+hand. When a whole block is off by the same few px, check which face the
+preview actually rendered before moving anything; the draft's front end has
+the last word.
 
 ### 3. Check
 
@@ -1112,7 +1117,7 @@ Tested on throwaway pages in a WPML group of their own:
 | WPML copies builder mode and data onto a new translation | the front end still shows the Elementor original; the post-check misreads it as extra `<p>` | push clears both and checks (`STILL_ELEMENTOR`); look at the front end |
 | a shortcode's name in `page.css`, even in a comment | everything after it in the stylesheet dies, phone queries included; the preview runs no shortcodes and looks fine | `verify` fails it |
 | ` - ` in the copy | wptexturize makes it an en dash, inside `wp:html` too | `verify` warns; write `&#45;` |
-| Raleway assumed | the live page renders Roboto from the header and kit; a Raleway preview would measure other glyph widths | `preview` loads `source.fonts` for an Elementor build; ship `assets/fonts/roboto.woff2` so headless Chrome has it |
+| Raleway assumed | the live page renders Roboto from the header and kit; a Raleway preview would measure other glyph widths | `extract` downloads the original's font files into `assets/fonts` and `preview` serves them |
 | the theme's `padding-top:10px` on `h1`–`h5`, Elementor's 10px column padding | every section a little lower than the last | `references/elementor-widgets.md` |
 | `diff --width 390` as a narrowed window | Chrome will not go below ~500px; every number was off | Elementor builds diff at 768 and 390 in an iframe |
 | internal links in a translation | WPML rewrites them absolute on save | expected; not an error |

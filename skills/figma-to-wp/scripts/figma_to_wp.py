@@ -1908,6 +1908,61 @@ def el_assets(out, urls, creds):
     return assets, matched, failed
 
 
+def el_fonts(out, html, base, families):
+    """Download the font files behind `families` into assets/fonts, from the
+    page's own @font-face rules: its inline <style> blocks and the stylesheets
+    it links, plus what those @import (one level). Only the weights and styles
+    declared are fetched, woff2 preferred; where a weight is split by script,
+    the latin file. Returns (files written, families with none). Nothing here
+    is allowed to stop an extract: a stylesheet or file that will not load is
+    skipped."""
+    inline, links = elementor.style_sources(html)
+    sheets = [(c, base) for c in inline]
+
+    def add(url, depth):
+        try:
+            final, body = http_get(urllib.parse.urljoin(base, url) if depth == 0 else url)
+        except (urllib.error.URLError, OSError, ValueError):
+            return
+        css = body.decode("utf-8", "replace")
+        sheets.append((css, final))
+        if depth == 0:
+            for imp in elementor.css_imports(css):
+                add(urllib.parse.urljoin(final, imp), 1)
+    for href in links:
+        add(href, 0)
+
+    want = {f.lower(): f for f in families}
+    chosen = {}                      # (family, weight, style) -> (rank, url)
+    for css, where in sheets:
+        for face in elementor.font_faces(css):
+            fam = want.get(face["family"].lower())
+            src = elementor.best_font_src(face)
+            if not fam or not src:
+                continue
+            rng = face["range"].upper().replace(" ", "")
+            rank = 0 if not rng else (0 if "U+0000-00FF" in rng else 1)
+            key = (fam, face["weight"], face["style"])
+            if key not in chosen or rank < chosen[key][0]:
+                chosen[key] = (rank, urllib.parse.urljoin(where, src), src)
+    written = {}
+    d = os.path.join(out, "assets", "fonts")
+    for (fam, weight, style), (_, url, src) in sorted(chosen.items()):
+        ext = elementor._font_ext(src) or "woff2"
+        name = (f"{font_slug(fam)}-{weight}" + ("-italic" if style == "italic" else "")
+                + "." + ext)
+        try:
+            _, body = http_get(url)
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, name), "wb") as fh:
+                fh.write(body)
+        except (urllib.error.URLError, OSError) as e:
+            print(f"fonts     download failed: {url} ({e})", file=sys.stderr)
+            continue
+        written.setdefault(fam, []).append(name)
+    return written, [f for f in families if f not in written]
+
+
 def extract_elementor(args):
     """A live Elementor page as the design: the page body shot at 1440, 768 and
     390, its copy and geometry measured at each, its widgets listed, its
@@ -2082,6 +2137,15 @@ def extract_elementor(args):
                   f"between two loads — some widget settles differently each time; "
                   f"positions below it are not reliable to {DRIFT_TOL}px.")
     print(f"fonts     {', '.join(fonts) or '(none reported)'}")
+    wanted = el_font_families(fonts)
+    got, lacking = el_fonts(out, html, final, wanted)
+    n = sum(len(v) for v in got.values())
+    if n:
+        print(f"fonts     {n} file(s) -> build/{slug}/assets/fonts "
+              f"({', '.join(sorted(got))}); the preview serves them, no network")
+    for fam in lacking:
+        print(f"warn      fonts: no @font-face file found for {fam!r} in the page's "
+              f"styles — the preview will not have its glyph widths")
     if not {"Roboto", "Raleway"} & set(fonts):
         print("warn      fonts: neither Roboto nor Raleway loaded on this page — "
               "the raw page only gets the fonts the site's header and kit load, "
@@ -3949,6 +4013,22 @@ def local_font_css(out, families=("Raleway",)):
 # one unknown family makes the whole css2 request fail.
 ICON_FONT = re.compile(r"icon|awesome|dashicons|swiper|glyph|symbol", re.I)
 WEIGHTED = {"Roboto", "Raleway"}
+FONT_MIME = {"woff2": "woff2", "woff": "woff", "ttf": "truetype", "otf": "opentype"}
+FONT_FILE = re.compile(r"^(?P<fam>.+?)-(?P<w>\d+(?:-\d+)?)(?P<it>-italic)?\.(?P<ext>woff2|woff|ttf|otf)$")
+
+
+def font_slug(family):
+    return re.sub(r"[^a-z0-9]+", "-", family.lower()).strip("-")
+
+
+def el_font_families(fonts):
+    """The families of a reference worth loading: what it reported, minus icon
+    faces; Roboto (the site's own) when it reported nothing."""
+    fams = []
+    for f in fonts or []:
+        if f and not ICON_FONT.search(f) and f not in fams:
+            fams.append(f)
+    return fams or ["Roboto"]
 
 
 def read_design(out):
@@ -3959,27 +4039,52 @@ def read_design(out):
         return {}
 
 
+def downloaded_font_css(out, family):
+    """@font-face rules for the files extract downloaded for family
+    (assets/fonts/<family>-<weight>[-italic].<ext>)."""
+    d = os.path.join(out, "assets", "fonts")
+    css = ""
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        m = FONT_FILE.match(name)
+        if not m or m.group("fam") != font_slug(family):
+            continue
+        css += (f"@font-face{{font-family:'{family}';"
+                f"src:url('assets/fonts/{name}') format('{FONT_MIME[m.group('ext')]}');"
+                f"font-weight:{m.group('w').replace('-', ' ')};"
+                f"font-style:{'italic' if m.group('it') else 'normal'};"
+                "font-display:block}")
+    return f"<style>{css}</style>" if css else ""
+
+
 def preview_font_html(out, design):
     """The preview's font <link> and local faces. Figma and Claude Design
     builds get Raleway, as they always did. An Elementor build gets what the
     reference actually loaded (design.json source.fonts): the site names Raleway
     in its stylesheets and loads Roboto, so a Raleway preview measures glyph
-    widths no visitor sees. Roboto stands in when extract reported nothing."""
+    widths no visitor sees. The faces come from the files extract downloaded
+    into assets/fonts, so nothing is fetched at preview time; only a family with
+    no file falls back to a Google Fonts link (headless Chrome never receives
+    it, but a person's browser does)."""
     src = (design or {}).get("source") or {}
     if src.get("type") != "elementor":
         return ('<link href="https://fonts.googleapis.com/css2?family=Raleway:'
                 'wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700'
                 '&display=swap" rel="stylesheet">' + local_font_css(out))
-    fams = []
-    for f in src.get("fonts") or []:
-        if f and not ICON_FONT.search(f) and f not in fams:
-            fams.append(f)
-    fams = fams or ["Roboto"]
-    q = "&family=".join(urllib.parse.quote_plus(f) + (":wght@400;500;600;700"
-                                                      if f in WEIGHTED else "")
-                        for f in fams)
-    return ('<link href="https://fonts.googleapis.com/css2?family=' + q +
-            '&display=swap" rel="stylesheet">' + local_font_css(out, fams))
+    local, linked = "", []
+    for fam in el_font_families(src.get("fonts")):
+        css = downloaded_font_css(out, fam) or local_font_css(out, [fam])
+        if css:
+            local += css
+        else:
+            linked.append(fam)
+    link = ""
+    if linked:
+        q = "&family=".join(urllib.parse.quote_plus(f) + (":wght@400;500;600;700"
+                                                          if f in WEIGHTED else "")
+                            for f in linked)
+        link = ('<link href="https://fonts.googleapis.com/css2?family=' + q +
+                '&display=swap" rel="stylesheet">')
+    return link + local
 
 
 MOBILE_WRAP = """<!doctype html><meta charset="utf-8"><title>mobile</title>
