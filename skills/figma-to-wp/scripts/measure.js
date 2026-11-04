@@ -77,6 +77,7 @@ function fwMeasure(){
               by:Math.round(b.top+window.scrollY), bh:Math.round(b.height),
               clipped:clipped(el),
               cls:(el.getAttribute('class')||'').slice(0,60), inner:inner,
+              tag:el.tagName.toLowerCase(),
               // A centred block's left edge says nothing: widen the box and
               // the text does not move, narrow it and it does. Comparing
               // left-to-left reported a heading 267px out that was sitting
@@ -199,8 +200,14 @@ function fwMeasure(){
   try{ document.fonts.forEach(function(f){
          var n=(f.family||'').replace(/["']/g,'');
          if(f.status==='loaded'&&n&&fonts.indexOf(n)<0) fonts.push(n); }); }catch(e){}
+  // Where the measured root sits, so a caller can make every position
+  // relative to it: a live page has theme wrappers above its body.
+  var rr=root.getBoundingClientRect();
   s.textContent=JSON.stringify({runs:out, sections:secs, boxes:boxes,
-                                fontOK:fontOK, fonts:fonts, mobile:mob});
+                                fontOK:fontOK, fonts:fonts, mobile:mob,
+                                root:{x:Math.round(rr.left+window.scrollX),
+                                      y:Math.round(rr.top+window.scrollY),
+                                      w:Math.round(rr.width), h:Math.round(rr.height)}});
   document.body.appendChild(s);
   // Headless Chrome will not open a window narrower than 500px, so a real
   // phone width can only be had by rendering into an iframe of that width.

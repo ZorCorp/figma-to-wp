@@ -1,4 +1,5 @@
 import contextlib, io, json, os, re, shutil, sys, tempfile, unittest
+import urllib.parse, urllib.request
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -692,6 +693,421 @@ class MeasureJs(unittest.TestCase):
         self.assertIn("fonts:", js)
         self.assertIn("status==='loaded'", js)
 
+
+
+def _measure_dom(runs, root, sections=(), fonts=("Roboto",), vw=1440):
+    data = {"runs": runs, "sections": list(sections), "boxes": [], "fontOK": {},
+            "fonts": list(fonts), "root": root,
+            "mobile": {"vw": vw, "scrollW": vw, "over": [], "small": [], "tap": [],
+                       "lefts": {}, "imgs": []}}
+    return ('<html><body><script type="application/json" id="fw-measure">%s'
+            '</script></body></html>' % json.dumps(data))
+
+
+def _run(text, x, y, **kw):
+    r = {"text": text, "x": x, "y": y, "w": 300, "h": 40, "size": 32.0,
+         "lh": "41.6px", "ls": "normal", "family": "Roboto", "weight": "700",
+         "color": "rgb(17, 17, 17)", "align": "left", "tag": "h1", "sec": "s1",
+         "clipped": False}
+    r.update(kw)
+    return r
+
+
+def _read(path, mode="r"):
+    with open(path, mode, **({} if "b" in mode else {"encoding": "utf-8"})) as f:
+        return f.read()
+
+
+def _write(path, text):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+def _size(path):
+    from PIL import Image
+    with Image.open(path) as im:
+        return im.size
+
+
+class ElementorPinVh(unittest.TestCase):
+    def test_pin_vh_rewrites_numbers_not_names(self):
+        css = (".hero{min-height:96vh;height:calc(100vh - 80px);top:-5vh}"
+               ".h-100vh{margin:.5vh}.x{height:50dvh}")
+        out = el.pin_vh(css, 1000)
+        self.assertIn("min-height:960px", out)
+        self.assertIn("calc(1000px - 80px)", out)
+        self.assertIn("top:-50px", out)
+        self.assertIn(".h-100vh{margin:5px}", out)   # the class name is left alone
+        self.assertIn("height:500px", out)
+        self.assertNotIn("vh;", out)
+
+    def test_pin_vh_html_touches_styles_only(self):
+        html = ('<style>.a{height:100vh}</style><div style="min-height: 80vh">'
+                '<p>Fill 100vh of the screen</p></div>')
+        out = el.pin_vh_html(html, 1000)
+        self.assertIn(".a{height:1000px}", out)
+        self.assertIn('style="min-height: 800px"', out)
+        self.assertIn("Fill 100vh of the screen", out)
+
+    def test_serve_live_pins_vh_in_proxied_css_only(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        _write(os.path.join(tmp, "live.html"), "<p>x</p>")
+        srv = el.serve_live(tmp, "https://example.test", viewport_h=1000)
+        self.addCleanup(fw.stop_server, srv)
+
+        def resp(body, ctype):
+            r = mock.MagicMock()
+            r.read.return_value = body
+            r.status = 200
+            r.headers.get.return_value = ctype
+            return r
+        import http.client
+
+        def get(path):
+            c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=5)
+            try:
+                c.request("GET", path)
+                return c.getresponse().read()
+            finally:
+                c.close()
+        with mock.patch("urllib.request.urlopen",
+                        return_value=resp(b".h{height:96vh}", "text/css; charset=utf-8")):
+            self.assertEqual(get("/a.css"), b".h{height:960px}")
+        with mock.patch("urllib.request.urlopen",
+                        return_value=resp(b"var h='96vh'", "application/javascript")):
+            self.assertEqual(get("/a.js"), b"var h='96vh'")
+
+
+class ElementorDocCss(unittest.TestCase):
+    def test_doc_css_keeps_one_documents_rules_and_their_media(self):
+        css = ("/* .elementor-5 in a comment */.elementor-5 .a{x:1}.elementor-50 .b{x:2}"
+               "@font-face{font-family:F}.elementor-9 .c{x:3}"
+               "@media(max-width:767px){.elementor-9 .d{x:4}.elementor-5 .e{x:5}}"
+               "@media(max-width:1024px){.elementor-9 .f{x:6}}")
+        out = el.doc_css(css, 5)
+        self.assertEqual(out, ".elementor-5 .a{x:1}\n@media(max-width:767px){.elementor-5 .e{x:5}}")
+        self.assertEqual(el.responsive_rules(out)["767"], [".elementor-5 .e{x:5}"])
+
+
+class ExtractElementor(unittest.TestCase):
+    """extract --from elementor: every network and browser call mocked."""
+
+    URL = "https://example.test/example/"
+    THUMB = "https://example.test/wp-content/uploads/elementor/thumbs/t-abc.png"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.build = os.path.join(self.tmp, "build")
+        self.out = os.path.join(self.build, "ex")
+        self.html = LIVE
+        self.final = None                 # fetch_live's final URL, when it differs
+        self.status = "publish"
+        self.post_id = 1234
+        self.meta = {"_elementor_edit_mode": "builder",
+                     "_elementor_data": mini("elementor-data.json")}
+        self.media = {"hero": [{"id": 55, "source_url":
+                                "https://example.test/wp-content/uploads/hero.png"}]}
+        self.calls, self.dumps, self.shots = [], [], []
+        for name, repl in (
+                ("BUILD", self.build),
+                ("wp_creds", lambda: ("https://example.test", "u", "p")),
+                ("wp", self.fake_wp), ("get_meta", self.fake_get_meta),
+                ("fetch_live", self.fake_fetch_live), ("http_get", self.fake_http_get),
+                ("shoot", self.fake_shoot), ("dump_dom", self.fake_dump_dom),
+                ("_framed", self.fake_framed)):
+            p = mock.patch.object(fw, name, repl)
+            p.start()
+            self.addCleanup(p.stop)
+        # serve_live and _framed are covered on their own; real servers here
+        # only cost half a second each to shut down.
+        srv = mock.MagicMock(server_port=1)
+        p = mock.patch.object(el, "serve_live", return_value=srv)
+        self.serve_live = p.start()
+        self.addCleanup(p.stop)
+
+    @contextlib.contextmanager
+    def fake_framed(self, url, width, height):
+        yield "http://127.0.0.1:2/frame.html?w=%d" % width
+
+    def fake_wp(self, method, path, **kw):
+        self.calls.append((method, path))
+        if method != "GET":
+            raise AssertionError("extract must not write: %s %s" % (method, path))
+        if path.startswith("/wp-json/wp/v2/media"):
+            q = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+            return self.media.get(q["search"][0], [])
+        return {"id": self.post_id, "slug": "example", "status": self.status,
+                "link": self.URL, "modified_gmt": "2026-01-02T03:04:05",
+                "type": "page", "title": {"raw": "Example"}}
+
+    def fake_get_meta(self, post_id, key, creds=None):
+        self.calls.append(("get_meta", key))
+        return self.meta.get(key)
+
+    def fake_fetch_live(self, url):
+        self.calls.append(("fetch_live", url))
+        return (self.final or url), self.html
+
+    def fake_http_get(self, url, timeout=60):
+        self.calls.append(("http_get", url))
+        if url.endswith("post-1234.css"):
+            return url, mini("post-1234.css").encode()
+        return url, b"\x89PNG fake " + url.encode()
+
+    def fake_shoot(self, url, png, width, tall=14000):
+        from PIL import Image
+        self.shots.append((url, os.path.basename(png), width))
+        Image.new("RGB", (width, 3000), "white").save(png)
+        return Image.open(png)       # what the real shoot() hands back
+
+    def fake_dump_dom(self, url, width=1440, timeout=180):
+        self.dumps.append((url, width))
+        if width == 1440:
+            return _measure_dom(
+                [_run("Example heading", 40, 300),
+                 _run("Contact us", 60, 900, tag="span", size=16.0, lh="normal",
+                      ls="0.5px", weight="400", sec="s2", align="start")],
+                {"x": 0, "y": 100, "w": 1440, "h": 2000},
+                [{"name": "s1", "y": 100, "h": 600}, {"name": "s2", "y": 700, "h": 400}])
+        return _measure_dom([_run("Example heading", 16, 140, size=30.0)],
+                            {"x": 0, "y": 20, "w": width, "h": 2400},
+                            [{"name": "s1", "y": 20, "h": 900}], vw=width)
+
+    def args(self, **kw):
+        a = dict(source=self.URL, slug="ex", from_="elementor", force=False,
+                 frame=None, no_assets=False, no_render=False,
+                 cd_project=None, cd_file=None)
+        a.update(kw)
+        return type("A", (), a)()
+
+    def extract(self, **kw):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            fw.cmd_extract(self.args(**kw))
+        return out.getvalue()
+
+    def dies(self, code, **kw):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            fw.cmd_extract(self.args(**kw))
+        self.assertIn(code + ":", err.getvalue())
+        return err.getvalue()
+
+    def design(self):
+        return json.loads(_read(os.path.join(self.out, "design.json")))
+
+    def test_extract_writes_three_references_and_design_json(self):
+        printed = self.extract()
+        for f in ("design.png", "design-768.png", "design-390.png", "design.json",
+                  "elementor.json", "manifest.json", os.path.join("elementor", "live.html")):
+            self.assertTrue(os.path.exists(os.path.join(self.out, f)), f)
+        d = self.design()
+        src = d["source"]
+        self.assertEqual(src["type"], "elementor")
+        self.assertEqual((src["post_id"], src["url"], src["width"], src["viewport_h"]),
+                         (1234, self.URL, 1440, 1000))
+        self.assertEqual(src["modified_gmt"], "2026-01-02T03:04:05")
+        self.assertEqual(src["fonts"], ["Roboto"])
+        self.assertEqual(set(d["widths"]), {"768", "390"})
+        for w in ("768", "390"):
+            self.assertEqual(set(d["widths"][w]), {"texts", "sections"})
+        t = d["texts"][0]
+        for k in ("i", "text", "x", "y", "w", "h", "align", "type", "tag"):
+            self.assertIn(k, t)
+        self.assertEqual((t["i"], t["text"], t["x"], t["y"], t["tag"]),
+                         (1, "Example heading", 40, 200, "h1"))   # relative to data-fw-root
+        self.assertEqual(t["type"], {"family": "Roboto", "size": 32.0, "weight": 700,
+                                     "lh": 41.6, "ls": 0, "fill": "#111111"})
+        self.assertEqual(d["texts"][1]["type"]["ls"], 0.5)
+        self.assertEqual(d["texts"][1]["align"], "left")     # computed "start", design.json's word
+        self.assertIsNone(d["texts"][1]["type"]["lh"])
+        self.assertEqual(d["widths"]["390"]["texts"][0]["y"], 120)
+        self.assertEqual(d["widths"]["390"]["sections"], [{"name": "s1", "y": 0, "h": 900}])
+        self.assertEqual((d["frames"], d["tokens"], d["comments"]), ([], {}, []))
+        # 768 and 390 come out of an iframe, cropped to its width
+        self.assertEqual(_size(os.path.join(self.out, "design-390.png"))[0], 390)
+        self.assertEqual(_size(os.path.join(self.out, "design-768.png"))[0], 768)
+        self.assertEqual(_size(os.path.join(self.out, "design.png")), (1440, 2000))
+        self.assertEqual(self.dumps[0], ("http://127.0.0.1:1/live.html", 1440))
+        self.assertEqual([u for u, w in self.dumps[1:]],
+                         ["http://127.0.0.1:2/frame.html?w=768",
+                          "http://127.0.0.1:2/frame.html?w=390"])
+        self.assertEqual(self.serve_live.call_args.kwargs.get("viewport_h"), 1000)
+        self.assertEqual(self.serve_live.call_args.args[0], os.path.join(self.out, "elementor"))
+        inv = json.loads(_read(os.path.join(self.out, "elementor.json")))
+        self.assertEqual(inv["tier3"], ["elementskit-funfact"])
+        self.assertEqual(inv["posts_queries"][0]["posts_per_page"], 3)
+        self.assertEqual(len(inv["responsive"]["767"]), 2)
+        self.assertIn("tier 3: elementskit-funfact — no recipe in "
+                      "references/elementor-widgets.md yet", printed)
+        self.assertIn("900", printed)
+
+    def test_live_html_is_the_snapshot_with_vh_pinned(self):
+        self.html = LIVE.replace("<head>", "<head><style>.full{height:100vh}</style>", 1)
+        self.extract()
+        live = _read(os.path.join(self.out, "elementor", "live.html"))
+        self.assertIn("data-fw-root", live)
+        self.assertIn(".full{height:1000px}", live)
+        self.assertIn("fwMeasure", live)
+
+    def test_extract_by_post_id_uses_the_rest_link(self):
+        self.extract(source="1234")
+        self.assertIn(("fetch_live", self.URL), self.calls)
+
+    def test_extract_dies_when_doc_id_differs(self):
+        self.post_id = 999
+        self.dies("NO_ELEMENTOR_DOC", source="999")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "design.json")))
+
+    def test_extract_refuses_redirect_and_password_form(self):
+        self.final = "https://example.test/somewhere-else/"
+        self.dies("NOT_PUBLIC")
+        self.final = None
+        self.html = LIVE.replace("<body", '<body><form class="post-password-form"></form><i', 1)
+        self.dies("NOT_PUBLIC")
+        self.html = LIVE.replace("<body", '<body><form name="loginform" '
+                                 'action="https://example.test/wp-login.php" method="post"></form><i', 1)
+        self.dies("NOT_PUBLIC")
+        self.assertFalse(os.path.exists(os.path.join(self.out, "design.json")))
+
+    def test_page_css_falls_back_to_its_rules_in_the_inline_css(self):
+        # No post-<id>.css on the server and no elementor-post-<id> <style>:
+        # the page's rules ride in elementor-frontend-inline-css with every
+        # other document's.
+        import urllib.error
+        real = self.fake_http_get
+
+        def http_get(url, timeout=60):
+            if url.endswith("post-1234.css"):
+                raise urllib.error.HTTPError(url, 404, "nf", {}, None)
+            return real(url, timeout)
+        fw.http_get = http_get
+        self.html = LIVE.replace("</head>", (
+            '<style id="elementor-frontend-inline-css">'
+            ".elementor-11 .elementor-element.elementor-element-h1a1{color:red}"
+            "@media(max-width:767px){.elementor-11 .elementor-element.elementor-element-h1a1{padding:1px}"
+            ".elementor-1234 .elementor-element.elementor-element-a1b2{padding:2px}}"
+            ".elementor-1234 .elementor-element.elementor-element-a1b2{background-image:"
+            'url("https://example.test/wp-content/uploads/bg.jpg")}'
+            ".elementor-11 .x{background-image:url(https://example.test/wp-content/uploads/hdr.jpg)}"
+            "</style></head>"), 1)
+        printed = self.extract()
+        inv = json.loads(_read(os.path.join(self.out, "elementor.json")))
+        self.assertEqual(inv["responsive"]["767"],
+                         [".elementor-1234 .elementor-element.elementor-element-a1b2{padding:2px}"])
+        self.assertIn("elementor-frontend-inline-css", printed)
+        man = json.loads(_read(os.path.join(self.out, "manifest.json")))
+        self.assertIn("assets/bg.jpg", man)
+        self.assertNotIn("assets/hdr.jpg", man)       # the header's background
+
+    def test_password_form_css_and_login_link_are_not_a_form(self):
+        # The site's own stylesheet styles .post-password-form on every page,
+        # and a footer may link to the login page; neither is the page itself.
+        self.html = LIVE.replace(
+            "</head>", "<style>.post-password-form{padding:4px}</style></head>", 1).replace(
+            "</body>", '<a href="/wp-login.php">Log in</a></body>', 1)
+        self.extract()
+        self.assertEqual(self.design()["source"]["type"], "elementor")
+
+    def test_extract_refuses_unpublished_page(self):
+        self.status = "draft"
+        self.dies("NOT_PUBLIC", source="1234")
+
+    def test_extract_refuses_non_builder_page(self):
+        self.meta["_elementor_edit_mode"] = ""
+        self.dies("NOT_ELEMENTOR")
+        self.meta["_elementor_edit_mode"] = None
+        self.dies("NOT_ELEMENTOR")
+
+    def test_manifest_keeps_thumbs_without_id(self):
+        self.html = LIVE.replace(
+            '<span class="number">42</span>',
+            '<span class="number">42</span><img src="%s" alt="t">' % self.THUMB, 1)
+        self.extract()
+        man = json.loads(_read(os.path.join(self.out, "manifest.json")))
+        self.assertEqual(man["assets/t-abc.png"], {"id": None, "url": self.THUMB})
+        self.assertEqual(man["assets/hero.png"],
+                         {"id": 55, "url": "https://example.test/wp-content/uploads/hero.png"})
+        for rec in man.values():
+            self.assertNotIn("sha", rec)          # push treats url-without-sha as uploaded
+        self.assertNotIn("assets/logo.png", man)  # header image, not the page's
+        self.assertTrue(os.path.exists(os.path.join(self.out, "assets", "t-abc.png")))
+        self.assertTrue(os.path.exists(os.path.join(self.out, "assets", "hero.png")))
+        # thumbs are never looked up in the media library
+        self.assertFalse([c for c in self.calls if c[0] == "GET" and "search=t-abc" in c[1]])
+
+    def test_extract_refuses_to_overwrite_figma_build(self):
+        os.makedirs(self.out)
+        _write(os.path.join(self.out, "page.html"), "<p>figma work</p>")
+        _write(os.path.join(self.out, "design.json"), json.dumps({"source": {"file_key": "k"}}))
+        self.dies("NOT_AN_ELEMENTOR_BUILD")
+        self.assertEqual(_read(os.path.join(self.out, "page.html")), "<p>figma work</p>")
+        self.assertFalse(self.shots)
+        self.extract(force=True)
+        self.assertEqual(self.design()["source"]["type"], "elementor")
+        self.assertEqual(_read(os.path.join(self.out, "page.html")), "<p>figma work</p>")
+
+    def test_reextract_of_an_elementor_build_is_allowed(self):
+        self.extract()
+        _write(os.path.join(self.out, "page.html"), "<p>mine</p>")
+        self.extract()
+        self.assertEqual(_read(os.path.join(self.out, "page.html")), "<p>mine</p>")
+
+    def test_fonts_without_roboto_or_raleway_warn(self):
+        real = self.fake_dump_dom
+
+        def dump(url, width=1440, timeout=180):
+            return real(url, width, timeout).replace('"Roboto"]', '"Inter"]')
+        fw.dump_dom = dump
+        self.assertIn("fonts", self.extract())
+        self.assertRegex(self.extract(), r"(?i)warn.*neither Roboto nor Raleway")
+
+
+class ElementorFramed(unittest.TestCase):
+    def test_measure_at_narrow_width_uses_the_iframe_wrapper(self):
+        seen = {}
+
+        def dump(url, width=1440, timeout=180):
+            with urllib.request.urlopen(url, timeout=5) as r:
+                seen["wrap"] = r.read().decode()
+            seen["width"] = width
+            return _measure_dom([], {"x": 0, "y": 0, "w": 390, "h": 10}, vw=390)
+        with mock.patch.object(fw, "dump_dom", dump):
+            m = fw.measure_at("http://127.0.0.1:1/live.html", 390)
+        self.assertEqual(m["mobile"]["vw"], 390)
+        self.assertIn('src="http://127.0.0.1:1/live.html"', seen["wrap"])
+        self.assertIn('width="390"', seen["wrap"])
+        self.assertIn("fwMeasure", seen["wrap"])
+        self.assertGreaterEqual(seen["width"], 500)
+
+    def test_measure_at_1440_measures_the_page_itself(self):
+        with mock.patch.object(fw, "dump_dom", return_value=_measure_dom(
+                [], {"x": 0, "y": 0, "w": 1440, "h": 10})) as d:
+            fw.measure_at("http://h/live.html", 1440)
+        self.assertEqual(d.call_args.args[0], "http://h/live.html")
+
+    def test_measure_at_without_report_dies(self):
+        with mock.patch.object(fw, "dump_dom", return_value="<html></html>"), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            fw.measure_at("http://h/live.html", 1440)
+
+    def test_shoot_framed_crops_to_the_frame_width(self):
+        from PIL import Image
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        png = os.path.join(tmp, "d.png")
+
+        def shoot(url, out, width, tall=14000):
+            self.assertGreaterEqual(width, 500)
+            self.assertEqual(tall, 9000)
+            Image.new("RGB", (width, 1200), "white").save(out)
+            return Image.open(out)
+        with mock.patch.object(fw, "shoot", shoot):
+            fw.shoot_framed("http://h/live.html", png, 390, 9000)
+        self.assertEqual(_size(png), (390, 1200))
 
 if __name__ == "__main__":
     unittest.main()

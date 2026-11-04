@@ -302,6 +302,24 @@ def responsive_rules(css):
     return out
 
 
+def doc_css(css, post_id):
+    """Only the rules of css that style document post_id (a selector naming
+    .elementor-<id>), each @media block kept around the ones inside it. A site
+    that prints Elementor CSS inline puts every document's rules in one
+    <style>; this is the page's share of it."""
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    mine = re.compile(r"\.elementor-%d(?![\w-])" % int(post_id))
+    out = []
+    for prelude, body in _blocks(css):
+        if prelude.lower().startswith("@media"):
+            inner = ["%s{%s}" % (sel, decl) for sel, decl in _blocks(body) if mine.search(sel)]
+            if inner:
+                out.append("%s{%s}" % (prelude, "".join(inner)))
+        elif not prelude.startswith("@") and mine.search(prelude):
+            out.append("%s{%s}" % (prelude, body))
+    return "\n".join(out)
+
+
 # --- snapshot -----------------------------------------------------------------
 
 _ATTR = r"""\s%s\s*=\s*(?:"([^"]*)"|'([^']*)')"""
@@ -389,12 +407,40 @@ def snapshot(html, origin, post_id, measure_js):
     return html + script if i < 0 else html[:i] + script + html[i:]
 
 
+# --- viewport height ----------------------------------------------------------
+
+# A number followed by vh (or dvh/svh/lvh), not one glued to a name: the
+# lookbehind keeps ".h-100vh" a class, the leading sign keeps "-5vh" negative.
+_VH = re.compile(r"(?<![\w.#-])(-?(?:\d+\.?\d*|\.\d+))[dsl]?vh\b")
+
+
+def pin_vh(css, viewport_h):
+    """css with every vh length written out in px against viewport_h. The
+    screenshot's viewport is thousands of px tall so the whole page fits, and
+    a 96vh hero would fill it."""
+    def px(m):
+        v = round(float(m.group(1)) * viewport_h / 100, 2)
+        return "%gpx" % v
+    return _VH.sub(px, css)
+
+
+def pin_vh_html(html, viewport_h):
+    """pin_vh inside <style> blocks and style="" attributes only, so copy that
+    happens to say "100vh" is left as written."""
+    html = re.sub(r"(<style\b[^>]*>)(.*?)(</style>)",
+                  lambda m: m.group(1) + pin_vh(m.group(2), viewport_h) + m.group(3),
+                  html, flags=re.S | re.I)
+    return re.sub(r"""(\sstyle\s*=\s*)("[^"]*"|'[^']*')""",
+                  lambda m: m.group(1) + pin_vh(m.group(2), viewport_h), html, flags=re.I)
+
+
 # --- local server -------------------------------------------------------------
 
-def serve_live(dir, origin, ua=UA):
+def serve_live(dir, origin, ua=UA, viewport_h=None):
     """Serve dir/live.html locally and forward every other path to origin, so
     the snapshot's relative URLs (CSS, fonts, scripts, images) load from the
-    live site while the page itself stays the edited local copy."""
+    live site while the page itself stays the edited local copy. With
+    viewport_h, vh lengths in proxied stylesheets are pinned to it (pin_vh)."""
     origin = origin.rstrip("/")
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -402,11 +448,16 @@ def serve_live(dir, origin, ua=UA):
             pass
 
         def _send(self, status, ctype, body):
-            self.send_response(status)
-            self.send_header("Content-Type", ctype)
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            # Chrome drops its connections the moment --dump-dom or the
+            # screenshot is done; a reply still in flight is not an error.
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def do_GET(self):
             if urllib.parse.urlsplit(self.path).path == "/live.html":
@@ -425,8 +476,10 @@ def serve_live(dir, origin, ua=UA):
             except (urllib.error.URLError, OSError) as e:
                 return self._send(502, "text/plain", ("upstream: %s" % e).encode())
             ctype = headers.get("Content-Type") if headers is not None else None
-            self._send(status if isinstance(status, int) else 200,
-                       ctype if isinstance(ctype, str) else "application/octet-stream", body)
+            ctype = ctype if isinstance(ctype, str) else "application/octet-stream"
+            if viewport_h and ctype.split(";")[0].strip().lower() == "text/css":
+                body = pin_vh(body.decode("utf-8", "replace"), viewport_h).encode("utf-8")
+            self._send(status if isinstance(status, int) else 200, ctype, body)
 
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()

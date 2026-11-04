@@ -43,6 +43,7 @@ import argparse
 import base64
 import glob
 import collections
+import contextlib
 import hashlib
 from html import unescape
 import shutil
@@ -52,6 +53,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +62,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wpsafe  # noqa: E402
+import elementor  # noqa: E402
 
 HOME = os.path.expanduser(os.environ.get("FIGMA_WP_HOME", "~/.figma-wp"))
 BUILD = os.path.join(os.getcwd(), "build")
@@ -1494,9 +1497,436 @@ def extract_claude_design(args):
     print(f"\nbuild/{slug}/ is ready. Next: verify {slug}, preview, diff.")
 
 
+# ----------------------------------------------------------- elementor source
+
+# vh lengths are pinned to this before any shot or measurement. shoot() opens
+# a 14000px-tall window so the whole page fits in one capture; left alone, a
+# 96vh hero renders 13440px tall there and nowhere else.
+VIEWPORT_H = 1000
+SHOT_TALL = 14000
+EL_WIDTHS = (768, 390)
+IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif")
+
+
+def http_get(url, timeout=60):
+    """(final_url, body) of a front-end GET, redirects followed. It carries UA:
+    the site's WAF turns away urllib's default one."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.geturl(), r.read()
+
+
+def fetch_live(url):
+    """(final_url, html) of a page as a visitor who is not logged in sees it."""
+    final, body = http_get(url)
+    return final, body.decode("utf-8", "replace")
+
+
+def _fw_measure(dom, what):
+    m = re.search(r'<script type="application/json" id="fw-measure">(.*?)</script>',
+                  dom, re.S)
+    if not m:
+        die("NO_MEASURE", f"{what} never reported a measurement. Is measure.js "
+                          f"in the page, and did it finish loading?")
+    return json.loads(m.group(1))
+
+
+@contextlib.contextmanager
+def _framed(url, width, height):
+    """MOBILE_WRAP around url, served from a scratch folder: Chrome's window
+    will not go under 500px, an iframe goes to any width, and the wrapper
+    republishes the frame's measurement for --dump-dom."""
+    tmp = tempfile.mkdtemp(prefix="fw-frame-")
+    srv = None
+    try:
+        with open(os.path.join(tmp, "frame.html"), "w", encoding="utf-8") as fh:
+            fh.write(MOBILE_WRAP.replace('src="preview.html"',
+                                         'src="%s"' % url.replace('"', "%22"))
+                     .replace("__W__", str(width)).replace("__H__", str(height)))
+        srv = serve_dir(tmp)
+        yield f"http://127.0.0.1:{srv.server_port}/frame.html"
+    finally:
+        if srv:
+            stop_server(srv)
+        shutil.rmtree(tmp, True)
+
+
+def measure_at(url, width):
+    """measure.js's report for url rendered width px wide."""
+    if width >= 1440:
+        return _fw_measure(dump_dom(url, width=width), url)
+    with _framed(url, width, SHOT_TALL) as wrap:
+        return _fw_measure(dump_dom(wrap, width=max(width + 120, 800)),
+                           f"{url} at {width}px")
+
+
+def shoot_framed(url, png, width, height):
+    """shoot() of url inside a width x height iframe, cropped to the frame."""
+    from PIL import Image
+    with _framed(url, width, height) as wrap:
+        shoot(wrap, png, max(width + 120, 800), tall=height).close()
+    with Image.open(png) as im:
+        cut = im.crop((0, 0, min(width, im.width), im.height))
+    cut.save(png)
+
+
+def _crop_to_root(png, root):
+    """The reference is the page body only, and the same origin its
+    coordinates use: the data-fw-root element's box."""
+    from PIL import Image
+    with Image.open(png) as im:
+        x, y = max(0, root.get("x", 0)), max(0, root.get("y", 0))
+        cut = im.crop((x, y, min(im.width, x + root.get("w", im.width)),
+                       min(im.height, y + root.get("h", im.height))))
+    cut.save(png)
+
+
+def _css_fill(v):
+    """A computed colour in design.json's own spelling: #RRGGBB, or
+    rgba(r,g,b,a) when it is not opaque."""
+    m = re.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)", str(v or ""))
+    if not m:
+        return v
+    r, g, b = (int(x) for x in m.groups()[:3])
+    a = m.group(4)
+    if a is None or float(a) >= 0.999:
+        return f"#{r:02X}{g:02X}{b:02X}"
+    return f"rgba({r},{g},{b},{round(float(a), 3)})"
+
+
+def el_texts(m):
+    """measure.js runs as design.json texts, relative to the root's top-left."""
+    root = m.get("root") or {}
+    ox, oy = root.get("x", 0), root.get("y", 0)
+    out = []
+    for i, r in enumerate(m.get("runs") or [], 1):
+        w = str(r.get("weight") or "")
+        rec = {"i": i, "text": r.get("text", ""), "x": r["x"] - ox, "y": r["y"] - oy,
+               "w": r.get("w"), "h": r.get("h"), "align": {"start": "left", "end": "right"}.get(r.get("align"), r.get("align") or "left"),
+               "type": {"family": r.get("family"), "size": r.get("size"),
+                        "weight": int(w) if w.isdigit() else w or None,
+                        "lh": css_px(r.get("lh")), "ls": css_px(r.get("ls")) or 0,
+                        "fill": _css_fill(r.get("color"))},
+               "tag": r.get("tag"), "sec": r.get("sec")}
+        # A collapsed accordion answer is copy all the same, but its position
+        # is the closed state's, not a place anything should be put.
+        if r.get("clipped"):
+            rec["clipped"] = True
+        out.append(rec)
+    return out
+
+
+def el_sections(m):
+    root = m.get("root") or {}
+    oy = root.get("y", 0)
+    return [{"name": s.get("name"), "y": s["y"] - oy, "h": s.get("h")}
+            for s in m.get("sections") or []]
+
+
+def _same_page(a, b):
+    """Two URLs name the same page: scheme, case of the host, a trailing slash
+    and percent-encoding aside."""
+    def key(u):
+        p = urllib.parse.urlsplit(u)
+        return p.netloc.lower(), unquote(p.path).rstrip("/"), p.query
+    return key(a) == key(b)
+
+
+def _el_post(post_id, rest, creds):
+    return wp("GET", f"/wp-json/wp/v2/{rest}/{int(post_id)}?context=edit&_fields="
+                     f"id,slug,title,status,link,parent,modified_gmt,type", creds=creds)
+
+
+def _el_public(post):
+    if post.get("status") != "publish":
+        die("NOT_PUBLIC", f"#{post.get('id')} is {post.get('status')!r}, not "
+                          f"published. extract reads the page as a visitor sees it, "
+                          f"and a visitor sees a login page or a 404 there.")
+
+
+def _el_post_css(origin, post_id, html):
+    """(css, where) of the page's own Elementor stylesheet: the uploaded
+    post-<id>.css, else its own inline <style>, else the page's rules out of
+    whatever inline <style> carries them (elementor-frontend-inline-css holds
+    every document's when the site prints CSS inline), else nothing."""
+    url = f"{origin}/wp-content/uploads/elementor/css/post-{post_id}.css"
+    try:
+        _, body = http_get(url)
+        return body.decode("utf-8", "replace"), f"post-{post_id}.css"
+    except (urllib.error.URLError, OSError):
+        pass
+    m = re.search(r"<style\b[^>]*\bid=[\"']elementor-post-%d(?:-inline-css)?[\"'][^>]*>"
+                  r"(.*?)</style>" % int(post_id), html, re.S | re.I)
+    if m:
+        return m.group(1), f"the inline <style id=elementor-post-{post_id}>"
+    parts, ids = [], []
+    for m in re.finditer(r"<style\b([^>]*)>(.*?)</style>", html, re.S | re.I):
+        mine = elementor.doc_css(m.group(2), post_id)
+        if mine:
+            parts.append(mine)
+            i = re.search(r"\bid=[\"']([^\"']+)", m.group(1))
+            ids.append(i.group(1) if i else "<style>")
+    if parts:
+        return "\n".join(parts), f".elementor-{post_id} rules in {', '.join(ids)}"
+    return "", None
+
+
+def el_image_urls(text, origin):
+    """Every uploaded image the page body or its stylesheet uses, in order: the
+    real src of an <img>/<source> (lazy loaders keep it in data-*), and url()
+    in CSS. The page's own CSS file and other hosts are not images."""
+    host = urllib.parse.urlsplit(origin).netloc.lower()
+    found = []
+
+    def add(u):
+        u = unescape(u).strip()
+        if not u or u.startswith("data:"):
+            return
+        u = urllib.parse.urljoin(origin + "/", u)
+        p = urllib.parse.urlsplit(u)
+        if p.netloc.lower() != host or "/wp-content/uploads/" not in p.path \
+                or "/uploads/elementor/css/" in p.path \
+                or not p.path.lower().endswith(IMG_EXT):
+            return
+        if u not in found:
+            found.append(u)
+    for m in re.finditer(r"<(?:img|source)\b[^>]*>", text, re.I):
+        tag = m.group(0)
+        for attr in ("data-lazy-src", "data-src", "src"):
+            v = re.search(r"\s%s\s*=\s*[\"']([^\"']+)[\"']" % attr, tag)
+            if v and not v.group(1).startswith("data:"):
+                add(v.group(1))
+                break
+    for m in re.finditer(r"url\(\s*([\"']?)([^\"')]+)\1\s*\)", text):
+        add(m.group(2))
+    return found
+
+
+def _upload_key(path):
+    """An upload's path with the size suffix WordPress adds to a resized copy
+    (-1024x683) and the -scaled of a big original taken off."""
+    stem, ext = os.path.splitext(path)
+    return re.sub(r"-(?:\d+x\d+|scaled)$", "", stem) + ext
+
+
+def el_media_id(url, creds):
+    """The attachment id behind an uploaded image, or None. Elementor's own
+    thumbnails are generated files with no attachment and are not looked up."""
+    path = urllib.parse.urlsplit(url).path
+    if "/uploads/elementor/thumbs/" in path:
+        return None
+    stem = os.path.splitext(os.path.basename(_upload_key(path)))[0]
+    hits = wp("GET", f"/wp-json/wp/v2/media?search={urllib.parse.quote(stem)}"
+                     f"&per_page=20&_fields=id,source_url", creds=creds) or []
+    paths = [(h.get("id"), urllib.parse.urlsplit(h.get("source_url") or "").path)
+             for h in hits if isinstance(h, dict)]
+    for hid, sp in paths:
+        if sp == path:
+            return hid
+    # A resized copy (hero-1024x683.png) belongs to its original's attachment.
+    for hid, sp in paths:
+        if _upload_key(sp) == _upload_key(path):
+            return hid
+    return None
+
+
+def el_assets(out, urls, creds):
+    """Download every image for the local preview and record where it lives.
+
+    Each manifest entry is {"id", "url"} with no sha: push reads that as
+    already on the site and points the page at url instead of uploading.
+    """
+    os.makedirs(os.path.join(out, "assets"), exist_ok=True)
+    manifest = read_manifest(out)
+    taken = {rec.get("url"): rel for rel, rec in manifest.items()}
+    assets, matched, failed = [], 0, []
+    for n, u in enumerate(urls, 1):
+        rel = taken.get(u)
+        if not rel:
+            name = unquote(os.path.basename(urllib.parse.urlsplit(u).path))
+            stem, ext = os.path.splitext(name)
+            rel, k = f"assets/{name}", 2
+            while rel in manifest and manifest[rel].get("url") != u:
+                rel, k = f"assets/{stem}-{k}{ext}", k + 1
+        mid = el_media_id(u, creds)
+        matched += mid is not None
+        manifest[rel] = {"id": mid, "url": u}
+        try:
+            _, body = http_get(u)
+            with open(os.path.join(out, rel), "wb") as fh:
+                fh.write(body)
+        except (urllib.error.URLError, OSError) as e:
+            failed.append(f"{u} ({e})")
+        assets.append({"id": f"a{n}", "file": rel, "name": "", "w": None, "h": None,
+                       "url": u, "media_id": mid})
+    with open(os.path.join(out, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    return assets, matched, failed
+
+
+def extract_elementor(args):
+    """A live Elementor page as the design: the page body shot at 1440, 768 and
+    390, its copy and geometry measured at each, its widgets listed, its
+    images mapped to the media library they already sit in."""
+    creds = wp_creds()
+    target = str(args.source).strip()
+    post, url = None, target
+    if target.isdigit():
+        post = _el_post(target, "pages", creds)
+        url = post.get("link") or die("NO_SUCH_PAGE", f"#{target} has no link")
+    elif not target.startswith("http"):
+        hits = find_page(target, creds)
+        if not hits:
+            die("NO_SUCH_PAGE", f"nothing matches {target!r}. Pass the post id or "
+                                f"the page's URL.")
+        if len(hits) > 1:
+            die("AMBIGUOUS", f"{target!r} matches {len(hits)} pages: "
+                             + ", ".join(f"#{h['id']} {h.get('link')}" for h in hits[:8])
+                             + ". Re-run with the post id.")
+        post, url = hits[0], hits[0].get("link")
+    if post:
+        _el_public(post)
+
+    # Only what a visitor sees can be the reference. A redirect, a password
+    # form or a login page shot as design.png would be built faithfully.
+    try:
+        final, html = fetch_live(url)
+    except urllib.error.HTTPError as e:
+        die("NOT_PUBLIC", f"{url} answers HTTP {e.code} to a visitor who is not "
+                          f"logged in; extract only reads public pages.")
+    except urllib.error.URLError as e:
+        die("NETWORK_ERROR", f"GET {url} -> {e.reason}")
+    if not _same_page(final, url):
+        die("NOT_PUBLIC", f"{url} redirects to {final}; extract will not shoot "
+                          f"another page as this one's reference.")
+    # The form itself, not the words: the site's stylesheet styles
+    # .post-password-form on every page, and a footer may link to wp-login.
+    for pat, what in ((r"<form\b[^>]*\bclass\s*=\s*[\"'][^\"']*\bpost-password-form\b",
+                       "a password form"),
+                      (r"<form\b[^>]*\baction\s*=\s*[\"'][^\"']*wp-login\.php",
+                       "a login form")):
+        if re.search(pat, html, re.I):
+            die("NOT_PUBLIC", f"{url} shows {what}, not the page; extract only "
+                              f"reads public pages.")
+    if not post:
+        m = re.search(r"<body\b[^>]*\bclass\s*=\s*[\"'][^\"']*?\b(page-id|postid)-(\d+)",
+                      html, re.I)
+        if not m:
+            die("NO_SUCH_PAGE", f"{url} names no post in its <body> class; "
+                                f"pass the post id instead.")
+        post = _el_post(m.group(2), "pages" if m.group(1) == "page-id" else "posts",
+                        creds)
+        _el_public(post)
+    post_id = int(post["id"])
+
+    if get_meta(post_id, "_elementor_edit_mode", creds=creds) != "builder":
+        die("NOT_ELEMENTOR", f"#{post_id} is not built with Elementor "
+                             f"(_elementor_edit_mode is not 'builder').")
+    # A translation that still renders the original's document measures the
+    # wrong page — or the header, with nothing to tell the two apart.
+    if elementor.page_doc(html, post_id) is None:
+        die("NO_ELEMENTOR_DOC", f"{url} renders no Elementor document with id "
+                                f"{post_id}; it is showing some other page's.")
+
+    slug = args.slug or post.get("slug") or slugify(target)
+    out = os.path.join(BUILD, slug)
+    dj = os.path.join(out, "design.json")
+    page = os.path.join(out, "page.html")
+    # extract never writes page.html, but a build made from another source
+    # would be left with a design.json and references that are not its own.
+    if os.path.exists(page) and not args.force:
+        prev = {}
+        if os.path.exists(dj):
+            with open(dj, encoding="utf-8") as fh:
+                prev = json.load(fh).get("source", {})
+        if prev.get("type") != "elementor":
+            why = "no design.json" if not os.path.exists(dj) else f"source.type={prev.get('type')!r}"
+            die("NOT_AN_ELEMENTOR_BUILD",
+                f"{page} exists but is not an Elementor build ({why}); extracting "
+                f"here would replace its design. Pass --force to overwrite.")
+
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(final))
+    print(f"page      #{post_id} {url} ({post.get('status')}, "
+          f"edited {post.get('modified_gmt')})")
+
+    inv = elementor.inventory(html, post_id,
+                              get_meta(post_id, "_elementor_data", creds=creds))
+    css, css_from = _el_post_css(origin, post_id, html)
+    inv["responsive"] = elementor.responsive_rules(css)
+
+    live_dir = os.path.join(out, "elementor")
+    os.makedirs(live_dir, exist_ok=True)
+    with open(os.path.join(live_dir, "live.html"), "w", encoding="utf-8") as fh:
+        fh.write(elementor.pin_vh_html(
+            elementor.snapshot(html, origin, post_id, MEASURE_SRC), VIEWPORT_H))
+    write_json(os.path.join(out, "elementor.json"), inv)
+
+    srv = elementor.serve_live(live_dir, origin, ua=UA, viewport_h=VIEWPORT_H)
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}/live.html"
+        meas = {1440: measure_at(base, 1440)}
+        shoot(base, os.path.join(out, "design.png"), 1440).close()
+        _crop_to_root(os.path.join(out, "design.png"), meas[1440].get("root") or {})
+        for w in EL_WIDTHS:
+            meas[w] = measure_at(base, w)
+            png = os.path.join(out, f"design-{w}.png")
+            shoot_framed(base, png, w, SHOT_TALL)
+            _crop_to_root(png, meas[w].get("root") or {})
+    finally:
+        stop_server(srv)
+
+    start, end = elementor.page_doc(html, post_id)
+    urls = el_image_urls(html[start:end] + "\n" + css, origin)
+    assets, matched, failed = el_assets(out, urls, creds)
+
+    fonts = meas[1440].get("fonts") or []
+    write_json(dj, {
+        "source": {"type": "elementor", "post_id": post_id, "url": url,
+                   "modified_gmt": post.get("modified_gmt"), "width": 1440,
+                   "viewport_h": VIEWPORT_H, "fonts": fonts,
+                   "shot_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        "texts": el_texts(meas[1440]), "sections": el_sections(meas[1440]),
+        "widths": {str(w): {"texts": el_texts(meas[w]), "sections": el_sections(meas[w])}
+                   for w in EL_WIDTHS},
+        "frames": [], "tokens": {}, "comments": [], "assets": assets})
+
+    print(f"snapshot  build/{slug}/elementor/live.html (vh pinned to {VIEWPORT_H}px)")
+    print(f"design    design.png 1440, " + ", ".join(f"design-{w}.png" for w in EL_WIDTHS)
+          + " — header, footer, popups hidden")
+    print("texts     " + ", ".join(f"{len(meas[w].get('runs') or [])} at {w}"
+                                   for w in (1440,) + EL_WIDTHS))
+    print(f"fonts     {', '.join(fonts) or '(none reported)'}")
+    if not {"Roboto", "Raleway"} & set(fonts):
+        print("warn      fonts: neither Roboto nor Raleway loaded on this page — "
+              "the raw page only gets the fonts the site's header and kit load, "
+              "so check what this page's copy will fall back to.")
+    tiers = collections.Counter(w_["tier"] for w_ in inv["widgets"])
+    print(f"widgets   {len(inv['widgets'])} (tier 1: {tiers[1]}, tier 2: {tiers[2]}, "
+          f"tier 3: {tiers[3]}), template {inv['template'] or '(default)'}")
+    for t in inv["tier3"]:
+        print(f"tier 3: {t} — no recipe in references/elementor-widgets.md yet")
+    print("popups    " + (", ".join(str(p) for p in inv["popups"]) or "none")
+          + ("  — check which popup each language actually loads" if inv["popups"] else ""))
+    if css_from:
+        print(f"responsive {len(inv['responsive']['1024'])} rule(s) at <=1024, "
+              f"{len(inv['responsive']['767'])} at <=767, from {css_from}")
+    else:
+        print(f"responsive none: no post-{post_id}.css and no .elementor-{post_id} "
+              f"rules inline either")
+    print(f"assets    {len(urls)} image(s): {matched} in the media library, "
+          f"{len(urls) - matched} not (Elementor thumbs or unmatched) — "
+          f"none is re-uploaded by push")
+    for f_ in failed:
+        print(f"          download failed: {f_}", file=sys.stderr)
+    print(f"\nbuild/{slug}/ is ready. Next: write page.html against design.png, "
+          f"then verify {slug}, preview, diff.")
+
+
 def cmd_extract(args):
     if getattr(args, "from_", None) == "claude-design":
         return extract_claude_design(args)
+    if getattr(args, "from_", None) == "elementor":
+        return extract_elementor(args)
     if os.path.isdir(args.source):
         return extract_from_export(args)
     args.url = args.source
@@ -2398,7 +2828,8 @@ def run_checks(out, report=False, section=None, through=None):
 # like a browser problem. `doctor` syntax-checks the file now.
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "measure.js"), encoding="utf-8") as _fh:
-    MEASURE_JS = "<script>\n" + _fh.read() + "</script>"
+    MEASURE_SRC = _fh.read()
+MEASURE_JS = "<script>\n" + MEASURE_SRC + "</script>"
 
 
 def dump_dom(url, width=1440, timeout=180):
@@ -4246,14 +4677,15 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     e = sub.add_parser("extract")
-    e.add_argument("source", help="a Figma frame URL, or a folder of Figma exports")
+    e.add_argument("source", help="a Figma frame URL, or a folder of Figma exports; "
+                                  "with --from elementor, a public page's URL or post id")
     e.add_argument("--slug")
     e.add_argument("--frame", help="which frame is the page: a PDF name in "
                                    "export mode, a frame name for a page URL "
                                    "(default: the largest)")
     e.add_argument("--no-assets", action="store_true")
     e.add_argument("--no-render", action="store_true")
-    e.add_argument("--from", dest="from_", choices=["figma", "claude-design"],
+    e.add_argument("--from", dest="from_", choices=["figma", "claude-design", "elementor"],
                    default="figma", help="what SOURCE is (default: figma)")
     e.add_argument("--cd-project", help="Claude Design project id, recorded in design.json")
     e.add_argument("--cd-file", help="the export's path inside the project")
