@@ -1,6 +1,6 @@
 ---
 name: figma-to-wp
-description: "Build or update a masterconcept.ai WordPress page from a Figma design. Pulls the frame's render, its copy verbatim, its colour and type tokens, its box geometry and its images out of Figma; you write the HTML against those numbers, one section at a time. `verify` confirms every string survived and the site's hard rules hold, `audit` names which element is wrong and by how much, `diff` screenshots the result and scores each section against the render, and `mobile` runs the phone checks the frame cannot answer; then it uploads the media and creates the page as a draft via mc/set-post-html with the right slug and Permalink Manager URI. `pull` starts from a page that already exists in WordPress. Use when someone gives a Figma link and wants it turned into a page on masterconcept.ai, or wants an existing AI-built page refreshed from an updated design."
+description: "Build or update a masterconcept.ai WordPress page from a Figma design. Pulls the frame's render, its copy verbatim, its colour and type tokens, its box geometry and its images out of Figma; you write the HTML against those numbers, one section at a time. `verify` confirms every string survived and the site's hard rules hold, `audit` names which element is wrong and by how much, `diff` screenshots the result and scores each section against the render, and `mobile` runs the phone checks the frame cannot answer; then it uploads the media and creates the page as a draft via mc/set-post-html with the right slug and Permalink Manager URI. `pull` starts from a page that already exists in WordPress. `extract --from elementor` takes a live Elementor page on the site as the design instead — its render at 1440, 768 and 390, its copy, widgets and responsive rules — to build a new raw-HTML page from it (another language, joined to its WPML group) or, after a reviewed draft, to replace the Elementor page itself with `push --replace` (`elementor-restore` puts it back). Use when someone gives a Figma link and wants it turned into a page on masterconcept.ai, wants an existing AI-built page refreshed from an updated design, or wants an Elementor page rebuilt as raw HTML."
 license: MIT
 allowed-tools:
   - Bash(*)
@@ -24,6 +24,10 @@ diff      overlay match, per band and per section, with a 90% gate
 audit     which element is wrong, by how much, and has a section drifted
 mobile    the phone checks the frame cannot answer — after desktop is confirmed
 push      media -> draft page -> permalink
+
+extract --from elementor   a live Elementor page as the design: 1440 · 768 · 390
+push --replace <id>        swap that Elementor page for the reviewed draft
+elementor-restore          put a replaced page back on Elementor
 ```
 
 The script fetches; it does not interpret. **You** decide what the layout is, by
@@ -129,7 +133,9 @@ always rebuild.
 `references/site-rules.md`, beside the script, carries the rules that are about
 masterconcept.ai rather than about Figma: what KSES strips, the theme's width
 clamp, which shortcodes exist, how links have to be written for WPML. Read it
-before authoring, not after a push goes wrong.
+before authoring, not after a push goes wrong. `references/elementor-widgets.md`
+is its counterpart for a build whose source is an Elementor page: how each
+widget is written as raw HTML.
 
 ## Ask for these before you start
 
@@ -142,7 +148,9 @@ asking. Collect whatever is missing up front, in one go:
 | **Page title** | |
 | **URL slug** | |
 | **Parent path**, e.g. `partners/work-collaboration` | Pass it to `push --parent-path`; it resolves to an id by walking the path. |
-| **Language** (`en` / `zh-hant` / `zh-hans`) | Defaults to `en`. |
+| **Language** | A WPML language code of the site — `zh-hant`, `zh-hk` and so on. Defaults to `en`. `push --language` checks it against the languages the site actually has before it writes anything; `BAD_LANGUAGE` lists them. |
+| **Is the source an Elementor page? Usage A or B?** | **A** builds a new raw-HTML page from it — usually another language, joined to the original's WPML group — and leaves the original alone. **B** turns the Elementor page itself into raw HTML at the same id and URL, and only after the user has signed off a draft. They push differently, and B overwrites a live page. See [From Elementor](#from-elementor). |
+| **Usage A: the copy verbatim, or translated?** If translated: from the user (a file, or pasted), or drafted by Claude and confirmed by the user line by line | Decides whether the page has a `copy.json` and who stands behind its words. Usage B is always verbatim. |
 | **The WordPress username** | **Ask. Never guess.** A wrong username returns `rest_not_logged_in`, which looks exactly like a server misconfiguration — chasing that instead of asking cost an hour in the session that produced this skill. |
 | **Which author should own the page** | The Style Kit CSS is author-gated to `wpbuddy` / `mcp` (see `design-system.php`). Any other author means `wpbuddy-design.css` does not load and the page is on its own for styling, and it will not appear in WP Buddy → AI Builder. Fine if the page carries all its own CSS — but say so rather than let it surprise them. |
 | **A throwaway slug first?** | Offer it. Publishing into the real URL later is one `--page-slug` away, and a test slug cannot collide with a live page. |
@@ -741,6 +749,8 @@ The desktop also *converges* and the phone does not: the desktop is a search
 against a reference, run with `match` and the loop above. The phone has no
 reference in Figma at all — it is a checklist against the house spec, done once.
 Interleaving a search with a checklist makes you redo the checklist every pass.
+An Elementor build is the exception: the original page has its own tablet and
+phone layouts, so both have a reference — see [From Elementor](#from-elementor).
 
 `mobile` says so itself. It reads `diff/state.json` and, if the desktop has
 unexplained bands or `match` under 80%, tells you that reading the phone now is
@@ -824,6 +834,286 @@ What `wpsafe` does for you, and why each exists:
 then run `scripts/sync-wpsafe.sh ../mcp-wp` and open a PR there — nothing
 detects a skill change that was never synced.
 
+## From Elementor
+
+Most pages on the site are Elementor pages: no Figma file, no Claude Design
+project, and the layout in post meta rather than the body. For those **the live
+page is the design**. `extract --from elementor` shoots it and measures it, and
+from there it is the same work as a Figma build — you write raw HTML against
+the references, one section at a time — with one difference that matters: the
+original has a tablet and a phone layout of its own, so those have references
+too, and the build keeps them. The site's house phone spec does not apply.
+
+The script still only fetches. It reads what has one right answer — the copy,
+the computed type, every box, the widget list, the page's responsive rules, the
+images — and you decide the layout by looking at the pictures.
+
+### Two ways to use it — ask which, before anything
+
+| | **A. A new page from it** | **B. Replace it** |
+|---|---|---|
+| What happens | a new raw-HTML page is created, usually another language joined to the original's WPML group | the Elementor page itself becomes raw HTML |
+| The original | untouched | same id, URL, title, SEO and WPML group; its Elementor data is kept for the way back |
+| Copy | verbatim or translated — **ask** | verbatim, always |
+| Push | `push --title … --language … --translation-of <orig>` | draft first, the user signs it off, then `push --replace <orig>` |
+
+### 1. Extract
+
+```bash
+python3 "$FW" extract <page URL or post id> --from elementor --slug <slug>
+```
+
+**Public pages only.** extract reads the page the way a visitor does, and stops
+(`NOT_PUBLIC`) on a page that is not published, that redirects somewhere else,
+or that answers with a password or login form — any of those shot as
+`design.png` would be built faithfully. It also stops when the page is not
+built with Elementor (`NOT_ELEMENTOR`), and when the page renders no Elementor
+document of its own id (`NO_ELEMENTOR_DOC`) — a translation still drawing its
+original's document would otherwise be measured as itself. A build folder made
+from another source is not overwritten without `--force`
+(`NOT_AN_ELEMENTOR_BUILD`).
+
+For usage A in another language, give the build its own `--slug` (the
+original's own slug is the default, and the original may get a build of its
+own).
+
+What lands in `build/<slug>/`:
+
+| File | What |
+|---|---|
+| `design.png`, `design-768.png`, `design-390.png` | the page body at 1440, 768 and 390 — header, footer, popups and cookie banner hidden, lazy images loaded, every `vh` pinned to a 1000px viewport |
+| `design.json` | `source` (type `elementor`, post id, URL, `modified_gmt`, the fonts the page loaded); `texts` — **the whole copy, from the page's HTML**, each placed by the 1440 render with its computed type in `texts[].type`; `sections`; `widths."768"` / `widths."390"` with the texts and sections measured at that width, for the position checks. `frames` and `tokens` are empty: read type off `texts[].type` |
+| `elementor.json` | `widgets` (type, tier, section), `tier3`, `popups`, `posts_queries`, `responsive` (the page's own rules at ≤1024 and ≤767), `flags` (motion, sticky, hidden per device, HubSpot), `template` |
+| `elementor/live.html` | the snapshot every reference was shot from |
+| `assets/` + `manifest.json` | the images, for the preview. The manifest already points at the media library's copy, so push uploads none of them; an Elementor thumbnail has `id: null` and stays on its URL |
+
+In a page repo, the `<slug>: extract` commit carries all of these.
+
+**Read the output before you write anything.** It is the brief:
+
+- `copy` — how many strings, and two flags. **`hidden` means no text run
+  matched the string at 1440**: a closed tab, a phone-only block, a collapsed
+  answer. It is still copy and `verify` still wants it on the page; it is not
+  "invisible, leave it out". **`unmeasured`** marks strings under 3 characters,
+  which the measurement skips — they have no position, only text.
+- `WARN ref drift` / `ref mismatch` / `render drift` — the picture and the
+  numbers disagree from some point down. Positions below it are not reliable.
+- `fonts` — what the original actually loaded. See *Fonts* below.
+- `widgets` and `tier 3:` — a tier-3 widget has no recipe. Stop, add one to
+  `references/elementor-widgets.md` (generic — this repo is public), then build.
+- `popups` — each popup id is per language. Usage A in another language needs
+  the one **that** language loads.
+- `responsive` and `assets` — how many rules and images were found.
+
+### 2. Author
+
+Read `references/elementor-widgets.md` first: a recipe for every tier-1 and
+tier-2 widget, and the measures every Elementor page shares — each column's
+10px padding, the theme's `padding-top:10px` on `h1`–`h5`, Elementor's
+breakpoints (tablet ≤1024, phone ≤767, not the house 768). The rest of this
+skill applies unchanged: one section at a time, sourced numbers only,
+`dropped.json` for anything left out on purpose.
+
+- **One `<section>` per top-level section of the original, in the same order,**
+  and none nested inside them. The section checks pair the build's sections
+  with the original's in order.
+- **No `vh`.** The references pin `vh` to a 1000px viewport; the build's `vh`
+  renders differently in `diff` and in the framed `mobile` / `diff --width`
+  checks, and every position below it drifts. Write the px the reference
+  measured.
+- **The tablet and phone are a search, not a checklist.** Desktop first and
+  confirmed by the user, as always — then the 768 and 390 layouts against
+  `design-768.png` and `design-390.png`, with the original's own rules from
+  `elementor.json` → `responsive`.
+
+**Fonts.** Do not assume Raleway. The site names it and loads it nowhere on
+these pages: the Elementor original and the raw page both render in
+**Roboto**, which the site's Elementor header and kit load on every page. So the
+raw page needs to load no font of its own — but it depends on the header
+loading Roboto, and if that ever stops, the page falls back with it. The
+preview is not the site here: it loads Raleway, not the header's Roboto, so
+glyph widths in the preview can differ from the live page. When a whole block
+is off by the same few px, check which face the preview actually rendered
+before moving anything; the draft's front end has the last word.
+
+### 3. Check
+
+`verify`, `preview`, `audit` and `diff` as for Figma; gate each section at 90
+or explain it in `accepted.json`. Then the two narrow widths:
+
+```bash
+python3 "$FW" diff   <slug> --url … --width 768     # against design-768.png
+python3 "$FW" diff   <slug> --url … --width 390     # against design-390.png
+python3 "$FW" mobile <slug> --url … --width 768
+python3 "$FW" mobile <slug> --url …                 # 390
+```
+
+On an Elementor build `diff --width 768|390` renders the page in an iframe of
+that width and compares it to that width's reference (`NO_REFERENCE` for a
+width extract did not shoot). `mobile` runs its usual checks and, in addition,
+compares every text's position with where the original put it at that width,
+±6px (`--tolerance`). Body copy under 16px that is under 16px on the original
+too is printed as a note, not counted: the original is the spec.
+
+### Usage A — copy
+
+**Verbatim**: `design.json` → `texts` is the copy, and `verify` checks it
+string by string, as for Figma.
+
+**Translated**: ask where the translation comes from — the user (a file, or
+pasted), or a draft Claude writes. Either way it goes into
+`build/<slug>/copy.json`, and that file becomes the only source of the page's
+words. Never retype a translation off anything else.
+
+```json
+{"mode": "translated", "source": "user",
+ "entries": [{"i": 3, "from": "Get started", "to": "立即開始"}]}
+```
+
+- `i` is the string's `texts[].i` in `design.json`; `from` is the original, kept
+  so a reviewer can read the pair (verify warns when it no longer matches).
+- `verify` checks the page against every `to`, and lists each string with no
+  translation as `untranslated (#i)` — an error, unless `dropped.json` leaves
+  it out on purpose.
+- A Claude draft is `"source": "claude-draft"`. Give it to the user entry by
+  entry; only once they have confirmed it, set `"approved": true`. Until then
+  `verify` fails `COPY_NOT_APPROVED`, and push will not run.
+- A malformed file stops every check (`BAD_COPY_JSON`) rather than run on a
+  guess.
+- A translated page wraps differently, so `mobile` compares each section's top
+  and height (`dy`, `dh`) with the original's instead of each text's position.
+
+### Usage A — push
+
+```bash
+python3 "$FW" push <slug> --title "…" --language zh-hk \
+    --translation-of <original post id> --page-slug <original's slug> \
+    --parent-path <the original's parent path>
+```
+
+`--translation-of` joins the new page to the original's WPML group when it is
+created (only then: `TRANSLATION_OF_ON_UPDATE`). Every language in a group
+shares the slug, and `--parent-path` resolves in the page's own language.
+
+WPML copies the original's Elementor switch and data onto a page the moment it
+is created as its translation, so the new page would render Elementor. push
+clears both on a page it created, then checks: `STILL_ELEMENTOR` if the edit
+mode is still set, or if the rendered body lacks the page's wrapper class
+(`<x>-page`). That second check reads the REST body, which does not run
+Elementor — so look at the front end too: open the draft logged in at
+`?page_id=N&preview=true`, and again once it is published. It should carry
+your wrapper class and no `data-elementor-type="wp-page"`.
+
+Expected and not an error: WPML rewrites a translation's internal links to
+absolute URLs on every save. The body WordPress holds will not match the build
+there.
+
+### Usage B — draft, sign-off, replace
+
+1. **Draft.** Push the build as a new draft of its own, at a throwaway slug,
+   joined to no group:
+
+   ```bash
+   python3 "$FW" push <slug> --title "…" --page-slug <slug>-draft --language <the original's>
+   ```
+
+   The user checks it logged in at `?page_id=N&preview=true`. Nothing goes
+   further until they say it is right.
+
+2. **Replace.** Then, and only then:
+
+   ```bash
+   python3 "$FW" push <slug> --replace <original post id>
+   ```
+
+   In this order:
+
+   - **Refuses before anything is read**: `--title`, `--parent`,
+     `--parent-path`, `--page-slug` or `--force` with `--replace`
+     (`REPLACE_ARG`). The original keeps its title, place and URL, and no check
+     is skipped.
+   - **Refuses before anything is written**: `verify` failing; no draft in
+     `wp.json` (`REPLACE_NO_DRAFT`); `wp.json`'s page being the original itself
+     (`REPLACE_DRAFT_IS_ORIGINAL`); `design.json` not an extract of that page
+     (`REPLACE_WRONG_PAGE`); the original edited since extract
+     (`PAGE_MOVED_ON` — extract again); the original's URL landing somewhere
+     else (`ORIGINAL_REDIRECTS`).
+   - Reads what search engines key the page by — title, meta description,
+     canonical, hreflang — from the front end.
+   - **Backs up** the Elementor meta, the page JS and the body to
+     `backups/<id>-elementor-<stamp>.json` and reads it back. A page with no
+     builder mode or no Elementor data has nothing to restore:
+     `BACKUP_FAILED`, nothing changed.
+   - Writes a `replacing` marker to `wp.json` **before the first write**, so a
+     run that stops halfway says where its way back is. A rerun then refuses
+     (`REPLACE_UNFINISHED`) and points at `elementor-restore`.
+   - Writes the body with `mc/set-post-html`, clears **only**
+     `_elementor_edit_mode` (`_elementor_data` stays, for the way back), writes
+     the page JS. The permalink is never regenerated.
+   - Purges the cache and reads the front end again: `STILL_ELEMENTOR` if it is
+     not your HTML, `IDENTITY_CHANGED` if the title, description, canonical or
+     hreflang moved. Either one leaves the draft alone and names the backup.
+   - Moves the draft to the trash, and rewrites `wp.json` to the original with
+     a `replaced` record. From here a plain `push <slug>` updates the page.
+
+3. **Back.** `elementor-restore` puts the Elementor page back:
+
+   ```bash
+   python3 "$FW" elementor-restore <slug>            # the backup wp.json names
+   python3 "$FW" elementor-restore <slug> --backup <path>
+   ```
+
+   It refuses if `_elementor_data` on the site is no longer what the backup
+   holds (`ELEMENTOR_DATA_CHANGED` — someone edited it since; compare and
+   decide, it will not guess), or if the backup is of another page
+   (`BACKUP_MISMATCH`). Otherwise it keeps the body the page holds now in
+   `backups/`, sets builder mode and the page JS back **first** — Elementor then
+   draws its own data whatever the body says, so a failure after that still
+   leaves the page on Elementor — then writes the old body, purges, and checks
+   the front end renders the Elementor document again (`RESTORE_FAILED` if
+   not). Any step failing stops with `RESTORE_INCOMPLETE`. **Running it again
+   is always safe.** It clears `replaced`/`replacing` from `wp.json` and prints
+   how to replace again.
+
+### What the site was seen to do
+
+Tested on throwaway pages in a WPML group of their own:
+
+- **Only `_elementor_edit_mode` decides whether Elementor renders.** Blank, the
+  front end prints the body; `_elementor_data` can stay where it is. The body
+  loses its `elementor-page` class (so the theme's width clamp applies — the
+  wrapper needs the breakout) and keeps its page-template class.
+- **WPML copies `_elementor_edit_mode` and `_elementor_data`** — not the page
+  template — onto a page created as a translation, at the moment it is created.
+- **Neither side follows the other.** Clearing a translation's Elementor meta
+  leaves the original as it was, and changing the original's leaves the
+  translation as it was.
+- **Restore works.** Builder mode plus the old body brings the Elementor
+  version back exactly, and the Elementor editor opens it normally.
+- **REST `content.rendered` does not run Elementor.** It shows the body even
+  while the front end draws Elementor. Check the front end.
+- **A draft can be checked** in a logged-in browser at
+  `?page_id=N&preview=true` — nothing has to be published to be looked at.
+- Not yet settled: whether saving the original in Elementor copies its meta
+  back onto a translation that push made raw — the acceptance run will answer
+  it.
+
+### Traps already met
+
+| Trap | What it does | Now |
+|---|---|---|
+| WPML copies builder mode and data onto a new translation | the front end still shows the Elementor original; the post-check misreads it as extra `<p>` | push clears both and checks (`STILL_ELEMENTOR`); look at the front end |
+| a shortcode's name in `page.css`, even in a comment | everything after it in the stylesheet dies, phone queries included; the preview runs no shortcodes and looks fine | `verify` fails it |
+| ` - ` in the copy | wptexturize makes it an en dash, inside `wp:html` too | `verify` warns; write `&#45;` |
+| Raleway assumed | the live page renders Roboto from the header and kit; the preview loads Raleway, so glyph widths differ | build to what the original loaded; check the preview's face |
+| the theme's `padding-top:10px` on `h1`–`h5`, Elementor's 10px column padding | every section a little lower than the last | `references/elementor-widgets.md` |
+| `diff --width 390` as a narrowed window | Chrome will not go below ~500px; every number was off | Elementor builds diff at 768 and 390 in an iframe |
+| internal links in a translation | WPML rewrites them absolute on save | expected; not an error |
+| posts widget → `[wpb_post_list]` in a language with no matching term or posts | "No posts found." under a heading | hide the band when the list is empty (`elementor-widgets.md`, *posts*) |
+| a hero in `vh` | reference and build disagree on its height | references pin `vh` to 1000px; build in px |
+| the original's popup id kept on another language | the button does nothing | `elementor.json` → `popups`; use the id that language loads |
+| `push --post-id` on an Elementor page | the body is written, the page keeps rendering Elementor, nothing is backed up | refused (`ELEMENTOR_PAGE`); use `--replace` |
+
 ## Editing a page that already exists
 
 ```bash
@@ -848,7 +1138,9 @@ edit and push back — verified byte-identical on a 37KB page — but it is not
 the file someone originally wrote.
 
 An Elementor page keeps its layout in post meta, not the body. `pull` says so
-and stops rather than writing a build folder that looks usable and is not.
+and stops (`ELEMENTOR_PAGE`) rather than writing a build folder that looks
+usable and is not. To work on one, start from `extract --from elementor`
+instead — see [From Elementor](#from-elementor).
 
 Without a `design.json` there is no copy to check and no render to diff
 against, so `verify` and `diff` have much less to say. That is the trade for
@@ -905,7 +1197,9 @@ separate, explicit step.
 ## Hard don'ts
 
 - **Never open one of these pages with "Edit with Elementor."** It converts the
-  page and hides the HTML body.
+  page and hides the HTML body. A page `push --replace` swapped still holds its
+  old Elementor data, and that is what the editor would open and save back
+  over the HTML. The way back is `elementor-restore`, not the editor.
 - **Post revisions are disabled site-wide — there is no undo.** `push --post-id`
   writes the existing body to `build/<slug>/backups/` first. Never skip it.
 - **Never retype copy from the render.** It comes from `design.json` or it does
@@ -937,3 +1231,5 @@ separate, explicit step.
 | Language switcher lands on the home page | Translations were never linked into one WPML group. Use `mc/create-localized-page` with `translation_of`. |
 | Slug changed but the URL did not | Permalink Manager stores URIs separately. Run `mc/regenerate-permalink`. |
 | Page looks stale to logged-out visitors | `PUT /wp-json/siteground-optimizer/v1/purge-cache`. |
+| `NOT_PUBLIC` from `extract --from elementor` | The page is a draft or private, redirects, or shows a password or login form. extract only reads what a visitor sees; it will not shoot a login page as the design. |
+| A translation pushed from an Elementor original still shows the original | `STILL_ELEMENTOR` from push, or found by eye on the front end. WPML copied the builder meta onto it. The REST body does not run Elementor, so only the front end tells — open it at `?page_id=N&preview=true` logged in. |

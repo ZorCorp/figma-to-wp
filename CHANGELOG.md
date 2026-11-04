@@ -3,6 +3,37 @@
 All notable changes to `figma-to-wp` are documented here. Versioning is semver;
 new capability → minor, fix/docs → patch.
 
+## [Unreleased]
+
+An Elementor page as the source.
+
+- **`extract --from elementor <url or post id>`** takes a published Elementor
+  page as the design: the page body shot at 1440, 768 and 390 (header, footer
+  and popups hidden, lazy images loaded, `vh` pinned to a 1000px viewport), its
+  whole copy from the HTML, the computed type and position of every string at
+  each width, and `elementor.json` — widgets with their tier, popups, posts
+  queries and the page's own rules at ≤1024 and ≤767. Images keep their
+  media-library URLs, so push uploads none. Pages a visitor cannot see are
+  refused (`NOT_PUBLIC`).
+- **`references/elementor-widgets.md`**: how each tier-1 and tier-2 widget is
+  written as raw HTML, and the measures every Elementor page shares.
+- **`mobile` and `diff --width 768|390`** compare an Elementor build against
+  the original at that width, in an iframe; `mobile --tolerance` (default 6px)
+  sets how far a text may sit from the original's.
+- **`copy.json`** for a page in another language than its source: `verify`
+  checks the translation, lists what is untranslated, and refuses a Claude
+  draft the user has not approved.
+- **`push --language`** takes any WPML language the site has, checked against
+  the site; **`--translation-of`** joins a new page to a WPML group; a page
+  created as a translation of an Elementor page has the copied Elementor meta
+  cleared and is checked (`STILL_ELEMENTOR`).
+- **`push --replace <id>`** swaps an Elementor page for a reviewed draft: backs
+  up the Elementor meta, page JS and body first, clears only the edit mode,
+  keeps the URL, and checks the front end still has the same title,
+  description, canonical and hreflang. **`elementor-restore`** puts it back.
+- **`verify`** fails a shortcode name in the page's CSS (comments included) and
+  warns on a spaced hyphen, which the site turns into an en dash.
+
 ## [0.7.1]
 
 - **No more Claude Tag.** The skill runs in Claude Code and Cowork on the

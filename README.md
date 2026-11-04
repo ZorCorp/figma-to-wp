@@ -17,6 +17,14 @@ every section, every time. A number cannot see a container.
 so an update starts from what is live rather than from scratch. `doctor` checks
 the machine before any of it.
 
+An Elementor page on the site can be the design too. `extract --from elementor`
+shoots the live page at 1440, 768 and 390 and reads its copy, widgets and
+responsive rules; the raw-HTML page built from it keeps the original's tablet
+and phone layouts. It either becomes a new page — typically another language,
+joined to the original's WPML group — or, once you have signed off a draft,
+replaces the Elementor page at the same URL with `push --replace`.
+`elementor-restore` puts the Elementor version back.
+
 ## Where it runs
 
 On your own Mac, through a local terminal — the **Desktop Commander** connector
