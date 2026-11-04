@@ -2429,6 +2429,60 @@ def spaced_hyphens(html):
     return [m.group(0) for m in re.finditer(r"\S - \S", t)]
 
 
+def load_copy(out):
+    """build/<slug>/copy.json, or None when the page has none.
+
+    A page built in another language than its design (the Elementor original
+    is English, the page being built is Chinese) cannot pass a check against
+    the design's own strings. copy.json says what each one becomes:
+    {"mode": "verbatim" | "translated", "source": "user" | "claude-draft",
+     "approved": bool, "entries": [{"i": <design.json texts[].i>, "from": str,
+     "to": str | null}]}. A file that cannot be read the way it was written is
+    refused outright, because every check after this one would run on a guess.
+    """
+    path = os.path.join(out, "copy.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cp = json.load(fh)
+    except ValueError as e:
+        die("BAD_COPY_JSON", f"copy.json is not valid JSON: {e}")
+    if not isinstance(cp, dict):
+        die("BAD_COPY_JSON", "copy.json must be an object")
+    if cp.get("mode") not in ("verbatim", "translated"):
+        die("BAD_COPY_JSON", f"mode {cp.get('mode')!r} is not 'verbatim' or 'translated'")
+    cp.setdefault("source", "user")
+    if cp["source"] not in ("user", "claude-draft"):
+        die("BAD_COPY_JSON", f"source {cp['source']!r} is not 'user' or 'claude-draft'")
+    entries = cp.setdefault("entries", [])
+    if not isinstance(entries, list):
+        die("BAD_COPY_JSON", "entries must be a list")
+    for n, e in enumerate(entries):
+        if not isinstance(e, dict) or type(e.get("i")) is not int:
+            die("BAD_COPY_JSON", f"entries[{n}] needs an integer 'i'")
+        if e.get("to") is not None and not isinstance(e["to"], str):
+            die("BAD_COPY_JSON", f"entries[{n}] (#{e['i']}): 'to' must be a string or null")
+    return cp
+
+
+def translated_texts(design_texts, cp, warnings):
+    """design texts with `text` swapped for the translation, so the copy and
+    hard-break checks run on what the page should say. Position and scope stay
+    the design's own. `src` keeps the design string, which is what dropped.json
+    keys are written against. A string with no translation keeps text "" and
+    is reported by the caller as untranslated."""
+    by_i = {e["i"]: e for e in cp["entries"]}
+    out = []
+    for t in design_texts:
+        e = by_i.get(t["i"])
+        to = ((e or {}).get("to") or "")
+        if e and isinstance(e.get("from"), str) and squash(e["from"]) != squash(t["text"]):
+            warnings.append(f"copy.json #{t['i']} 'from' differs from design.json")
+        out.append({**t, "text": to if squash(to) else "", "src": t["text"]})
+    return out
+
+
 def run_checks(out, report=False, section=None, through=None):
     """Every check, returned rather than printed, so push can run them too."""
     dj = os.path.join(out, "design.json")
@@ -2452,6 +2506,17 @@ def run_checks(out, report=False, section=None, through=None):
     errors, warnings, skipped = [], [], 0
     used = set()
     texts = design["texts"]
+    # Translated: every check below reads the `to` string instead of the
+    # design's. verbatim, or no copy.json at all, is the design's own copy.
+    cp = load_copy(out)
+    translated = bool(cp) and cp["mode"] == "translated"
+    if translated:
+        if cp["source"] == "claude-draft" and cp.get("approved") is not True:
+            errors.append("COPY_NOT_APPROVED: copy.json source is claude-draft "
+                          "and approved is not true")
+        texts = translated_texts(texts, cp, warnings)
+    else:
+        texts = [{**t, "src": t["text"]} for t in texts]
     band = None
     if section or through:
         band = section_range(out, through or section, through=bool(through))
@@ -2464,9 +2529,18 @@ def run_checks(out, report=False, section=None, through=None):
                   f"before pushing.")
     for t in texts:
         s = squash(t["text"])
+        # A dropped key is written against the design's string; the page's
+        # translation of it may not hold the key at all.
+        hit = [k for k in dropped if k and (k in squash(t["src"]) or k in s)]
+        if translated and not s:
+            if hit:
+                skipped += 1
+                used |= set(hit)
+            else:
+                errors.append(f'untranslated (#{t["i"]}): {t["src"].strip()[:70]}')
+            continue
         if not s or s in body:
             continue
-        hit = [k for k in dropped if k and k in s]
         if hit:
             skipped += 1
             used |= set(hit)
@@ -2494,6 +2568,8 @@ def run_checks(out, report=False, section=None, through=None):
             if nm:
                 assetish.add(squash("%s (%s)" % (f_, nm)))
     all_copy = [squash(t["text"]) for t in design["texts"]]
+    if translated:
+        all_copy += [squash(t["text"]) for t in texts]
     for k in sorted(dropped):
         if not k or k in assetish:
             continue
@@ -2519,7 +2595,7 @@ def run_checks(out, report=False, section=None, through=None):
         parts = [p for p in re.split(r"[\u2028\u2029\n]", t["text"]) if squash(p)]
         if len(parts) < 2:
             continue
-        if any(k and k in squash(t["text"]) for k in dropped):
+        if any(k and (k in squash(t["text"]) or k in squash(t["src"])) for k in dropped):
             continue
         if "\x00".join(squash(p) for p in parts) not in marked:
             errors.append(
@@ -2997,7 +3073,7 @@ def run_checks(out, report=False, section=None, through=None):
     for w in warnings:
         print(f"warn  {w}")
     total = len(texts)
-    print(f"\n{total - len([e for e in errors if e.startswith('copy')])}/{total} "
+    print(f"\n{total - len([e for e in errors if e.startswith(('copy missing', 'untranslated'))])}/{total} "
           f"strings matched ({skipped} dropped on purpose)")
     print(f"{len(errors)} errors, {len(warnings)} warnings")
     return errors, warnings
@@ -4016,11 +4092,31 @@ def cmd_mobile(args):
         for i in odd[:6]:
             print(f"          .{i['cls'][:30]:<30} nat {i['nat']} box {i['box']}")
 
+    # A translated page has other words in the same places: a Chinese line is
+    # narrower and an English one wraps differently, so a text-by-text position
+    # check would flag every string. What must still hold is the page's
+    # rhythm: where each section starts and how tall it is.
+    cp = load_copy(out)
+    translated = bool(cp) and cp["mode"] == "translated"
     if el:
+        label = "sections" if translated else "positions"
         if not el_ref:
-            print(f"positions skipped — the original was only measured at "
+            print(f"{label} skipped — the original was only measured at "
                   f"{', '.join(str(k) for k in design.get('widths') or {})}px, "
                   f"not {args.width}")
+        elif translated:
+            live = el_sections(meas)
+            off = compare_sections(el_ref.get("sections") or [], live, args.tolerance)
+            if off:
+                bad += 1
+                print(f"sections  {len(off)} section(s) more than ±{args.tolerance}px "
+                      f"from the original at {args.width}px")
+                for o_ in off[:8]:
+                    print(f"          dy {o_['dy']:+d} dh {o_['dh']:+d}  "
+                          f"{str(o_['name'])[:50]!r}")
+            else:
+                print(f"sections  none beyond ±{args.tolerance}px "
+                      f"({len(live)} section(s) measured)")
         else:
             # The run's own coordinates are the frame's; the reference's are
             # the root's. Subtract the root so both start at the same corner.

@@ -1340,6 +1340,48 @@ class MobileDiffElementor(unittest.TestCase):
         self.assertEqual(bad, 1)
         self.assertNotIn("positions", text)
 
+    def with_sections(self):
+        self.design["widths"]["390"]["sections"] = [
+            {"name": "s1", "y": 0, "h": 600}, {"name": "s2", "y": 600, "h": 400}]
+        _write(os.path.join(self.out, "design.json"), json.dumps(self.design))
+
+    def translated(self):
+        _write(os.path.join(self.out, "copy.json"), json.dumps(
+            {"mode": "translated", "source": "user", "approved": True, "entries": []}))
+
+    def test_translated_mode_compares_sections_not_positions(self):
+        self.translated()
+        self.with_sections()
+        # the root sits 50px down; s2 starts 40px late in the root, and the
+        # text is somewhere the English reference never put it
+        secs = [{"name": "s1", "y": 50, "h": 600}, {"name": "s2", "y": 690, "h": 400}]
+        runs = [_run("\u6bcf\u500b\u5718\u968a\u7684\u65b9\u6848", 300, 700, size=20)]
+        bad, text = self.mobile(_measure_dom(
+            runs, {"x": 0, "y": 50, "w": 390, "h": 1000}, sections=secs, vw=390))
+        self.assertEqual(bad, 1)
+        self.assertIn("sections  1 section(s) more than \u00b16px", text)
+        self.assertIn("dy +40 dh +0", text)
+        self.assertNotIn("positions", text)
+
+    def test_translated_sections_inside_tolerance_report_none(self):
+        self.translated()
+        self.with_sections()
+        secs = [{"name": "s1", "y": 50, "h": 603}, {"name": "s2", "y": 653, "h": 400}]
+        bad, text = self.mobile(_measure_dom(
+            [], {"x": 0, "y": 50, "w": 390, "h": 1000}, sections=secs, vw=390))
+        self.assertEqual(bad, 0)
+        self.assertRegex(text, r"sections\s+none")
+        self.assertNotIn("positions", text)
+
+    def test_verbatim_copy_json_keeps_the_positions_check(self):
+        _write(os.path.join(self.out, "copy.json"), json.dumps(
+            {"mode": "verbatim", "entries": []}))
+        runs = [_run("Plans for every team", 20, 170, size=20)]
+        bad, text = self.mobile(self.dom(runs=runs, root={"x": 0, "y": 50, "w": 390, "h": 1000}))
+        self.assertEqual(bad, 1)
+        self.assertIn("positions", text)
+        self.assertNotIn("sections ", text)
+
     def diff(self, width, ref=None):
         from PIL import Image
         for n in ("design.png", "design-390.png"):
@@ -1389,3 +1431,147 @@ class MobileDiffElementor(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CopyJson(unittest.TestCase):
+    """copy.json: a translated page is checked against its `to` strings."""
+    TEXTS = [{"i": 1, "text": "Plans for every team", "y": 100},
+             {"i": 2, "text": "Start for free today", "y": 600},
+             {"i": 3, "text": "Line one\nLine two", "y": 700}]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.out = os.path.join(self.tmp, "build", "t")
+        os.makedirs(self.out)
+        self.page('<p id="herotop">%s</p><p>%s</p><p>%s<br>%s</p>' %
+                  ("\u6bcf\u500b\u5718\u968a\u7684\u65b9\u6848", "\u7acb\u5373\u514d\u8cbb\u8a66\u7528",
+                   "\u7b2c\u4e00\u884c", "\u7b2c\u4e8c\u884c"))
+        self.design()
+
+    def page(self, body):
+        _write(os.path.join(self.out, "page.html"), "{{styles}}\n" + body)
+        _write(os.path.join(self.out, "page.css"), ".a{}")
+
+    def design(self, texts=None):
+        _write(os.path.join(self.out, "design.json"),
+               json.dumps({"texts": texts or self.TEXTS, "assets": []}))
+
+    def copy(self, entries, **kw):
+        cp = {"mode": "translated", "source": "user", "approved": True, "entries": entries}
+        cp.update(kw)
+        _write(os.path.join(self.out, "copy.json"), json.dumps(cp))
+
+    def good_entries(self):
+        return [{"i": 1, "from": "Plans for every team", "to": "\u6bcf\u500b\u5718\u968a\u7684\u65b9\u6848"},
+                {"i": 2, "from": "Start for free today", "to": "\u7acb\u5373\u514d\u8cbb\u8a66\u7528"},
+                {"i": 3, "from": "Line one\nLine two", "to": "\u7b2c\u4e00\u884c\n\u7b2c\u4e8c\u884c"}]
+
+    def checks(self, **kw):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return fw.run_checks(self.out, **kw)
+
+    def test_translated_copy_checks_to_strings(self):
+        self.copy(self.good_entries())
+        errors, _ = self.checks()
+        self.assertEqual(errors, [])
+        # a `to` the page does not carry is a missing string, and it is the
+        # `to` that is reported, not the English
+        ents = self.good_entries()
+        ents[1]["to"] = "\u9019\u53e5\u9801\u9762\u6c92\u6709"
+        self.copy(ents)
+        errors, _ = self.checks()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith("copy missing (#2, y=600)"), errors)
+        self.assertIn("\u9019\u53e5", errors[0])
+
+    def test_translated_hard_break_is_checked_on_the_to_string(self):
+        self.page('<p id="herotop">%s</p><p>%s</p><p>%s%s</p>' %
+                  ("\u6bcf\u500b\u5718\u968a\u7684\u65b9\u6848", "\u7acb\u5373\u514d\u8cbb\u8a66\u7528",
+                   "\u7b2c\u4e00\u884c", "\u7b2c\u4e8c\u884c"))
+        self.copy(self.good_entries())
+        errors, _ = self.checks()
+        self.assertEqual(len(errors), 1, errors)
+        self.assertTrue(errors[0].startswith("hard break not reproduced (#3"), errors)
+
+    def test_missing_translation_is_an_error(self):
+        ents = self.good_entries()
+        ents[0]["to"] = None
+        ents[1]["to"] = "  "
+        del ents[2]                      # no entry at all for #3
+        self.copy(ents)
+        errors, _ = self.checks()
+        self.assertEqual(
+            errors, ["untranslated (#1): Plans for every team",
+                     "untranslated (#2): Start for free today",
+                     "untranslated (#3): Line one\nLine two"])
+
+    def test_untranslated_is_scoped_and_dropped_json_exempts(self):
+        _write(os.path.join(self.out, "sections.json"), json.dumps(
+            {"hero": {"design_y": 100, "design_span": 100},
+             "cta": {"design_y": 600, "design_span": 200}}))
+        _write(os.path.join(self.out, "dropped.json"), json.dumps({"Start for free": "nav"}))
+        ents = self.good_entries()
+        ents[0]["to"] = None
+        ents[1]["to"] = None
+        self.copy(ents)
+        errors, _ = self.checks(section="cta")        # #1 is outside the band
+        self.assertEqual(errors, [])
+        errors, _ = self.checks(section="hero")
+        self.assertEqual(errors, ["untranslated (#1): Plans for every team"])
+
+    def test_unapproved_claude_draft_is_an_error(self):
+        self.copy(self.good_entries(), source="claude-draft", approved=False)
+        errors, _ = self.checks()
+        self.assertEqual(errors, ["COPY_NOT_APPROVED: copy.json source is claude-draft "
+                                  "and approved is not true"])
+        self.copy(self.good_entries(), source="claude-draft", approved=None)
+        cp = json.loads(_read(os.path.join(self.out, "copy.json")))
+        del cp["approved"]                                          # approved absent
+        _write(os.path.join(self.out, "copy.json"), json.dumps(cp))
+        self.assertEqual(len(self.checks()[0]), 1)
+        self.copy(self.good_entries(), source="claude-draft", approved=True)
+        self.assertEqual(self.checks()[0], [])
+
+    def test_from_that_differs_is_a_warning_only(self):
+        ents = self.good_entries()
+        ents[0]["from"] = "Plans for each team"
+        self.copy(ents)
+        errors, warnings = self.checks()
+        self.assertEqual(errors, [])
+        self.assertEqual([w for w in warnings if "'from'" in w],
+                         ["copy.json #1 'from' differs from design.json"])
+
+    def test_no_copy_json_is_verbatim(self):
+        # the design's English strings are not on the Chinese page: errors
+        errors, _ = self.checks()
+        self.assertEqual(len([e for e in errors if e.startswith("copy missing")]), 3)
+        # and `verbatim` with a file present is the same as no file, even with
+        # entries that would otherwise be untranslated
+        self.copy([{"i": 1, "from": "x", "to": None}], mode="verbatim",
+                  source="claude-draft", approved=False)
+        errors2, warnings2 = self.checks()
+        self.assertEqual(errors2, errors)
+        self.assertFalse([w for w in warnings2 if "copy.json" in w])
+        # a page that does carry the English passes with no copy.json
+        os.remove(os.path.join(self.out, "copy.json"))
+        self.page('<p id="herotop">Plans for every team</p><p>Start for free today</p>'
+                  '<p>Line one<br>Line two</p>')
+        self.assertEqual(self.checks()[0], [])
+
+    def test_malformed_copy_json_dies(self):
+        bad = ["{not json", "[]", json.dumps({"mode": "other", "entries": []}),
+               json.dumps({"mode": "translated", "source": "bot", "entries": []}),
+               json.dumps({"mode": "translated", "entries": {}}),
+               json.dumps({"mode": "translated", "entries": [{"from": "a", "to": "b"}]}),
+               json.dumps({"mode": "translated", "entries": [{"i": "1", "to": "b"}]}),
+               json.dumps({"mode": "translated", "entries": [{"i": 1, "to": 5}]})]
+        for text in bad:
+            _write(os.path.join(self.out, "copy.json"), text)
+            with self.subTest(text=text), contextlib.redirect_stderr(io.StringIO()) as err:
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                    fw.run_checks(self.out)
+            self.assertIn("BAD_COPY_JSON", err.getvalue())
+
+    def test_load_copy_without_file_is_none(self):
+        self.assertIsNone(fw.load_copy(self.out))
