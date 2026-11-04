@@ -4764,6 +4764,14 @@ def backup_elementor(post_id, out, creds=None):
     rec = {"post_id": int(post_id), "modified_gmt": page.get("modified_gmt"),
            "content_raw": (page.get("content") or {}).get("raw", ""),
            "meta": {k: get_meta(post_id, k, creds=creds) for k in ELEMENTOR_META}}
+    # A backup that cannot bring the page back is no backup: refuse before
+    # anything is written, rather than let --replace overwrite a page it
+    # cannot restore (or one that was never built with Elementor).
+    mode, data = rec["meta"]["_elementor_edit_mode"], rec["meta"]["_elementor_data"]
+    if mode != "builder" or not data or data == "[]":
+        die("BACKUP_FAILED",
+            f"#{post_id} has nothing to restore (_elementor_edit_mode={mode!r}, "
+            f"_elementor_data empty={not data or data == '[]'}). Nothing was changed.")
     stamp = re.sub(r"\D", "", str(rec["modified_gmt"] or "prev"))
     path = os.path.join(out, "backups", f"{int(post_id)}-elementor-{stamp}.json")
     try:
@@ -4802,16 +4810,40 @@ def parse_identity(html):
     return ident
 
 
-def public_identity(url):
-    """{"title", "description", "hreflang": {code: href}, "canonical"} of a
-    public page, from its front-end HTML."""
-    return parse_identity(fetch_live(url)[1])
-
-
 def bust(url):
     """url with a throwaway query, so a cache that was just purged cannot
     answer with the page it held a moment ago."""
     return url + ("&" if "?" in url else "?") + f"fwcb={int(time.time())}"
+
+
+def public_identity(url):
+    """{"title", "description", "hreflang": {code: href}, "canonical"} of a
+    public page, from its front-end HTML. A URL that lands somewhere else is
+    not that page's identity: die ORIGINAL_REDIRECTS."""
+    try:
+        final, html = fetch_live(bust(url))
+    except (urllib.error.URLError, OSError) as e:
+        die("NOT_PUBLIC", f"{url} could not be read as a visitor: {e}. "
+                          f"Nothing was changed.")
+    norm = lambda u: urllib.parse.urlsplit(u)._replace(query="", fragment="").geturl().rstrip("/")
+    if norm(final) != norm(url):
+        die("ORIGINAL_REDIRECTS",
+            f"{url} answers from {final}, so its identity is that page's, not "
+            f"this one's. Nothing was changed.")
+    return parse_identity(html)
+
+
+def _replace_args(args):
+    """--replace changes the body only. Refused before any site call, even the
+    parent lookup."""
+    # The original keeps its title, parent and URL; the swap changes the body only.
+    for flag, val in (("--title", args.title), ("--parent", args.parent),
+                      ("--parent-path", args.parent_path),
+                      ("--page-slug", args.page_slug), ("--force", args.force)):
+        if val:
+            die("REPLACE_ARG", f"{flag} cannot be combined with --replace: the "
+                               f"original's title, place and URL stay as they are, "
+                               f"and no check is skipped.")
 
 
 def _replace_gate(out, meta, orig, args):
@@ -4830,6 +4862,13 @@ def _replace_gate(out, meta, orig, args):
     if int(draft) == orig:
         die("REPLACE_DRAFT_IS_ORIGINAL",
             f"wp.json's page is #{orig} itself, so there is no draft to swap in.")
+    if meta.get("replacing"):
+        r = meta["replacing"]
+        die("REPLACE_UNFINISHED",
+            f"an earlier --replace of #{r.get('orig')} stopped after it began "
+            f"writing. Its Elementor backup is build/{args.slug}/{r.get('backup')}. "
+            f"Run elementor-restore from it, or check what the page shows now; "
+            f"then remove \"replacing\" from wp.json to try again.")
     if meta.get("replaced"):
         die("ALREADY_REPLACED",
             f"this build already replaced #{meta['post_id']} (draft "
@@ -4849,11 +4888,18 @@ def _replace_gate(out, meta, orig, args):
     return src
 
 
-def _replace_finish(out, meta, orig, draft, before, bpath, url, creds):
+def _replace_finish(out, meta, orig, draft, before, ebackup, url, creds):
     """After the body is on the original: purge, prove the front end is raw
     HTML and still the same page to a search engine, then retire the draft."""
     wp("PUT", "/wp-json/siteground-optimizer/v1/purge-cache", creds=creds)
-    html = fetch_live(bust(url))[1]
+    back = os.path.join(out, ebackup)
+    try:
+        html = fetch_live(bust(url))[1]
+    except (urllib.error.URLError, OSError) as e:
+        die("IDENTITY_CHANGED",
+            f"#{orig} could not be read back from {url} ({e}), so it is not "
+            f"known to be the same page. The draft #{draft} was left alone. "
+            f"Elementor backup: {back} (restore with elementor-restore).")
     assert_raw(orig, html, page_wrapper(out), creds=creds)
     now = parse_identity(html)
     diffs = []
@@ -4869,18 +4915,20 @@ def _replace_finish(out, meta, orig, draft, before, bpath, url, creds):
             f"#{orig} no longer looks the same to a search engine:\n    "
             + "\n    ".join(diffs)
             + f"\n  The draft #{draft} was left alone. Put the Elementor page back "
-              f"with elementor-restore from {bpath}.")
+              f"with elementor-restore from {back}.")
     # No force: the draft goes to the trash, where it can still be fetched.
     wp("DELETE", f"/wp-json/wp/v2/pages/{int(draft)}", creds=creds)
     print(f"draft     #{draft} moved to the trash")
     page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit&_fields="
                                f"id,slug,title,status,link,parent,modified_gmt",
                         creds=creds))
-    write_wp_meta(out, {**meta, "post_id": orig, "slug": page["slug"],
+    # meta carries no "replacing": the swap is complete.
+    write_wp_meta(out, {**{k: v for k, v in meta.items() if k != "replacing"},
+                        "post_id": orig, "slug": page["slug"],
                         "title": (page["title"] or {}).get("raw", ""),
                         "parent": page.get("parent"), "link": page["link"],
                         "status": page["status"], "modified_gmt": page["modified_gmt"],
-                        "replaced": {"draft": int(draft), "backup": bpath},
+                        "replaced": {"draft": int(draft), "backup": ebackup},
                         "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
     print(f"wp.json   #{orig} now, replaced draft #{draft}, edited {page['modified_gmt']}")
 
@@ -4892,6 +4940,8 @@ def cmd_push(args):
     # pulling a page into build/anything and pushing it back renamed a live
     # URL to "anything" and 404'd the real one. Only --page-slug may rename.
     out = os.path.join(BUILD, args.slug)
+    if getattr(args, "replace", None):
+        _replace_args(args)
     creds = wp_creds()
     # The site decides which languages exist, not this script. Check before
     # anything is read from or written to a page.
@@ -4993,6 +5043,13 @@ def cmd_push(args):
         seen, now = (src["modified_gmt"] if replace else meta.get("modified_gmt")), \
             cur.get("modified_gmt")
         if seen and now and now != seen and (replace or not args.force):
+            if replace:
+                die("PAGE_MOVED_ON",
+                    f"#{post_id} was edited in WordPress after it was extracted:\n"
+                    f"    extract read       {seen}\n"
+                    f"    WordPress now says {now}\n"
+                    f"  Extract it again and rebuild against what it holds now; "
+                    f"nothing was changed.")
             die("PAGE_MOVED_ON",
                 f"#{post_id} was edited in WordPress after this build last "
                 f"touched it:\n"
@@ -5016,8 +5073,12 @@ def cmd_push(args):
         # Identity first, then the backup, both before the media upload: the
         # first write to the site must find the way back already on disk.
         before = public_identity(src["url"])
-        bpath = backup_elementor(post_id, out, creds=creds)
-        print(f"backup    {bpath}")
+        ebackup = os.path.relpath(backup_elementor(post_id, out, creds=creds), out)
+        # Record it before the first write: if anything below stops, wp.json
+        # says where the way back is, and a rerun refuses (REPLACE_UNFINISHED).
+        write_wp_meta(out, {**meta, "replacing": {"orig": post_id, "backup": ebackup}})
+        print(f"elementor backup {os.path.join(out, ebackup)}  "
+              f"(restore with elementor-restore)")
 
     # Now that the page is known, the slug follows it — not the folder.
     page_slug = args.page_slug or (cur.get("slug") if post_id else None) \
@@ -5137,7 +5198,8 @@ def cmd_push(args):
     # A build whose wp.json has a post_id but no modified_gmt was created by
     # a push that failed before finishing — its permalink may never have run.
     unfinished = bool(meta.get("post_id")) and not meta.get("modified_gmt")
-    if post_type == "page" or created or unfinished or args.page_slug:
+    # --replace never touches the original's URL.
+    if not replace and (post_type == "page" or created or unfinished or args.page_slug):
         perm = ability("mc/regenerate-permalink",
                        {"post_id": int(post_id), "slug": page_slug}, creds=creds)
         print(f"permalink {(perm.get('output') or perm).get('permalink', '')}")
@@ -5163,7 +5225,7 @@ def cmd_push(args):
 
     rendered = (after.get("content") or {}).get("rendered", "")
     if replace:
-        _replace_finish(out, meta, post_id, draft_id, before, bpath, src["url"], creds)
+        _replace_finish(out, meta, post_id, draft_id, before, ebackup, src["url"], creds)
         return
     if post_type == "page":
         assert_raw(post_id, rendered, page_wrapper(out), creds=creds)

@@ -59,6 +59,11 @@ class VerifyCheckWiring(unittest.TestCase):
         self.assertFalse(any("spaced hyphen" in e for e in errors), errors)
 
 
+def put(path, text):
+    with open(path, "w") as fh:
+        fh.write(text)
+
+
 class WpHelpers(unittest.TestCase):
     CREDS = ("https://x.test", "u", "p")
 
@@ -182,7 +187,7 @@ class PushElementor(unittest.TestCase):
         self.build = os.path.join(self.tmp, "build")
         self.out = os.path.join(self.build, "p")
         os.makedirs(self.out)
-        open(os.path.join(self.out, "page.html"), "w").write(self.HTML)
+        put(os.path.join(self.out, "page.html"), self.HTML)
         self.calls = []
         self.rendered = self.RENDERED
         self.meta = ["", ""]          # successive get_meta answers
@@ -237,7 +242,7 @@ class PushElementor(unittest.TestCase):
         meta = {"post_id": 5, "post_type": "page",
                 "modified_gmt": "2026-01-01T00:00:00"}
         meta.update(extra)
-        json.dump(meta, open(os.path.join(self.out, "wp.json"), "w"))
+        put(os.path.join(self.out, "wp.json"), json.dumps(meta))
 
     def test_bad_language_dies_before_any_write(self):
         err = io.StringIO()
@@ -354,7 +359,7 @@ class PushElementor(unittest.TestCase):
         self.assertEqual(fw.page_wrapper(self.out), "gehk-page")
 
     def test_page_wrapper_none_found(self):
-        open(os.path.join(self.out, "page.html"), "w").write("<div><p>a</p></div>")
+        put(os.path.join(self.out, "page.html"), "<div><p>a</p></div>")
         self.assertEqual(fw.page_wrapper(self.out), "")
 
     def test_clear_elementor_data_flag(self):
@@ -369,11 +374,11 @@ class PushElementor(unittest.TestCase):
 
     def test_push_skips_manifest_entry_without_id(self):
         url = "https://x/elementor/thumbs/a.png"
-        open(os.path.join(self.out, "page.html"), "w").write(
+        put(os.path.join(self.out, "page.html"),
             '<!-- wp:html -->\n<div class="mc-page gehk-page"><img src="assets/a.png"></div>\n'
             '<!-- /wp:html -->\n')
-        json.dump({"assets/a.png": {"id": None, "url": url}},
-                  open(os.path.join(self.out, "manifest.json"), "w"))
+        put(os.path.join(self.out, "manifest.json"),
+            json.dumps({"assets/a.png": {"id": None, "url": url}}))
         self.push()
         self.assertFalse([c for c in self.calls
                           if c[0] == "POST" and "/media" in c[1]])
@@ -423,6 +428,9 @@ class PushReplace(unittest.TestCase):
         self.fetched = [identity_page(body='<div class="elementor">x</div>'),
                         identity_page(body='<div class="mc-page gehk-page">a</div>')]
         self.backup_seen = None
+        self.replacing_seen = None
+        self.final = None             # fetch_live's final URL, when it differs
+        self.fetch_error = None       # raised by the Nth fetch_live call (1-based)
         for name, repl in (
                 ("BUILD", self.build),
                 ("wp_creds", lambda: ("https://x", "u", "p")),
@@ -459,6 +467,7 @@ class PushReplace(unittest.TestCase):
         # the first write must find the Elementor backup already on disk
         if self.backup_seen is None:
             self.backup_seen = self.backups()
+            self.replacing_seen = self.wp_json().get("replacing")
         self.calls.append(what)
 
     def fake_wp(self, method, path, **kw):
@@ -485,7 +494,9 @@ class PushReplace(unittest.TestCase):
 
     def fake_fetch_live(self, url):
         self.calls.append(("fetch_live", url))
-        return url, self.fetched.pop(0)
+        if self.fetch_error == len([c for c in self.calls if c[0] == "fetch_live"]):
+            raise urllib.error.HTTPError(url, 500, "boom", {}, None)
+        return self.final or url, self.fetched.pop(0)
 
     def args(self, **kw):
         a = dict(slug="p", title=None, parent=None, parent_path=None, page_slug=None,
@@ -547,10 +558,65 @@ class PushReplace(unittest.TestCase):
         self.dies("PAGE_MOVED_ON")
         self.no_writes()
 
-    def test_replace_moved_on_is_not_forced_past(self):
+    def test_replace_moved_on_message_does_not_offer_force(self):
         self.orig_mod = "2026-04-04T00:00:00"
-        self.dies("PAGE_MOVED_ON", force=True)
+        self.assertNotIn("--force", self.dies("PAGE_MOVED_ON"))
+
+    def test_replace_refuses_args_that_change_identity_or_skip_checks(self):
+        for kw in ({"title": "T"}, {"parent": 3}, {"parent_path": "a/b"},
+                   {"page_slug": "x"}, {"force": True}):
+            self.dies("REPLACE_ARG", **kw)
+        self.assertEqual(self.calls, [])
+
+    def test_replace_never_regenerates_the_permalink(self):
+        self.replace()
+        self.assertNotIn("mc/regenerate-permalink", self.names())
+
+    def test_replace_records_replacing_before_the_first_write(self):
+        out = self.replace()
+        self.assertEqual(self.replacing_seen["orig"], self.ORIG)
+        self.assertRegex(self.replacing_seen["backup"], r"^backups/50-elementor-\d+\.json$")
+        self.assertIn("elementor backup", out)
+        self.assertIn("elementor-restore", out)
+        self.assertEqual(self.wp_json().get("replacing"), None)    # finished: gone
+        self.assertEqual(self.wp_json()["post_id"], self.ORIG)
+
+    def test_replace_unfinished_leaves_replacing_and_rerun_refuses(self):
+        self.fetched[1] = identity_page(body='<div class="elementor">x</div>')
+        self.dies("STILL_ELEMENTOR")
+        w = self.wp_json()
+        self.assertEqual(w["post_id"], self.DRAFT)                  # untouched
+        self.assertEqual(w["replacing"]["orig"], self.ORIG)
+        self.calls.clear()
+        self.fetched = [identity_page(), identity_page()]
+        err = self.dies("REPLACE_UNFINISHED")
+        self.assertIn(w["replacing"]["backup"], err)
+        self.assertIn("elementor-restore", err)
+        self.assertEqual(self.calls, [])                            # nothing read or written
+
+    def test_replace_dies_cleanly_when_the_recheck_fetch_fails(self):
+        self.fetch_error = 2
+        err = self.dies("IDENTITY_CHANGED")
+        self.assertIn("-elementor-", err)
+        self.assertNotIn(("DELETE", f"/wp-json/wp/v2/pages/{self.DRAFT}"), self.calls)
+
+    def test_replace_refuses_an_original_that_redirects(self):
+        self.final = "https://x/elsewhere/"
+        self.dies("ORIGINAL_REDIRECTS")
         self.no_writes()
+
+    def test_trailing_slash_difference_is_not_a_redirect(self):
+        self.final = "https://x/example?fwcb=1"
+        self.replace()
+
+    def test_replace_refuses_to_back_up_what_it_cannot_restore(self):
+        self.metas["_elementor_data"] = "[]"
+        self.dies("BACKUP_FAILED")
+        self.no_writes()
+        self.metas.update(_elementor_data='[{"id":"a"}]', _elementor_edit_mode="")
+        self.dies("BACKUP_FAILED")
+        self.no_writes()
+        self.assertNotIn("replacing", self.wp_json())
 
     def test_replace_refuses_with_post_id_or_translation_of(self):
         self.dies("REPLACE_CONFLICT", post_id=7)
@@ -588,6 +654,7 @@ class PushReplace(unittest.TestCase):
         self.fetched[1] = identity_page(title="Other", body='<div class="gehk-page">a</div>')
         err = self.dies("IDENTITY_CHANGED")
         self.assertIn("elementor-restore", err)
+        self.assertIn("-elementor-", err)           # the Elementor backup, not the .html
         self.assertIn("title", err)
         self.assertNotIn(("DELETE", f"/wp-json/wp/v2/pages/{self.DRAFT}"), self.calls)
         self.assertEqual(self.wp_json()["post_id"], self.DRAFT)
@@ -616,15 +683,17 @@ class PushReplace(unittest.TestCase):
         w = self.wp_json()
         self.assertEqual(w["post_id"], self.ORIG)
         self.assertEqual(w["replaced"]["draft"], self.DRAFT)
-        self.assertTrue(os.path.isfile(w["replaced"]["backup"]))
+        self.assertRegex(w["replaced"]["backup"], r"^backups/50-elementor-\d+\.json$")
+        self.assertTrue(os.path.isfile(os.path.join(self.out, w["replaced"]["backup"])))
+        self.assertNotIn("replacing", w)
         self.assertEqual(w["modified_gmt"], self.orig_mod)
         self.assertEqual(w["slug"], "example")
 
     def test_replace_front_end_fetch_is_cache_busted_after_purge(self):
         self.replace()
         urls = [c[1] for c in self.calls if c[0] == "fetch_live"]
-        self.assertEqual(urls[0], "https://x/example/")
-        self.assertRegex(urls[1], r"^https://x/example/\?[\w=.-]+$")
+        for u in urls:        # the before fetch is busted too
+            self.assertRegex(u, r"^https://x/example/\?fwcb=\d+$")
 
     def test_replace_tolerates_a_style_block_before_the_json(self):
         real = self.fake_wp
