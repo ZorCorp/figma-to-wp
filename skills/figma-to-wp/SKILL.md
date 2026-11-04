@@ -969,8 +969,10 @@ width extract did not shoot). `mobile` runs its usual checks and, in addition,
 compares where every text starts with where the original started it at that
 width, ±6px (`--tolerance`) — the text, not its element's box, so a button
 whose label sits in a padding-free span matches one built with the label
-straight in the padded link. Body copy under 16px that is under 16px on the original
-too is printed as a note, not counted: the original is the spec.
+straight in the padded link. A `design.json` extracted before this change holds
+element-box positions at 768 and 390: re-run `extract` to refresh the reference
+before trusting `mobile`'s positions. Body copy under 16px that is under 16px
+on the original too is printed as a note, not counted: the original is the spec.
 
 ### Usage A — copy
 

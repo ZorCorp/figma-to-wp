@@ -1636,7 +1636,7 @@ def _blank_boxes(png, texts):
             if t.get("hidden") or t.get("clipped") or not t.get("w") or not t.get("h"):
                 continue
             # w/h are the element's, so place them at its box, not the ink.
-            bx, by = t.get("bx", t["x"]), t.get("by", t["y"])
+            bx, by = t.get("box_x", t["x"]), t.get("box_y", t["y"])
             box = (bx + 1, by + 1, bx + t["w"] - 1, by + t["h"] - 1)
             if box[2] <= box[0] or box[3] <= box[1] or box[1] >= g.height or box[0] >= g.width:
                 continue
@@ -1664,9 +1664,10 @@ def _el_text(r, ox, oy):
     x/y are where the text starts (the run's tx/ty), because that is what a
     position check should compare: the parent element's box depends on the
     markup (Elementor's padding-free button-text span against a raw build's
-    padded <a>) while the ink does not. The element's own box is kept as
-    bx/by, only when it differs; a run without tx/ty (an older measurement)
-    is placed by its box."""
+    padded <a>) while the ink does not. Whenever tx/ty is present the
+    element's own box is also kept as box_x/box_y (w/h are always the
+    element's, and a centred or right-aligned string is placed by its box, not
+    its first glyph); a run without tx/ty (an older measurement) is placed by its box and carries no box_x/box_y."""
     w = str(r.get("weight") or "")
     ink = r.get("tx") is not None and r.get("ty") is not None
     rec = {"text": r.get("text", ""),
@@ -1683,7 +1684,7 @@ def _el_text(r, ox, oy):
     if r.get("clipped"):
         rec["clipped"] = True
     if ink:
-        rec["bx"], rec["by"] = r["x"] - ox, r["y"] - oy
+        rec["box_x"], rec["box_y"] = r["x"] - ox, r["y"] - oy
     return rec
 
 
@@ -3444,11 +3445,22 @@ def cmd_audit(args):
             da = t.get("align", "left")
             if da != el.get("align", "left"):
                 bad.append(("align", f'{el.get("align","left")} vs {da}'))
+            # On an Elementor design.json x is where the text starts but w is
+            # still the element's width, so a centre or right edge has to come
+            # from the kept element box (box_x), not from x. A Figma text node
+            # has no box_x: its x and w are one box already.
+            rx = t.get("box_x", t["x"])
+            edge = {el.get("align"), da} & {"center", "right"}
             if (el.get("align") == "center" or da == "center") and t.get("w"):
                 ox = ((el["x"] + pl + (el.get("w", 0) - pl - pr) / 2)
-                      - (t["x"] + t["w"] / 2) - dx)
+                      - (rx + t["w"] / 2) - dx)
                 ox = int(round(ox))
                 label = "centre"
+            elif edge and "box_x" in t:
+                # A centred or right-aligned line's ink start moves with the
+                # line's width, so compare box to box.
+                ox = int(round(el["x"] - rx - dx))
+                label = "x"
             else:
                 ox = int(round(el["x"] + pl - t["x"] - dx))
                 label = "x"

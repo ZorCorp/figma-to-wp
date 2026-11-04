@@ -1559,16 +1559,25 @@ class MeasureJsInSnapshot(unittest.TestCase):
             '<span>Get started</span></a>'
             '<ul style="list-style:none;margin:0;padding:0"><li>'
             '<span class="ic" style="width:14px;height:14px;display:inline-block;margin-right:9px"></span>'
-            '<span>Fast setup</span></li></ul></div>')
+            '<span>Fast setup</span></li></ul>'
+            '<div style="width:300px;margin:0 auto;text-align:center">'
+            '<span>Centred copy that is long enough to wrap onto lines</span></div></div>')
         raw_shape = (
             '<div style="padding:40px">'
             '<a href="#" style="display:inline-block;padding:12px 24px">Get started</a>'
             '<ul style="list-style:none;margin:0;padding:0"><li style="display:flex">'
             '<span class="ic" style="flex:0 0 14px;height:14px;margin-right:9px"></span>'
-            'Fast setup</li></ul></div>')
+            'Fast setup</li></ul>'
+            '<div style="width:300px;margin:0 auto;text-align:center">'
+            'Centred copy that is long enough to wrap onto lines</div></div>')
         ref = self.measure_texts(elementor_shape)
         live = self.measure_texts(raw_shape)
-        self.assertEqual(sorted(t["text"] for t in ref), ["Fast setup", "Get started"])
+        # Both sides must have produced every text, or an empty list would
+        # pass compare_positions for the wrong reason.
+        want = ["Centred copy that is long enough to wrap onto lines",
+                "Fast setup", "Get started"]
+        self.assertEqual(sorted(t["text"] for t in ref), want)
+        self.assertEqual(sorted(t["text"] for t in live), want)
         self.assertEqual(fw.compare_positions(ref, live, 6), [])
 
 
@@ -2304,9 +2313,9 @@ class ComparePositions(unittest.TestCase):
                       _run("Old design file run", 124, 212)]}
         got = fw.el_texts(m)
         self.assertEqual((got[0]["x"], got[0]["y"]), (48, 74))      # tx/ty, root-relative
-        self.assertEqual((got[0]["bx"], got[0]["by"]), (24, 62))    # the element box, kept
+        self.assertEqual((got[0]["box_x"], got[0]["box_y"]), (24, 62))    # the element box, kept
         self.assertEqual((got[1]["x"], got[1]["y"]), (24, 162))     # no tx/ty: the box
-        self.assertNotIn("bx", got[1])
+        self.assertNotIn("box_x", got[1])
         placed = fw.el_copy(["Get started"], m)
         self.assertEqual((placed[0]["x"], placed[0]["y"]), (48, 74))
 
@@ -2330,6 +2339,68 @@ class ComparePositions(unittest.TestCase):
         self.assertEqual(fw.compare_sections(ref, live, 6),
                          [{"name": "s2", "dy": 40, "dh": 0},
                           {"name": "s3", "dy": 40, "dh": 30}])
+
+
+class AuditElementorAlignment(unittest.TestCase):
+    """audit against an Elementor design.json, whose x is where the text starts
+    and whose w is the element's width (the element box is kept as box_x)."""
+
+    def audit(self, texts, live_extra):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        out = os.path.join(tmp, "build", "ex")
+        os.makedirs(out)
+        # Six plain left-aligned strings that agree to the pixel, so the
+        # page-to-frame offset is 0 and two pairs can be judged on their own.
+        base = [(f"Plain line number {n}", 20, 100 + 60 * n) for n in range(6)]
+        runs = [_run(t, x, y, w=300, h=30, padl=0, padr=0, padt=0, padb=0, cls="c")
+                for t, x, y in base]
+        design = {"source": {"type": "elementor", "width": 1440},
+                  "widths": {}, "frames": [], "sections": [],
+                  "texts": fw.el_texts({"root": {"x": 0, "y": 0}, "runs": [
+                      {**r, "tx": r["x"], "ty": r["y"]} for r in runs] + texts})}
+        _write(os.path.join(out, "design.json"), json.dumps(design))
+        dom = _measure_dom(runs + live_extra, {"x": 0, "y": 0, "w": 1440, "h": 1000})
+        args = fw.argparse.Namespace(slug="ex", url="http://127.0.0.1:1/p.html",
+                                     section=None, tolerance=4)
+        buf = io.StringIO()
+        with mock.patch.object(fw, "BUILD", os.path.join(tmp, "build")), \
+                mock.patch.object(fw, "dump_dom", return_value=dom), \
+                contextlib.redirect_stdout(buf):
+            try:
+                fw.cmd_audit(args)
+            except SystemExit:          # exits 1 when it has findings
+                pass
+        return buf.getvalue()
+
+    def wide(self, text, align, tx, x=100, **kw):
+        """A run in a 800px-wide element at x=100 whose ink starts at tx."""
+        return _run(text, x, 700, w=800, h=30, align=align, padl=0, padr=0, padt=0,
+                    padb=0, cls="c", tx=tx, ty=700, **kw)
+
+    def test_centred_text_in_a_wider_box_is_not_an_offset(self):
+        # box 100..900 (centre 500), ink 200 wide starting at 400
+        ref = self.wide("Centred in a wide box", "center", 400)
+        out = self.audit([ref], [self.wide("Centred in a wide box", "center", 400)])
+        self.assertNotIn("centre", out)
+        self.assertNotIn("x +", out)
+
+    def test_centred_text_really_moved_is_still_reported(self):
+        ref = self.wide("Centred in a wide box", "center", 400)
+        out = self.audit([ref], [self.wide("Centred in a wide box", "center", 430, x=130)])
+        self.assertIn("centre +30px", out)
+
+    def test_right_aligned_text_in_a_wider_box_is_not_an_offset(self):
+        ref = self.wide("Right aligned in a box", "right", 780)
+        out = self.audit([ref], [self.wide("Right aligned in a box", "right", 780)])
+        self.assertNotIn(" x ", out)
+        self.assertNotIn("x -", out)
+        self.assertNotIn("x +", out)
+
+    def test_left_aligned_text_still_compares_the_ink_start(self):
+        ref = self.wide("Left aligned in a box", "left", 140)
+        out = self.audit([ref], [self.wide("Left aligned in a box", "left", 100)])
+        self.assertIn("x -40px", out)
 
 
 class MobileDiffElementor(unittest.TestCase):
