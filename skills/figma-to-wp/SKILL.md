@@ -882,10 +882,10 @@ What lands in `build/<slug>/`:
 | File | What |
 |---|---|
 | `design.png`, `design-768.png`, `design-390.png` | the page body at 1440, 768 and 390 — header, footer, popups and cookie banner hidden, lazy images loaded, every `vh` pinned to a 1000px viewport |
-| `design.json` | `source` (type `elementor`, post id, URL, `modified_gmt`, the fonts the page loaded); `texts` — **the whole copy, from the page's HTML**, each placed by the 1440 render with its computed type in `texts[].type`; `sections`; `widths."768"` / `widths."390"` with the texts and sections measured at that width, for the position checks. `frames` and `tokens` are empty: read type off `texts[].type` |
+| `design.json` | `source` (type `elementor`, post id, URL, `modified_gmt`, the fonts the page loaded); `texts` — **the whole copy, from the page's HTML**, each placed by the 1440 render with its computed type in `texts[].type`; `sections`; `widths."768"` / `widths."390"` with the texts and sections measured at that width, for the position checks. `frames` and `tokens` are empty: read type off `texts[].type`. `texts[].type.family` is the **first** family in the computed `font-family` stack, not the face that rendered: it may say Raleway while Roboto draws the glyphs (see *Fonts*) |
 | `elementor.json` | `widgets` (type, tier, section), `tier3`, `popups`, `posts_queries`, `responsive` (the page's own rules at ≤1024 and ≤767), `flags` (motion, sticky, hidden per device, HubSpot), `template` |
 | `elementor/live.html` | the snapshot every reference was shot from |
-| `assets/` + `manifest.json` | the images, for the preview. The manifest already points at the media library's copy, so push uploads none of them; an Elementor thumbnail has `id: null` and stays on its URL |
+| `assets/` + `manifest.json` | the images, for the preview. The manifest already points at the media library's copy with the sha of the file downloaded, so push uploads none of them while they are unchanged — and uploads one you edit in place. An Elementor thumbnail has `id: null` and stays on its URL; an image that failed to download has no sha and stays on its URL too |
 
 In a page repo, the `<slug>: extract` commit carries all of these.
 
@@ -1035,6 +1035,14 @@ Elementor — so look at the front end too: open the draft logged in at
 `?page_id=N&preview=true`, and again once it is published. It should carry
 your wrapper class and no `data-elementor-type="wp-page"`.
 
+**A create that stops halfway can be rerun.** Right after
+`mc/create-localized-page`, `wp.json` records the new id and
+`"creating": {"translation_of", "language"}`; it is removed only once the page
+has been checked raw. Run the same push again: it takes the page as its own —
+no `TRANSLATION_OF_ON_UPDATE` for the same `--translation-of` (a different one
+is still refused), no `ELEMENTOR_PAGE` for the meta WPML copied — clears that
+meta and checks again. Do not delete `creating` by hand.
+
 Expected and not an error: WPML rewrites a translation's internal links to
 absolute URLs on every save. The body WordPress holds will not match the build
 there.
@@ -1049,7 +1057,10 @@ there.
    ```
 
    The user checks it logged in at `?page_id=N&preview=true`. Nothing goes
-   further until they say it is right.
+   further until they say it is right. The draft push records the sha of the
+   body it sent (`wp.json` → `body_sha`) and the draft's `modified_gmt`:
+   `--replace` swaps in exactly that. Change the build, an asset, or the draft
+   in WordPress after the sign-off, and the draft is pushed and reviewed again.
 
 2. **Replace.** Then, and only then:
 
@@ -1063,21 +1074,36 @@ there.
      `--parent-path`, `--page-slug` or `--force` with `--replace`
      (`REPLACE_ARG`). The original keeps its title, place and URL, and no check
      is skipped.
-   - **Refuses before anything is written**: `verify` failing; no draft in
-     `wp.json` (`REPLACE_NO_DRAFT`); `wp.json`'s page being the original itself
-     (`REPLACE_DRAFT_IS_ORIGINAL`); `design.json` not an extract of that page
-     (`REPLACE_WRONG_PAGE`); the original edited since extract
-     (`PAGE_MOVED_ON` — extract again); the original's URL landing somewhere
-     else (`ORIGINAL_REDIRECTS`).
+   - **Refuses before anything is written**: `verify` failing; `--post-id`,
+     `--translation-of` or `--post-type post` with it (`REPLACE_CONFLICT`); no
+     draft in `wp.json` (`REPLACE_NO_DRAFT`); `wp.json`'s page being the
+     original itself (`REPLACE_DRAFT_IS_ORIGINAL`); a build that already
+     replaced its page (`ALREADY_REPLACED` — a plain `push <slug>` updates it
+     now) or stopped halfway doing so (`REPLACE_UNFINISHED`); `design.json` not
+     an extract of that page (`REPLACE_WRONG_PAGE`); **a page that is not a
+     usage-B draft** (`REPLACE_NOT_A_DRAFT`): a translated `copy.json`, a page
+     that is not `draft`/`pending`/`private`, or one in the original's WPML
+     group or another language than it — read with the
+     `ewpa/get-post-translations` ability, since REST pages carry no language
+     and the front end lists no drafts; a group that cannot be read is refused
+     too; **a draft that is not what was reviewed** (`REPLACE_DRAFT_STALE`):
+     the build's body (after the media rewrite) no longer matching
+     `wp.json` → `body_sha`, an asset changed since, the draft edited in
+     WordPress since (`modified_gmt`), or a `wp.json` from before `body_sha` —
+     push the draft again and have it signed off again; the original edited
+     since extract (`PAGE_MOVED_ON` — extract again); the original's URL
+     landing somewhere else (`ORIGINAL_REDIRECTS`).
    - Reads what search engines key the page by — title, meta description,
      canonical, hreflang — from the front end.
    - **Backs up** the Elementor meta, the page JS and the body to
      `backups/<id>-elementor-<stamp>.json` and reads it back. A page with no
      builder mode or no Elementor data has nothing to restore:
      `BACKUP_FAILED`, nothing changed.
-   - Writes a `replacing` marker to `wp.json` **before the first write**, so a
-     run that stops halfway says where its way back is. A rerun then refuses
-     (`REPLACE_UNFINISHED`) and points at `elementor-restore`.
+   - Writes a `replacing` marker to `wp.json` **just before the first write
+     to the original** (after the body backup), so a run that stops halfway
+     says where its way back is. A rerun then refuses (`REPLACE_UNFINISHED`)
+     and points at `elementor-restore`. A run that stops before it has changed
+     nothing on the original and leaves no marker.
    - Writes the body with `mc/set-post-html`, clears **only**
      `_elementor_edit_mode` (`_elementor_data` stays, for the way back), writes
      the page JS. The permalink is never regenerated.
@@ -1085,7 +1111,10 @@ there.
      not your HTML, `IDENTITY_CHANGED` if the title, description, canonical or
      hreflang moved. Either one leaves the draft alone and names the backup.
    - Moves the draft to the trash, and rewrites `wp.json` to the original with
-     a `replaced` record. From here a plain `push <slug>` updates the page.
+     a `replaced` record. From here a plain `push <slug>` updates the page —
+     and, while `wp.json` has `replaced`, leaves its Permalink Manager URI
+     alone (`permalink kept`): regenerating could reset a URI set by hand on
+     the Elementor page. `--page-slug` still regenerates it.
 
 3. **Back.** `elementor-restore` puts the Elementor page back:
 
@@ -1094,16 +1123,18 @@ there.
    python3 "$FW" elementor-restore <slug> --backup <path>
    ```
 
-   It refuses if `_elementor_data` on the site is no longer what the backup
-   holds (`ELEMENTOR_DATA_CHANGED` — someone edited it since; compare and
+   It refuses when there is no backup to read — `wp.json` names none and no
+   `--backup` was given, or the file is missing or not an Elementor backup
+   (`NO_BACKUP`) — and if `_elementor_data` on the site is no longer what the
+   backup holds (`ELEMENTOR_DATA_CHANGED` — someone edited it since; compare and
    decide, it will not guess), or if the backup is of another page
    (`BACKUP_MISMATCH`). Otherwise it keeps the body the page holds now in
    `backups/`, sets builder mode and the page JS back **first** — Elementor then
    draws its own data whatever the body says, so a failure after that still
    leaves the page on Elementor — then writes the old body, purges, and checks
    the front end renders the Elementor document again (`RESTORE_FAILED` if
-   not). Any step failing stops with `RESTORE_INCOMPLETE`. **Running it again
-   is always safe.** It clears `replaced`/`replacing` from `wp.json` and prints
+   not). Any step failing stops with `RESTORE_INCOMPLETE`, naming the error.
+   **Running it again is always safe.** It clears `replaced`/`replacing` from `wp.json` and prints
    how to replace again.
 
    The restore itself changes the original's `modified_gmt`, which `--replace`
@@ -1116,6 +1147,13 @@ there.
    state, or a `design.json` of another extract), `design.json` is left alone
    and the hint starts with "extract it again first": extract, rebuild, then
    replace.
+
+   That restamp is only as strong as the `_elementor_data` check: an edit made
+   between the replace and the restore that leaves `_elementor_data` alone (a
+   title, a setting kept elsewhere) is absorbed into the new stamp, not
+   caught. And running restore a second time loses the shortcut — the first
+   run already moved `source.modified_gmt` off the backup's stamp, so the
+   second says "extract it again first".
 
 ### What the site was seen to do
 
@@ -1160,7 +1198,9 @@ Tested on throwaway pages in a WPML group of their own:
 | posts widget → `[wpb_post_list]` in a language with no matching term or posts | "No posts found." under a heading | hide the band when the list is empty (`elementor-widgets.md`, *posts*); `extract` lists the term ids, `push --language` warns for each with no counterpart in that language |
 | a hero in `vh` | reference and build disagree on its height | references pin `vh` to 1000px; build in px |
 | the original's popup id kept on another language | the button does nothing | `elementor.json` → `popups`; use the id that language loads |
-| `push --post-id` on an Elementor page | the body is written, the page keeps rendering Elementor, nothing is backed up | refused (`ELEMENTOR_PAGE`); use `--replace` |
+| `push --post-id` on an Elementor page | the body is written, the page keeps rendering Elementor, nothing is backed up | refused (`ELEMENTOR_PAGE`); usage B: a draft first, signed off, then `--replace` |
+| a usage-A translation pushed with `--replace` | another language on the original, the live translation trashed | refused (`REPLACE_NOT_A_DRAFT`) |
+| the build changed after the draft was signed off | `--replace` would ship what nobody reviewed | refused (`REPLACE_DRAFT_STALE`); push the draft again |
 
 ## Editing a page that already exists
 
