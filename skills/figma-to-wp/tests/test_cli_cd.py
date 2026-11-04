@@ -324,6 +324,8 @@ class PushPost(unittest.TestCase):
         self._orig_ability = fw.ability
         self._orig_wp_creds = fw.wp_creds
         self._orig_build = fw.BUILD
+        self._orig_langs = fw.wpml_languages
+        fw.wpml_languages = lambda creds=None: ["en", "zh-hant"]
         self.tmp = tempfile.mkdtemp()
         self.cwd = os.getcwd()
         os.chdir(self.tmp)
@@ -341,6 +343,7 @@ class PushPost(unittest.TestCase):
         self.fw.ability = self._orig_ability
         self.fw.wp_creds = self._orig_wp_creds
         self.fw.BUILD = self._orig_build
+        self.fw.wpml_languages = self._orig_langs
         os.chdir(self.cwd)
         shutil.rmtree(self.tmp)
 
@@ -402,6 +405,8 @@ class PushPostCreate(unittest.TestCase):
         self._orig_ability = fw.ability
         self._orig_wp_creds = fw.wp_creds
         self._orig_build = fw.BUILD
+        self._orig_langs = fw.wpml_languages
+        fw.wpml_languages = lambda creds=None: ["en", "zh-hant"]
         self.tmp = tempfile.mkdtemp()
         self.cwd = os.getcwd()
         os.chdir(self.tmp)
@@ -417,6 +422,7 @@ class PushPostCreate(unittest.TestCase):
         self.fw.ability = self._orig_ability
         self.fw.wp_creds = self._orig_wp_creds
         self.fw.BUILD = self._orig_build
+        self.fw.wpml_languages = self._orig_langs
         os.chdir(self.cwd)
         shutil.rmtree(self.tmp)
 

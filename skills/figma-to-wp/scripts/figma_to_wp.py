@@ -3631,6 +3631,53 @@ def wpml_languages(creds=None):
     return langs
 
 
+def clear_elementor(post_id, *, data, creds=None):
+    """Turn a page WPML copied Elementor onto back into a raw-HTML page.
+
+    Joining a raw page to an Elementor original as its translation copies
+    _elementor_edit_mode ("builder"), and the page then renders Elementor
+    instead of post_content. Blank it. `data` also empties _elementor_data;
+    set_meta stringifies, so "[]" is the JSON empty list, not a Python repr.
+    """
+    set_meta(post_id, "_elementor_edit_mode", "", creds=creds)
+    if data:
+        set_meta(post_id, "_elementor_data", "[]", creds=creds)
+
+
+def page_wrapper(out):
+    """The page's own wrapper class (gehk-page) from page.html: the first
+    class ending in -page other than the shared mc-page. "" when there is none."""
+    with open(os.path.join(out, "page.html"), encoding="utf-8") as fh:
+        html = fh.read()
+    for attr in re.findall(r'class="([^"]*)"', html):
+        for c in attr.split():
+            if c.endswith("-page") and c != "mc-page":
+                return c
+    return ""
+
+
+def assert_raw(post_id, rendered, wrapper, creds=None):
+    """After a push, the page must be raw HTML on the front end, not Elementor.
+
+    Two signs: _elementor_edit_mode is empty, and the rendered body carries the
+    page's own wrapper class. Either one failing means the site is still
+    drawing the Elementor document, whatever post_content now says.
+    """
+    mode = get_meta(post_id, "_elementor_edit_mode", creds=creds)
+    if mode:
+        die("STILL_ELEMENTOR",
+            f"#{post_id} still has _elementor_edit_mode={mode!r}, so the site "
+            f"renders Elementor and not the pushed HTML.")
+    if not wrapper:
+        print("check     wrapper class not found in page.html; checked the "
+              "Elementor meta only")
+        return
+    if not re.search(r'class="[^"]*' + re.escape(wrapper), rendered or ""):
+        die("STILL_ELEMENTOR",
+            f"#{post_id} renders without class \"{wrapper}\", so the page "
+            f"is not drawing the pushed HTML (Elementor or a cached copy).")
+
+
 def cmd_setup(args):
     os.makedirs(HOME, mode=0o700, exist_ok=True)
     tok = env("FIGMA_TOKEN") or die("NO_FIGMA_TOKEN", f"put FIGMA_TOKEN in {HOME}/.env")
@@ -3934,6 +3981,14 @@ def cmd_push(args):
     # URL to "anything" and 404'd the real one. Only --page-slug may rename.
     out = os.path.join(BUILD, args.slug)
     creds = wp_creds()
+    # The site decides which languages exist, not this script. Check before
+    # anything is read from or written to a page.
+    langs = wpml_languages(creds)
+    if args.language not in langs:
+        die("BAD_LANGUAGE",
+            f"--language {args.language!r} is not a WPML language on this "
+            f"site. Available: {', '.join(langs) or '(none found)'}")
+    translation_of = getattr(args, "translation_of", None)
     parent_id = args.parent
     if args.parent_path:
         parent_id = resolve_parent(args.parent_path, creds, args.language)
@@ -3974,6 +4029,10 @@ def cmd_push(args):
 
     if not post_id and not args.title:
         die("NO_TITLE", "--title is required when creating a page")
+    if post_id and translation_of:
+        die("TRANSLATION_OF_ON_UPDATE",
+            f"--translation-of only applies when a page is created, and "
+            f"#{post_id} already exists. WPML groups are not changed by push.")
 
     # Resolve every taxonomy term ONCE, before the page-moved-on check, the
     # media upload, or any write. Catching a bad slug after ewpa/create-post
@@ -4019,6 +4078,16 @@ def cmd_push(args):
                 f"overwrite it. The old body is only recoverable from "
                 f"build/<slug>/backups/ — site revisions are off.")
 
+        # An Elementor page holds its content in _elementor_data; set-post-html
+        # would overwrite post_content and the page would carry on rendering
+        # Elementor. Stop before the upload, backup or any write.
+        if post_type == "page" and \
+                get_meta(post_id, "_elementor_edit_mode", creds=creds) == "builder":
+            die("ELEMENTOR_PAGE",
+                f"#{post_id} is an Elementor page; a plain push would "
+                f"overwrite it without a backup of its Elementor data. "
+                f"use --replace")
+
     # Now that the page is known, the slug follows it — not the folder.
     page_slug = args.page_slug or (cur.get("slug") if post_id else None) \
         or args.slug
@@ -4028,14 +4097,20 @@ def cmd_push(args):
     new = 0
     for rel in sorted(set(re.findall(r'(?:src|poster)="(assets/[^"]+)"', html))):
         local = os.path.join(out, rel)
-        if not os.path.exists(local):
-            die("ASSET_MISSING", local)
         # Key on the bytes, not the path. Keying on the path alone means a
         # corrected asset under the same filename is never uploaded and the
         # page silently keeps serving the old one — which is how a logo with
         # its background keyed out stayed opaque on the live page.
+        # An entry with a url and no sha is already on the site and has
+        # nothing to compare against: Elementor thumbs (id null) from extract.
+        # Do not re-upload those or insist the file is local.
+        rec = manifest.get(rel, {})
+        if rec.get("url") and "sha" not in rec:
+            continue
+        if not os.path.exists(local):
+            die("ASSET_MISSING", local)
         sha = hashlib.sha256(open(local, "rb").read()).hexdigest()
-        if manifest.get(rel, {}).get("sha") == sha:
+        if rec.get("sha") == sha:
             continue
         send = local if args.no_webp else to_webp(local)
         ext = os.path.splitext(send)[1].lower()
@@ -4080,6 +4155,7 @@ def cmd_push(args):
                 "title": args.title, "language": args.language, "status": "draft",
                 "slug": page_slug,
                 **({"parent_id": parent_id} if parent_id else {}),
+                **({"translation_of": int(translation_of)} if translation_of else {}),
             }, creds=creds)
         # The ability may answer {"output": {...}} or the object itself, and
         # name the id "id" or "post_id" either way. Missing one shape here
@@ -4100,6 +4176,14 @@ def cmd_push(args):
 
     ability("mc/set-post-html", {"post_id": int(post_id), "content": html}, creds=creds)
     print(f"body      set via mc/set-post-html ({len(html)} bytes)")
+
+    # A page joined to an Elementor original as its translation inherits the
+    # builder meta and keeps rendering Elementor. A page created by this push
+    # is raw by intent, so blank what WPML copied. (Posts never use Elementor.)
+    if created and post_type == "page" and \
+            get_meta(post_id, "_elementor_edit_mode", creds=creds) == "builder":
+        clear_elementor(post_id, data=True, creds=creds)
+        print("elementor  cleared (copied by WPML)")
 
     if post_type == "post" and regions:
         ability("mc/set-terms", {"post_id": int(post_id), "taxonomy": "region",
@@ -4139,6 +4223,8 @@ def cmd_push(args):
                                                    time.gmtime())})
 
     rendered = (after.get("content") or {}).get("rendered", "")
+    if post_type == "page":
+        assert_raw(post_id, rendered, page_wrapper(out), creds=creds)
     delta = wpsafe.autop_delta(html, rendered)
     if not rendered:
         note = "  — could not compare: WordPress returned no rendered body"
@@ -4252,7 +4338,11 @@ def main():
                    help="parent by URL path, e.g. partners/work-collaboration")
     u.add_argument("--page-slug", help="the page's URL slug (default: the build slug)")
     u.add_argument("--post-id", type=int, help="update this page instead of creating one")
-    u.add_argument("--language", default="en", choices=["en", "zh-hant", "zh-hans"])
+    u.add_argument("--language", default="en",
+                   help="a WPML language code of the site, e.g. en, zh-hant, "
+                        "zh-hk (checked against the site before anything is written)")
+    u.add_argument("--translation-of", type=int, metavar="POST_ID",
+                   help="when creating, join this post's WPML translation group")
     u.add_argument("--force", action="store_true",
                    help="push even though WordPress has moved on since this "
                         "build last touched the page")
