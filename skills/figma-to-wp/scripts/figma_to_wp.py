@@ -1635,7 +1635,9 @@ def _blank_boxes(png, texts):
         for t in texts:
             if t.get("hidden") or t.get("clipped") or not t.get("w") or not t.get("h"):
                 continue
-            box = (t["x"] + 1, t["y"] + 1, t["x"] + t["w"] - 1, t["y"] + t["h"] - 1)
+            # w/h are the element's, so place them at its box, not the ink.
+            bx, by = t.get("bx", t["x"]), t.get("by", t["y"])
+            box = (bx + 1, by + 1, bx + t["w"] - 1, by + t["h"] - 1)
             if box[2] <= box[0] or box[3] <= box[1] or box[1] >= g.height or box[0] >= g.width:
                 continue
             lo, hi = g.crop(box).getextrema()
@@ -1658,9 +1660,17 @@ def _css_fill(v):
 
 
 def _el_text(r, ox, oy):
-    """One measure.js run in design.json's text shape, relative to the root."""
+    """One measure.js run in design.json's text shape, relative to the root.
+    x/y are where the text starts (the run's tx/ty), because that is what a
+    position check should compare: the parent element's box depends on the
+    markup (Elementor's padding-free button-text span against a raw build's
+    padded <a>) while the ink does not. The element's own box is kept as
+    bx/by, only when it differs; a run without tx/ty (an older measurement)
+    is placed by its box."""
     w = str(r.get("weight") or "")
-    rec = {"text": r.get("text", ""), "x": r["x"] - ox, "y": r["y"] - oy,
+    ink = r.get("tx") is not None and r.get("ty") is not None
+    rec = {"text": r.get("text", ""),
+           "x": (r["tx"] if ink else r["x"]) - ox, "y": (r["ty"] if ink else r["y"]) - oy,
            "w": r.get("w"), "h": r.get("h"),
            "align": {"start": "left", "end": "right"}.get(r.get("align"), r.get("align") or "left"),
            "type": {"family": r.get("family"), "size": r.get("size"),
@@ -1672,6 +1682,8 @@ def _el_text(r, ox, oy):
     # the closed state's, not a place anything should be put.
     if r.get("clipped"):
         rec["clipped"] = True
+    if ink:
+        rec["bx"], rec["by"] = r["x"] - ox, r["y"] - oy
     return rec
 
 

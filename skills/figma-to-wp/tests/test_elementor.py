@@ -1530,6 +1530,47 @@ class MeasureJsInSnapshot(unittest.TestCase):
         run = [r for r in data["runs"] if "inner section" in r["text"]][0]
         self.assertEqual(run["sec"], "s1")
 
+    def measure_texts(self, body):
+        """el_texts of a one-section Elementor-shaped snapshot of body, measured in Chrome."""
+        html = ('<html><head></head><body style="margin:0">'
+                '<div data-elementor-type="wp-page" data-elementor-id="5">'
+                '<section class="elementor-section elementor-top-section" data-element_type="section">'
+                + body + '</section></div></body></html>')
+        with open(os.path.join(HERE, "..", "scripts", "measure.js"), encoding="utf-8") as f:
+            js = f.read()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, "live.html"), "w", encoding="utf-8") as f:
+            f.write(el.snapshot(html, "https://example.test", 5, js))
+        srv = fw.serve_dir(tmp)
+        self.addCleanup(fw.stop_server, srv)
+        dom = fw.dump_dom("http://127.0.0.1:%d/live.html" % srv.server_address[1], width=800)
+        m = re.search(r'<script type="application/json" id="fw-measure">(.*?)</script>', dom, re.S)
+        self.assertTrue(m, "no fw-measure block in the DOM")
+        return fw.el_texts(json.loads(m.group(1)))
+
+    def test_position_check_compares_where_text_starts_not_element_boxes(self):
+        # Elementor wraps button text in a padding-free span inside the padded
+        # <a>, and icon-list text in a span after the icon; a raw build puts
+        # the text straight in the <a> / <li>. Same ink, different boxes.
+        elementor_shape = (
+            '<div style="padding:40px">'
+            '<a href="#" style="display:inline-block;padding:12px 24px">'
+            '<span>Get started</span></a>'
+            '<ul style="list-style:none;margin:0;padding:0"><li>'
+            '<span class="ic" style="width:14px;height:14px;display:inline-block;margin-right:9px"></span>'
+            '<span>Fast setup</span></li></ul></div>')
+        raw_shape = (
+            '<div style="padding:40px">'
+            '<a href="#" style="display:inline-block;padding:12px 24px">Get started</a>'
+            '<ul style="list-style:none;margin:0;padding:0"><li style="display:flex">'
+            '<span class="ic" style="flex:0 0 14px;height:14px;margin-right:9px"></span>'
+            'Fast setup</li></ul></div>')
+        ref = self.measure_texts(elementor_shape)
+        live = self.measure_texts(raw_shape)
+        self.assertEqual(sorted(t["text"] for t in ref), ["Fast setup", "Get started"])
+        self.assertEqual(fw.compare_positions(ref, live, 6), [])
+
 
 class MeasureJs(unittest.TestCase):
     def test_root_and_fonts(self):
@@ -2256,6 +2297,18 @@ class ComparePositions(unittest.TestCase):
         got = fw.compare_positions(ref, live, 6)
         self.assertEqual(got, [{"text": "Start for free today", "dx": 0, "dy": 14},
                                {"text": "Talk to our sales team", "dx": -9, "dy": 0}])
+
+    def test_el_texts_prefers_the_ink_position_and_falls_back_to_the_box(self):
+        m = {"root": {"x": 100, "y": 50},
+             "runs": [_run("Get started", 124, 112, tx=148, ty=124),
+                      _run("Old design file run", 124, 212)]}
+        got = fw.el_texts(m)
+        self.assertEqual((got[0]["x"], got[0]["y"]), (48, 74))      # tx/ty, root-relative
+        self.assertEqual((got[0]["bx"], got[0]["by"]), (24, 62))    # the element box, kept
+        self.assertEqual((got[1]["x"], got[1]["y"]), (24, 162))     # no tx/ty: the box
+        self.assertNotIn("bx", got[1])
+        placed = fw.el_copy(["Get started"], m)
+        self.assertEqual((placed[0]["x"], placed[0]["y"]), (48, 74))
 
     def test_compare_positions_pairs_repeated_text_in_order(self):
         ref = [_rec("Learn more about it", 20, 100), _rec("Learn more about it", 20, 500)]

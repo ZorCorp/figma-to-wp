@@ -966,8 +966,10 @@ python3 "$FW" mobile <slug> --url …                 # 390
 On an Elementor build `diff --width 768|390` renders the page in an iframe of
 that width and compares it to that width's reference (`NO_REFERENCE` for a
 width extract did not shoot). `mobile` runs its usual checks and, in addition,
-compares every text's position with where the original put it at that width,
-±6px (`--tolerance`). Body copy under 16px that is under 16px on the original
+compares where every text starts with where the original started it at that
+width, ±6px (`--tolerance`) — the text, not its element's box, so a button
+whose label sits in a padding-free span matches one built with the label
+straight in the padded link. Body copy under 16px that is under 16px on the original
 too is printed as a note, not counted: the original is the spec.
 
 ### Usage A — copy

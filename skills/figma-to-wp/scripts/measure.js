@@ -68,8 +68,17 @@ function fwMeasure(){
     while(p&&p!==root){ if(seen.has(p)){inner=true;break;} p=p.parentElement; }
     var r=el.getBoundingClientRect(); if(!r.width||!r.height) continue;
     var c=getComputedStyle(el), b=blockOf(el).getBoundingClientRect();
+    // Where this text node's first glyph box starts. The parent element's box
+    // is a matter of markup: Elementor puts button text in a padding-free
+    // <span> inside the padded <a>, a raw build puts it in the <a>, and the
+    // same ink position then reports boxes 24px apart.
+    var tr=document.createRange(), tq=null;
+    tr.selectNodeContents(n);
+    var rects=tr.getClientRects(); if(rects.length) tq=rects[0];
     out.push({text:t.slice(0,90),
               x:Math.round(r.left+window.scrollX), y:Math.round(r.top+window.scrollY),
+              tx:tq?Math.round(tq.left+window.scrollX):null,
+              ty:tq?Math.round(tq.top+window.scrollY):null,
               w:Math.round(r.width), h:Math.round(r.height),
               size:parseFloat(c.fontSize), lh:c.lineHeight, ls:c.letterSpacing,
               family:(c.fontFamily||'').split(',')[0].replace(/["']/g,'').trim(),
