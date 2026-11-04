@@ -1,4 +1,4 @@
-import contextlib, io, json, os, re, shutil, sys, tempfile, unittest
+import contextlib, hashlib, io, json, os, re, shutil, sys, tempfile, unittest
 import http.client, urllib.error, urllib.parse, urllib.request
 from unittest import mock
 
@@ -161,6 +161,14 @@ class WpHelpers(unittest.TestCase):
         self.assertEqual(req.full_url, "https://x.test/")
         self.assertEqual(req.get_header("User-agent"), fw.UA)
         self.assertIsNone(req.get_header("Authorization"))
+
+    def test_wpml_languages_network_error_dies_cleanly(self):
+        err = io.StringIO()
+        with mock.patch.object(fw.urllib.request, "urlopen",
+                               side_effect=urllib.error.URLError("down")), \
+                contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            fw.wpml_languages(creds=self.CREDS)
+        self.assertIn("NETWORK_ERROR", err.getvalue())
 
     def test_wpml_languages_attribute_order_and_dedupe(self):
         html = ('<link href="https://x/fr/" hreflang="fr" rel="alternate">'
@@ -393,7 +401,9 @@ class PushElementor(unittest.TestCase):
         with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
             self.push(title=None)
         self.assertIn("ELEMENTOR_PAGE", err.getvalue())
-        self.assertIn("--replace", err.getvalue())
+        self.assertIn("Usage B", err.getvalue())
+        self.assertIn("draft", err.getvalue())
+        self.assertNotIn("use --replace", err.getvalue())
         self.assertNotIn("mc/set-post-html", self.names())
         self.assertNotIn("set_meta", self.names())
         self.assertFalse([c for c in self.calls if c[0] == "POST"])  # no upload
@@ -404,6 +414,7 @@ class PushElementor(unittest.TestCase):
         self.push(title=None)
         self.assertIn("mc/set-post-html", self.names())
         self.assertNotIn("set_meta", self.names())
+        self.assertNotIn("mc/create-localized-page", self.names())     # an update creates nothing
 
     def test_post_type_post_skips_elementor_handling(self):
         self.push(post_type="post")
@@ -458,6 +469,126 @@ class PushElementor(unittest.TestCase):
             self.assertEqual([c.args[1:] for c in sm.call_args_list],
                              [("_elementor_edit_mode", ""), ("_elementor_data", "[]")])
 
+    # --- I1: a create that stopped after the page exists ----------------------
+
+    def fail_once(self, name):
+        real, state = self.fake_ability, {"done": False}
+
+        def ab(n, payload, creds=None):
+            if n == name and not state["done"]:
+                state["done"] = True
+                self.calls.append((n, payload))
+                raise SystemExit(1)
+            return real(n, payload, creds=creds)
+        return mock.patch.object(fw, "ability", ab)
+
+    def read_wp_json(self):
+        with open(os.path.join(self.out, "wp.json")) as fh:
+            return json.load(fh)
+
+    def test_create_that_stops_after_the_page_exists_can_be_rerun(self):
+        with self.fail_once("mc/set-post-html"), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.push(translation_of=77)
+        w = self.read_wp_json()
+        self.assertEqual(w["post_id"], 5)
+        self.assertEqual(w["creating"], {"translation_of": 77, "language": "zh-hant"})
+        self.calls.clear()
+        self.meta = ["builder", ""]        # what WPML copied onto it at create
+        out = self.push(translation_of=77)
+        self.assertNotIn("mc/create-localized-page", self.names())
+        self.assertIn("mc/set-post-html", self.names())
+        self.assertEqual([c for c in self.calls if c[0] == "set_meta"],
+                         [("set_meta", "_elementor_edit_mode", ""),
+                          ("set_meta", "_elementor_data", "[]")])
+        self.assertIn("elementor  cleared", out)
+        w = self.read_wp_json()
+        self.assertNotIn("creating", w)
+        self.assertEqual(w["post_id"], 5)
+
+    def test_rerun_of_a_stopped_create_without_translation_of_goes_on(self):
+        self.wp_json(creating={"translation_of": 77, "language": "zh-hant"}, modified_gmt=None)
+        self.meta = ["builder", ""]
+        self.push(title=None)
+        self.assertNotIn("creating", self.read_wp_json())
+
+    def test_rerun_of_a_stopped_create_with_another_translation_of_is_refused(self):
+        self.wp_json(creating={"translation_of": 77, "language": "zh-hant"}, modified_gmt=None)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            self.push(translation_of=78)
+        self.assertIn("TRANSLATION_OF_ON_UPDATE", err.getvalue())
+        self.assertIn("77", err.getvalue())
+        self.assertFalse([n for n in self.names()
+                          if n in ("mc/set-post-html", "set_meta", "POST")])
+
+    def test_creating_stays_until_the_raw_check_passes(self):
+        self.meta = ["", "builder"]        # assert_raw finds builder mode
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.push(translation_of=77)
+        self.assertIn("creating", self.read_wp_json())
+
+    def test_a_create_records_creating_before_the_body_is_written(self):
+        seen = {}
+        real = self.fake_ability
+
+        def ab(n, payload, creds=None):
+            if n == "mc/set-post-html":
+                seen["w"] = self.read_wp_json()
+            return real(n, payload, creds=creds)
+        with mock.patch.object(fw, "ability", ab):
+            self.push()
+        self.assertEqual(seen["w"]["creating"], {"translation_of": None, "language": "zh-hant"})
+        self.assertNotIn("creating", self.read_wp_json())
+
+    # --- I2: the draft push records what it sent ------------------------------
+
+    def test_push_records_the_sha_of_the_body_it_sent(self):
+        url = "https://x/wp-content/uploads/a.png"
+        put(os.path.join(self.out, "page.html"),
+            '<!-- wp:html -->\n<div class="mc-page gehk-page"><img src="assets/a.png"></div>\n'
+            '<!-- /wp:html -->\n')
+        put(os.path.join(self.out, "manifest.json"),
+            json.dumps({"assets/a.png": {"id": None, "url": url}}))
+        self.push()
+        sent = [c for c in self.calls if c[0] == "mc/set-post-html"][0][1]["content"]
+        self.assertIn(url, sent)
+        self.assertEqual(self.read_wp_json()["body_sha"],
+                         hashlib.sha256(sent.encode("utf-8")).hexdigest())
+
+    # --- I3: a replaced page keeps its URI ------------------------------------
+
+    def test_push_after_replace_keeps_the_permalink(self):
+        self.wp_json(replaced={"draft": 60, "backup": "backups/5-elementor-1.json"})
+        out = self.push(title=None)
+        self.assertNotIn("mc/regenerate-permalink", self.names())
+        self.assertIn("permalink kept", out)
+
+    def test_push_after_replace_with_page_slug_regenerates(self):
+        self.wp_json(replaced={"draft": 60, "backup": "backups/5-elementor-1.json"})
+        out = self.push(title=None, page_slug="p")
+        self.assertIn("mc/regenerate-permalink", self.names())
+        self.assertNotIn("permalink kept", out)
+
+    # --- M4: an extracted asset edited in place is uploaded --------------------
+
+    def test_extracted_asset_edited_in_place_is_uploaded(self):
+        url = "https://x/wp-content/uploads/elementor/thumbs/a.png"
+        put(os.path.join(self.out, "page.html"),
+            '<!-- wp:html -->\n<div class="mc-page gehk-page"><img src="assets/a.png"></div>\n'
+            '<!-- /wp:html -->\n')
+        os.makedirs(os.path.join(self.out, "assets"))
+        put(os.path.join(self.out, "assets", "a.png"), "as extracted")
+        put(os.path.join(self.out, "manifest.json"), json.dumps({"assets/a.png": {
+            "id": None, "url": url,
+            "sha": hashlib.sha256(b"as extracted").hexdigest()}}))
+        self.push()
+        self.assertFalse([c for c in self.calls if c[0] == "POST" and "/media" in c[1]])
+        put(os.path.join(self.out, "assets", "a.png"), "edited")
+        self.calls.clear()
+        self.push(title=None)
+        self.assertTrue([c for c in self.calls if c[0] == "POST" and "/media" in c[1]])
+
     def test_push_skips_manifest_entry_without_id(self):
         url = "https://x/elementor/thumbs/a.png"
         put(os.path.join(self.out, "page.html"),
@@ -509,6 +640,15 @@ class PushReplace(unittest.TestCase):
         self.write_wp_json()
         self.calls = []
         self.orig_mod = self.STAMP
+        # the reviewed draft as WordPress holds it, and each page's WPML group
+        self.draft = {"id": self.DRAFT, "status": "draft", "slug": "p-draft",
+                      "modified_gmt": "2026-03-03T00:00:00"}
+        self.groups = {
+            self.ORIG: {"post_id": self.ORIG, "language": "en", "plugin": "wpml",
+                        "translations": [{"language": "en", "post_id": self.ORIG},
+                                         {"language": "zh-hk", "post_id": 70}]},
+            self.DRAFT: {"post_id": self.DRAFT, "language": "en", "plugin": "wpml",
+                         "translations": [{"language": "en", "post_id": self.DRAFT}]}}
         self.metas = {k: (dict(v) if isinstance(v, dict) else v)
                       for k, v in self.META.items()}
         self.fetched = [identity_page(body='<div class="elementor">x</div>'),
@@ -536,9 +676,15 @@ class PushReplace(unittest.TestCase):
         with open(os.path.join(self.out, "design.json"), "w") as fh:
             json.dump({"source": src, "texts": []}, fh)
 
+    def body_sha(self):
+        # what the draft push sent: page.html assembled, no assets to rewrite
+        with open(os.path.join(self.out, "page.html"), encoding="utf-8") as fh:
+            return hashlib.sha256(fh.read().encode("utf-8")).hexdigest()
+
     def write_wp_json(self, **extra):
         meta = {"post_id": self.DRAFT, "post_type": "page", "slug": "p-draft",
-                "status": "draft", "modified_gmt": "2026-03-03T00:00:00"}
+                "status": "draft", "modified_gmt": "2026-03-03T00:00:00",
+                "body_sha": self.body_sha()}
         meta.update(extra)
         meta = {k: v for k, v in meta.items() if v is not None}
         with open(os.path.join(self.out, "wp.json"), "w") as fh:
@@ -557,6 +703,9 @@ class PushReplace(unittest.TestCase):
         self.calls.append(what)
 
     def fake_wp(self, method, path, **kw):
+        if method == "GET" and path.startswith(f"/wp-json/wp/v2/pages/{self.DRAFT}?"):
+            self.calls.append((method, path))
+            return dict(self.draft)
         if method == "GET":
             self.calls.append((method, path))
             return {"id": self.ORIG, "slug": "example", "status": "publish",
@@ -567,6 +716,12 @@ class PushReplace(unittest.TestCase):
         return {"id": 9, "source_url": "https://x/u.png"}
 
     def fake_ability(self, name, payload, creds=None):
+        if name == "ewpa/get-post-translations":          # a read
+            self.calls.append(("translations", payload["post_id"]))
+            g = self.groups.get(payload["post_id"])
+            if isinstance(g, Exception):
+                raise g
+            return g
         self.note_write((name, payload))
         return {}
 
@@ -826,6 +981,136 @@ class PushReplace(unittest.TestCase):
         self.dies("ELEMENTOR_PAGE", replace=None)
         self.no_writes()
 
+    # --- C1: only a usage-B draft is swapped in -------------------------------
+
+    def test_replace_refuses_a_translated_build(self):
+        put(os.path.join(self.out, "copy.json"), json.dumps(
+            {"mode": "translated", "source": "user", "approved": True, "entries": []}))
+        err = self.dies("REPLACE_NOT_A_DRAFT")
+        self.assertIn("translat", err)
+        self.no_writes()
+
+    def test_replace_refuses_a_draft_that_is_not_a_draft(self):
+        for status in ("publish", "future", "trash"):
+            with self.subTest(status):
+                self.calls.clear()
+                self.draft["status"] = status
+                self.assertIn(status, self.dies("REPLACE_NOT_A_DRAFT"))
+                self.no_writes()
+
+    def test_replace_takes_a_pending_or_private_draft(self):
+        for status in ("pending", "private"):
+            with self.subTest(status):
+                self.setUp()
+                self.draft["status"] = status
+                self.replace()
+                self.assertEqual(self.wp_json()["post_id"], self.ORIG)
+
+    def test_replace_refuses_a_draft_in_the_originals_group(self):
+        self.groups[self.ORIG]["translations"].append(
+            {"language": "zh-hant", "post_id": self.DRAFT})
+        err = self.dies("REPLACE_NOT_A_DRAFT")
+        self.assertIn("WPML", err)
+        self.no_writes()
+
+    def test_replace_refuses_a_draft_whose_group_holds_the_original(self):
+        self.groups[self.DRAFT]["translations"].append(
+            {"language": "en", "post_id": self.ORIG})
+        self.dies("REPLACE_NOT_A_DRAFT")
+        self.no_writes()
+
+    def test_replace_refuses_a_draft_in_another_language(self):
+        self.groups[self.DRAFT]["language"] = "zh-hk"
+        err = self.dies("REPLACE_NOT_A_DRAFT")
+        self.assertIn("zh-hk", err)
+        self.no_writes()
+
+    def test_replace_refuses_when_the_group_cannot_be_read(self):
+        self.groups[self.ORIG] = {"code": "nope"}
+        self.dies("REPLACE_NOT_A_DRAFT")
+        self.no_writes()
+
+    def test_replace_reads_the_group_in_either_answer_shape(self):
+        self.groups = {k: {"output": v} for k, v in self.groups.items()}
+        self.replace()
+        self.assertIn(("translations", self.ORIG), self.calls)
+        self.assertIn(("translations", self.DRAFT), self.calls)
+        self.assertEqual(self.wp_json()["post_id"], self.ORIG)
+
+    # --- I2: the draft the user signed off, not the build as it is now --------
+
+    def test_replace_refuses_when_the_build_changed_since_the_draft(self):
+        put(os.path.join(self.out, "page.html"),
+            '<!-- wp:html -->\n<div class="mc-page gehk-page"><p>b</p></div>\n'
+            '<!-- /wp:html -->\n')
+        err = self.dies("REPLACE_DRAFT_STALE")
+        self.assertIn("re-push the draft", err)
+        self.no_writes()
+
+    def test_replace_refuses_a_wp_json_without_body_sha(self):
+        self.write_wp_json(body_sha=None)
+        self.assertIn("re-push the draft", self.dies("REPLACE_DRAFT_STALE"))
+        self.no_writes()
+
+    def test_replace_refuses_a_draft_edited_in_wordpress_since_the_push(self):
+        self.draft["modified_gmt"] = "2026-03-04T00:00:00"
+        self.assertIn("re-push the draft", self.dies("REPLACE_DRAFT_STALE"))
+        self.no_writes()
+
+    def with_asset(self, on_disk, pushed=b"old bytes"):
+        put(os.path.join(self.out, "page.html"),
+            '<!-- wp:html -->\n<div class="mc-page gehk-page"><img src="assets/a.png"></div>\n'
+            '<!-- /wp:html -->\n')
+        os.makedirs(os.path.join(self.out, "assets"), exist_ok=True)
+        with open(os.path.join(self.out, "assets", "a.png"), "wb") as fh:
+            fh.write(on_disk)
+        url = "https://x/wp-content/uploads/p-a.png"
+        put(os.path.join(self.out, "manifest.json"), json.dumps(
+            {"assets/a.png": {"id": 9, "url": url, "sha": hashlib.sha256(pushed).hexdigest()}}))
+        with open(os.path.join(self.out, "page.html"), encoding="utf-8") as fh:
+            body = fh.read().replace('"assets/a.png"', f'"{url}"')
+        self.write_wp_json(body_sha=hashlib.sha256(body.encode("utf-8")).hexdigest())
+
+    def test_replace_refuses_when_an_asset_changed_since_the_draft(self):
+        self.with_asset(b"new bytes")
+        self.assertIn("assets/a.png", self.dies("REPLACE_DRAFT_STALE"))
+        self.no_writes()
+
+    def test_replace_with_the_assets_the_draft_had_uploads_nothing(self):
+        self.with_asset(b"old bytes")
+        self.replace()
+        self.assertFalse([c for c in self.calls if c[0] == "POST" and "/media" in c[1]])
+        body = [c for c in self.calls if c[0] == "mc/set-post-html"][0][1]["content"]
+        self.assertIn('src="https://x/wp-content/uploads/p-a.png"', body)
+
+    # --- M1 / M5 ---------------------------------------------------------------
+
+    def test_still_elementor_after_replace_names_the_backup_and_restore(self):
+        # the wrapper check: the front end is still drawing Elementor
+        self.fetched[1] = identity_page(body='<div class="elementor">x</div>')
+        err = self.dies("STILL_ELEMENTOR")
+        self.assertIn("-elementor-", err)
+        self.assertIn("elementor-restore p", err)
+
+    def test_still_elementor_edit_mode_after_replace_names_the_backup_and_restore(self):
+        # the meta check: the edit-mode write did not take
+        with mock.patch.object(fw, "set_meta",
+                               lambda pid, k, v, creds=None: self.note_write(("set_meta", k, v))):
+            err = self.dies("STILL_ELEMENTOR")
+        self.assertIn("_elementor_edit_mode", err)
+        self.assertIn("-elementor-", err)
+        self.assertIn("elementor-restore p", err)
+
+    def test_replacing_marker_waits_for_the_first_write_to_the_original(self):
+        def boom(*a, **kw):
+            raise SystemExit(1)
+        with mock.patch.object(fw, "backup_body", boom):
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                fw.cmd_push(self.args())
+        self.assertNotIn("replacing", self.wp_json())
+        self.assertFalse([c for c in self.calls
+                          if c[0] in ("mc/set-post-html", "set_meta", "POST", "PUT", "DELETE")])
+
     def test_argparse_replace_is_an_int(self):
         with mock.patch.object(sys, "argv", ["figma_to_wp", "push", "p", "--replace", "50"]), \
                 mock.patch.object(fw, "cmd_push") as cp:
@@ -1065,6 +1350,14 @@ class RestoreElementor(unittest.TestCase):
                 self.fetched = ['<div data-elementor-type="wp-page" data-elementor-id="50">']
                 self.run_restore()                                    # the rerun succeeds
                 self.assertNotIn("replaced", self.wp_json())
+
+    def test_restore_incomplete_names_an_unexpected_error(self):
+        def boom(*a, **kw):
+            raise RuntimeError("socket went away")
+        with mock.patch.object(fw, "ability", boom):
+            err = self.dies("RESTORE_INCOMPLETE")
+        self.assertIn("RuntimeError: socket went away", err)
+        self.assertIn("replaced", self.wp_json())
 
     def test_restore_does_not_rewrite_elementor_data(self):
         self.run_restore()
@@ -2033,16 +2326,27 @@ class ExtractElementor(ExtractFixture):
             '<span class="number">42</span><img src="%s" alt="t">' % self.THUMB, 1)
         self.extract()
         man = json.loads(_read(os.path.join(self.out, "manifest.json")))
-        self.assertEqual(man["assets/t-abc.png"], {"id": None, "url": self.THUMB})
-        self.assertEqual(man["assets/hero.png"],
-                         {"id": 55, "url": "https://example.test/wp-content/uploads/hero.png"})
-        for rec in man.values():
-            self.assertNotIn("sha", rec)          # push treats url-without-sha as uploaded
+        hero = "https://example.test/wp-content/uploads/hero.png"
+        sha = lambda u: hashlib.sha256(b"\x89PNG fake " + u.encode()).hexdigest()
+        # the sha of what was downloaded: push reuses the url while the file is
+        # unchanged, and uploads it once it is edited in place
+        self.assertEqual(man["assets/t-abc.png"],
+                         {"id": None, "url": self.THUMB, "sha": sha(self.THUMB)})
+        self.assertEqual(man["assets/hero.png"], {"id": 55, "url": hero, "sha": sha(hero)})
         self.assertNotIn("assets/logo.png", man)  # header image, not the page's
         self.assertTrue(os.path.exists(os.path.join(self.out, "assets", "t-abc.png")))
         self.assertTrue(os.path.exists(os.path.join(self.out, "assets", "hero.png")))
         # thumbs are never looked up in the media library
         self.assertFalse([c for c in self.calls if c[0] == "GET" and "search=t-abc" in c[1]])
+
+    def test_manifest_has_no_sha_for_an_image_that_did_not_download(self):
+        self.html = LIVE.replace(
+            '<span class="number">42</span>',
+            '<span class="number">42</span><img src="%s" alt="t">' % self.THUMB, 1)
+        self.http_files[self.THUMB] = urllib.error.URLError("gone")
+        self.extract()
+        man = json.loads(_read(os.path.join(self.out, "manifest.json")))
+        self.assertEqual(man["assets/t-abc.png"], {"id": None, "url": self.THUMB})
 
     def test_extract_refuses_to_overwrite_figma_build(self):
         os.makedirs(self.out)

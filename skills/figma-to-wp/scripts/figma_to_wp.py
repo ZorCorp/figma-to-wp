@@ -1890,8 +1890,10 @@ def el_media_id(url, creds):
 def el_assets(out, urls, creds):
     """Download every image for the local preview and record where it lives.
 
-    Each manifest entry is {"id", "url"} with no sha: push reads that as
-    already on the site and points the page at url instead of uploading.
+    Each manifest entry is {"id", "url", "sha"}: the sha of the bytes
+    downloaded, the same one push keys on. While the file is unchanged push
+    points the page at url instead of uploading; edited in place, it is
+    uploaded. A download that failed has no sha and stays on its url.
     """
     os.makedirs(os.path.join(out, "assets"), exist_ok=True)
     manifest = read_manifest(out)
@@ -1912,6 +1914,7 @@ def el_assets(out, urls, creds):
             _, body = http_get(u)
             with open(os.path.join(out, rel), "wb") as fh:
                 fh.write(body)
+            manifest[rel]["sha"] = hashlib.sha256(body).hexdigest()
         except (urllib.error.URLError, OSError) as e:
             failed.append(f"{u} ({e})")
         assets.append({"id": f"a{n}", "file": rel, "name": "", "w": None, "h": None,
@@ -4672,10 +4675,15 @@ def wpml_languages(creds=None):
     `en` here. x-default repeats one of the others and is skipped.
     """
     base = creds[0] if creds else wp_creds()[0]
-    with urllib.request.urlopen(
-            urllib.request.Request(base + "/", headers={"User-Agent": UA}),
-            timeout=60) as r:
-        html = r.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(base + "/", headers={"User-Agent": UA}),
+                timeout=60) as r:
+            html = r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as e:
+        # Runs before any write, so stopping here changes nothing.
+        die("NETWORK_ERROR", f"GET {base}/ (for the WPML languages) -> "
+                             f"{getattr(e, 'reason', e)}. Nothing was changed.")
     langs = []
     for tag in re.findall(r"<link\b[^>]*>", html, re.I):
         attr = {k.lower(): v for k, _, v in
@@ -4688,6 +4696,31 @@ def wpml_languages(creds=None):
         if code not in langs:
             langs.append(code)
     return langs
+
+
+def wpml_group(post_id, creds=None):
+    """(language, {post ids in its WPML group}) of a post, or None when the
+    answer cannot be read.
+
+    ewpa/get-post-translations is a read: {post_id, language, plugin,
+    translations: [{language, post_id, title, permalink, status}]}, flat or
+    under "output" like every ability here. REST pages carry no language or
+    group, and the front end lists only published translations (no drafts),
+    so this is the one place a draft's membership shows."""
+    res = ability("ewpa/get-post-translations", {"post_id": int(post_id)}, creds=creds)
+    o = (res.get("output") or res) if isinstance(res, dict) else None
+    tr = o.get("translations") if isinstance(o, dict) else None
+    if isinstance(tr, dict):         # a map keyed by language is the same list
+        tr = list(tr.values())
+    if not isinstance(tr, list):
+        return None
+    ids = set()
+    for t in tr:
+        try:
+            ids.add(int(t["post_id"]))
+        except (TypeError, ValueError, KeyError):
+            pass
+    return str(o.get("language") or "").lower(), ids
 
 
 def clear_elementor(post_id, *, data, creds=None):
@@ -4715,7 +4748,7 @@ def page_wrapper(out):
     return ""
 
 
-def assert_raw(post_id, rendered, wrapper, creds=None):
+def assert_raw(post_id, rendered, wrapper, creds=None, hint=""):
     """After a push, the page must be raw HTML on the front end, not Elementor.
 
     The meta check is what decides: _elementor_edit_mode empty or not (the live
@@ -4723,13 +4756,14 @@ def assert_raw(post_id, rendered, wrapper, creds=None):
     body). The wrapper-class check is only meaningful when `rendered` is the
     front end's HTML, as after --replace. REST content.rendered, which usage A
     passes, never runs Elementor, so it carries the wrapper whatever the meta
-    says and that check proves nothing there.
+    says and that check proves nothing there. `hint` ends either message:
+    after --replace it names the way back.
     """
     mode = get_meta(post_id, "_elementor_edit_mode", creds=creds)
     if mode:
         die("STILL_ELEMENTOR",
             f"#{post_id} still has _elementor_edit_mode={mode!r}, so the site "
-            f"renders Elementor and not the pushed HTML.")
+            f"renders Elementor and not the pushed HTML.{hint}")
     if not wrapper:
         print("check     wrapper class not found in page.html; checked the "
               "Elementor meta only")
@@ -4737,7 +4771,7 @@ def assert_raw(post_id, rendered, wrapper, creds=None):
     if not re.search(r'class="[^"]*' + re.escape(wrapper), rendered or ""):
         die("STILL_ELEMENTOR",
             f"#{post_id} renders without class \"{wrapper}\", so the page "
-            f"is not drawing the pushed HTML (Elementor or a cached copy).")
+            f"is not drawing the pushed HTML (Elementor or a cached copy).{hint}")
 
 
 def cmd_setup(args):
@@ -5211,6 +5245,102 @@ def _replace_gate(out, meta, orig, args):
     return src
 
 
+def page_assets(html):
+    """The local files the assembled body points at: assets/..."""
+    return sorted(set(re.findall(r'(?:src|poster)="(assets/[^"]+)"', html)))
+
+
+def asset_upload(out, rel, manifest):
+    """(upload?, sha) for one asset. Key on the bytes, not the path: keying on
+    the path alone means a corrected asset under the same filename is never
+    uploaded and the page silently keeps serving the old one — which is how a
+    logo with its background keyed out stayed opaque on the live page. An
+    entry with a url and no sha is on the site with nothing to compare against
+    (an image extract could not download): never re-upload it, never insist
+    the file is local."""
+    rec = manifest.get(rel, {})
+    if rec.get("url") and "sha" not in rec:
+        return False, None
+    local = os.path.join(out, rel)
+    if not os.path.exists(local):
+        die("ASSET_MISSING", local)
+    with open(local, "rb") as fh:
+        sha = hashlib.sha256(fh.read()).hexdigest()
+    return rec.get("sha") != sha, sha
+
+
+def with_media_urls(html, manifest):
+    for rel, rec in manifest.items():
+        html = html.replace(f'"{rel}"', f'"{rec["url"]}"')
+    return html
+
+
+def body_sha(html):
+    """The sha256 of a body as sent to mc/set-post-html."""
+    return hashlib.sha256(html.encode("utf-8")).hexdigest()
+
+
+def _replace_draft_check(out, meta, orig, draft, html, args, creds):
+    """--replace swaps in the draft the user signed off, and nothing else.
+    Reads only (REST GET and a read ability); every refusal comes before the
+    first write.
+
+    The draft must be a usage-B draft: verbatim copy, not published, outside
+    the original's WPML group and in its language — a usage-A translation
+    pushed with --replace put another language on the original and trashed
+    the live translation. And the build must still be what the draft shows:
+    the same body (sha recorded by the draft push), no asset changed since,
+    and the draft not edited in WordPress since."""
+    cp = load_copy(out)
+    if cp and cp.get("mode") == "translated":
+        die("REPLACE_NOT_A_DRAFT",
+            f"build/{args.slug}/copy.json is a translation, and a replace is "
+            f"verbatim: the original keeps its own words. A translated build is "
+            f"a new page (SKILL.md, From Elementor, usage A). Nothing was changed.")
+    page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{int(draft)}?context=edit"
+                               f"&_fields=id,status,modified_gmt", creds=creds))
+    if page.get("status") not in ("draft", "pending", "private"):
+        die("REPLACE_NOT_A_DRAFT",
+            f"wp.json's page #{draft} is {page.get('status')!r}, not a draft. "
+            f"--replace swaps in an unpublished draft of the original "
+            f"(SKILL.md, From Elementor, usage B). Nothing was changed.")
+    og, dg = wpml_group(orig, creds=creds), wpml_group(draft, creds=creds)
+    if og is None or dg is None:
+        die("REPLACE_NOT_A_DRAFT",
+            f"could not read the WPML group of #{orig if og is None else draft} "
+            f"(ewpa/get-post-translations), so #{draft} is not known to be a "
+            f"draft of its own. Nothing was changed.")
+    if int(draft) in og[1] or orig in dg[1]:
+        die("REPLACE_NOT_A_DRAFT",
+            f"#{draft} is in #{orig}'s WPML group: it is a translation of the "
+            f"original, not a draft of it. Replacing would put that page's "
+            f"language on the original. Nothing was changed.")
+    if og[0] and dg[0] and og[0] != dg[0]:
+        die("REPLACE_NOT_A_DRAFT",
+            f"#{draft} is in {dg[0]!r} and #{orig} in {og[0]!r}; a replace keeps "
+            f"the original's language. Nothing was changed.")
+    again = "Nothing was changed: re-push the draft and have it reviewed again."
+    if not meta.get("body_sha"):
+        die("REPLACE_DRAFT_STALE",
+            f"wp.json does not record what the draft #{draft} was pushed with "
+            f"(a push from before body_sha), so the build is not known to be "
+            f"what was reviewed. {again}")
+    manifest = read_manifest(out)
+    changed = [rel for rel in page_assets(html) if asset_upload(out, rel, manifest)[0]]
+    if changed:
+        die("REPLACE_DRAFT_STALE",
+            f"{', '.join(changed)} changed since the draft #{draft} was pushed. {again}")
+    if body_sha(with_media_urls(html, manifest)) != meta["body_sha"]:
+        die("REPLACE_DRAFT_STALE",
+            f"the build is no longer the body the draft #{draft} was pushed with. "
+            f"{again}")
+    if page.get("modified_gmt") != meta.get("modified_gmt"):
+        die("REPLACE_DRAFT_STALE",
+            f"the draft #{draft} was edited in WordPress after it was pushed "
+            f"({meta.get('modified_gmt')} -> {page.get('modified_gmt')}), so what "
+            f"was reviewed is not this build. {again}")
+
+
 def _replace_finish(out, meta, orig, draft, before, ebackup, url, creds):
     """After the body is on the original: purge, prove the front end is raw
     HTML and still the same page to a search engine, then retire the draft."""
@@ -5223,7 +5353,10 @@ def _replace_finish(out, meta, orig, draft, before, ebackup, url, creds):
             f"#{orig} could not be read back from {url} ({e}), so it is not "
             f"known to be the same page. The draft #{draft} was left alone. "
             f"Elementor backup: {back} (restore with elementor-restore).")
-    assert_raw(orig, html, page_wrapper(out), creds=creds)
+    assert_raw(orig, html, page_wrapper(out), creds=creds,
+               hint=f" The draft #{draft} was left alone. Put the Elementor page "
+                    f"back with `elementor-restore {os.path.basename(out)}` from "
+                    f"the Elementor backup {back}.")
     now = parse_identity(html)
     diffs = []
     for k in ("title", "description", "canonical"):
@@ -5387,13 +5520,26 @@ def cmd_push(args):
         replace = int(replace)
         src = _replace_gate(out, meta, replace, args)
         draft_id, post_id = int(post_id), replace
+        _replace_draft_check(out, meta, replace, draft_id, html, args, creds)
 
     if not post_id and not args.title:
         die("NO_TITLE", "--title is required when creating a page")
+    # A page this build created, by a push that stopped before the page was
+    # known to be raw: wp.json says so ("creating"), and this run finishes it.
+    creating = meta.get("creating") if (
+        not replace and post_id and meta.get("post_id")
+        and int(post_id) == int(meta["post_id"])) else None
     if post_id and translation_of:
-        die("TRANSLATION_OF_ON_UPDATE",
-            f"--translation-of only applies when a page is created, and "
-            f"#{post_id} already exists. WPML groups are not changed by push.")
+        if not creating:
+            die("TRANSLATION_OF_ON_UPDATE",
+                f"--translation-of only applies when a page is created, and "
+                f"#{post_id} already exists. WPML groups are not changed by push.")
+        if int(translation_of) != creating.get("translation_of"):
+            die("TRANSLATION_OF_ON_UPDATE",
+                f"#{post_id} was created as a translation of "
+                f"#{creating.get('translation_of')} by a push that did not finish; "
+                f"--translation-of {translation_of} names another page. WPML "
+                f"groups are not changed by push. Nothing was changed.")
     # Only a new page picks its language here; an update keeps the one it has.
     if not post_id:
         warn_posts_terms(out, args.language, creds)
@@ -5457,21 +5603,22 @@ def cmd_push(args):
         # An Elementor page holds its content in _elementor_data; set-post-html
         # would overwrite post_content and the page would carry on rendering
         # Elementor. Stop before the upload, backup or any write.
-        if post_type == "page" and not replace and \
+        # A page this build created is raw by intent, whatever WPML copied.
+        if post_type == "page" and not replace and not creating and \
                 get_meta(post_id, "_elementor_edit_mode", creds=creds) == "builder":
             die("ELEMENTOR_PAGE",
-                f"#{post_id} is an Elementor page; a plain push would "
-                f"overwrite it without a backup of its Elementor data. "
-                f"use --replace")
+                f"#{post_id} is an Elementor page: its content is Elementor's "
+                f"data, so a plain push would overwrite the body with no backup "
+                f"and the page would go on rendering Elementor. Nothing was "
+                f"changed. To replace it, follow SKILL.md, From Elementor, "
+                f"Usage B: push the build as a draft of its own, have it signed "
+                f"off, then push {args.slug} --replace {post_id}.")
 
     if replace:
         # Identity first, then the backup, both before the media upload: the
         # first write to the site must find the way back already on disk.
         before = public_identity(src["url"])
         ebackup = os.path.relpath(backup_elementor(post_id, out, creds=creds), out)
-        # Record it before the first write: if anything below stops, wp.json
-        # says where the way back is, and a rerun refuses (REPLACE_UNFINISHED).
-        write_wp_meta(out, {**meta, "replacing": {"orig": post_id, "backup": ebackup}})
         print(f"elementor backup {os.path.join(out, ebackup)}  "
               f"(restore with elementor-restore)")
 
@@ -5482,22 +5629,10 @@ def cmd_push(args):
     man_path = os.path.join(out, "manifest.json")
     manifest = read_manifest(out)
     new = 0
-    for rel in sorted(set(re.findall(r'(?:src|poster)="(assets/[^"]+)"', html))):
+    for rel in page_assets(html):
         local = os.path.join(out, rel)
-        # Key on the bytes, not the path. Keying on the path alone means a
-        # corrected asset under the same filename is never uploaded and the
-        # page silently keeps serving the old one — which is how a logo with
-        # its background keyed out stayed opaque on the live page.
-        # An entry with a url and no sha is already on the site and has
-        # nothing to compare against: Elementor thumbs (id null) from extract.
-        # Do not re-upload those or insist the file is local.
-        rec = manifest.get(rel, {})
-        if rec.get("url") and "sha" not in rec:
-            continue
-        if not os.path.exists(local):
-            die("ASSET_MISSING", local)
-        sha = hashlib.sha256(open(local, "rb").read()).hexdigest()
-        if rec.get("sha") == sha:
+        upload, sha = asset_upload(out, rel, manifest)
+        if not upload:
             continue
         send = local if args.no_webp else to_webp(local)
         ext = os.path.splitext(send)[1].lower()
@@ -5517,12 +5652,17 @@ def cmd_push(args):
     with open(man_path, "w") as fh:
         json.dump(manifest, fh, indent=1)
     print(f"media     {new} new, {len(manifest) - new} reused")
-    for rel, rec in manifest.items():
-        html = html.replace(f'"{rel}"', f'"{rec["url"]}"')
+    html = with_media_urls(html, manifest)
 
     if post_id:
         # Revisions are off site-wide. Keep the old body before overwriting it.
         print(f"backup    {backup_body(out, post_id, cur)}")
+        if replace:
+            # Record the way back just before the first write to the original:
+            # if anything below stops, wp.json says where it is, and a rerun
+            # refuses (REPLACE_UNFINISHED). Not earlier: a run that stops
+            # before this has changed nothing on the original.
+            write_wp_meta(out, {**meta, "replacing": {"orig": post_id, "backup": ebackup}})
     else:
         if post_type == "post":
             res = ability("ewpa/create-post", {
@@ -5551,6 +5691,14 @@ def cmd_push(args):
         # that is also how the next push knows this one never finished.
         meta = {**meta, "post_id": int(post_id), "post_type": post_type,
                 "slug": page_slug}
+        # A page may come back from WPML carrying the original's Elementor
+        # meta. Until it is cleared and checked raw, a rerun must be able to
+        # finish the job instead of refusing the page as Elementor's
+        # (ELEMENTOR_PAGE) or its --translation-of as an update; "creating"
+        # goes once assert_raw has passed.
+        if post_type == "page":
+            meta["creating"] = {"translation_of": int(translation_of) if translation_of
+                                else None, "language": args.language}
         write_wp_meta(out, meta)
 
     ability("mc/set-post-html", {"post_id": int(post_id), "content": html}, creds=creds)
@@ -5565,7 +5713,7 @@ def cmd_push(args):
     # A page joined to an Elementor original as its translation inherits the
     # builder meta and keeps rendering Elementor. A page created by this push
     # is raw by intent, so blank what WPML copied. (Posts never use Elementor.)
-    if created and post_type == "page" and \
+    if (created or creating) and post_type == "page" and \
             get_meta(post_id, "_elementor_edit_mode", creds=creds) == "builder":
         clear_elementor(post_id, data=True, creds=creds)
         print("elementor  cleared (copied by WPML)")
@@ -5585,11 +5733,17 @@ def cmd_push(args):
     # A build whose wp.json has a post_id but no modified_gmt was created by
     # a push that failed before finishing — its permalink may never have run.
     unfinished = bool(meta.get("post_id")) and not meta.get("modified_gmt")
-    # --replace never touches the original's URL.
+    # --replace never touches the original's URL, and neither does a later
+    # push of the page it replaced: regenerating may reset a Permalink Manager
+    # URI someone set by hand on the Elementor page. --page-slug still does.
     if not replace and (post_type == "page" or created or unfinished or args.page_slug):
-        perm = ability("mc/regenerate-permalink",
-                       {"post_id": int(post_id), "slug": page_slug}, creds=creds)
-        print(f"permalink {(perm.get('output') or perm).get('permalink', '')}")
+        if meta.get("replaced") and not args.page_slug:
+            print("permalink kept (a replaced Elementor page keeps its URI; "
+                  "--page-slug regenerates it)")
+        else:
+            perm = ability("mc/regenerate-permalink",
+                           {"post_id": int(post_id), "slug": page_slug}, creds=creds)
+            print(f"permalink {(perm.get('output') or perm).get('permalink', '')}")
 
     # Read modified_gmt LAST. It used to be read straight after set-post-html,
     # but the post-meta write and the permalink call each bump it again, so the
@@ -5601,14 +5755,16 @@ def cmd_push(args):
                                 f"?context=edit&_fields=id,slug,title,status,link,parent,modified_gmt,content",
                          creds=creds))
     # --replace rewrites wp.json last, once the front end has been checked.
+    # body_sha is what --replace holds a draft to: the body actually sent.
     if not replace:
-        write_wp_meta(out, {**meta, "post_id": after["id"], "slug": after["slug"],
-                            "title": (after["title"] or {}).get("raw", ""),
-                            "parent": after.get("parent"), "link": after["link"],
-                            "status": after["status"],
-                            "modified_gmt": after["modified_gmt"], "post_type": post_type,
-                            "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                                       time.gmtime())})
+        final = {**meta, "post_id": after["id"], "slug": after["slug"],
+                 "title": (after["title"] or {}).get("raw", ""),
+                 "parent": after.get("parent"), "link": after["link"],
+                 "status": after["status"],
+                 "modified_gmt": after["modified_gmt"], "post_type": post_type,
+                 "body_sha": body_sha(html),
+                 "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        write_wp_meta(out, final)
 
     rendered = (after.get("content") or {}).get("rendered", "")
     if replace:
@@ -5616,6 +5772,8 @@ def cmd_push(args):
         return
     if post_type == "page":
         assert_raw(post_id, rendered, page_wrapper(out), creds=creds)
+        if final.pop("creating", None) is not None:
+            write_wp_meta(out, final)
     delta = wpsafe.autop_delta(html, rendered)
     if not rendered:
         note = "  — could not compare: WordPress returned no rendered body"
@@ -5706,9 +5864,11 @@ def cmd_elementor_restore(args):
         from the same backup; say so and where the old body is."""
         try:
             fn()
-        except (Exception, SystemExit):
+        except (Exception, SystemExit) as e:
+            # die() has already printed why; anything else has not.
+            why = "" if isinstance(e, SystemExit) else f" ({type(e).__name__}: {e})"
             die("RESTORE_INCOMPLETE",
-                f"{what} failed for #{orig}; wp.json was not changed. Running "
+                f"{what} failed for #{orig}{why}; wp.json was not changed. Running "
                 f"`elementor-restore {args.slug}` again is safe. The body the page "
                 f"held before is {bbody}, the Elementor backup is {path}.")
 
