@@ -1,0 +1,16 @@
+[
+  {"id": "a1b2", "elType": "section", "settings": {}, "elements": [
+    {"id": "a1c1", "elType": "column", "settings": {"_column_size": 100}, "elements": [
+      {"id": "e5d1", "elType": "widget", "widgetType": "heading", "settings": {"title": "Example heading"}, "elements": []}
+    ]}
+  ]},
+  {"id": "e5f6", "elType": "section", "settings": {}, "elements": [
+    {"id": "e5c1", "elType": "column", "settings": {"_column_size": 100}, "elements": [
+      {"id": "e5d1", "elType": "widget", "widgetType": "posts",
+       "settings": {"_skin": "classic", "classic_posts_per_page": 3, "posts_post_type": "post",
+                    "posts_include": ["terms"], "posts_include_term_ids": ["12"],
+                    "posts_orderby": "date", "posts_order": "desc"},
+       "elements": []}
+    ]}
+  ]}
+]

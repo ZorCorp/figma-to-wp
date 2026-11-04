@@ -4,6 +4,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "scripts"))
 import figma_to_wp as fw  # noqa: E402
+import elementor as el  # noqa: E402
 
 
 class VerifyCssShortcode(unittest.TestCase):
@@ -378,6 +379,289 @@ class PushElementor(unittest.TestCase):
         html = [c for c in self.calls if c[0] == "mc/set-post-html"][0][1]["content"]
         self.assertIn(f'src="{url}"', html)
         self.assertNotIn("assets/a.png", html)
+
+
+MINI = os.path.join(HERE, "fixtures", "elementor-mini")
+
+
+def mini(name):
+    with open(os.path.join(MINI, name), encoding="utf-8") as f:
+        return f.read()
+
+
+LIVE = mini("live.html")
+
+
+class ElementorPageDoc(unittest.TestCase):
+    def test_page_doc_skips_header_and_footer(self):
+        s, e = el.page_doc(LIVE, 1234)
+        seg = LIVE[s:e]
+        self.assertIn("elementor-widget-heading", seg)
+        self.assertNotIn("elementor-widget-social-icons", seg)   # footer
+        self.assertNotIn("elementor-widget-image\" data-id=\"h1c3", seg)  # header
+        self.assertNotIn("Popup copy", seg)
+
+    def test_page_doc_other_id_is_none(self):
+        # A translation that still renders the original's doc has another id.
+        self.assertIsNone(el.page_doc(LIVE, 4321))
+        self.assertIsNone(el.page_doc("<p>no docs</p>", 1234))
+
+    def test_page_doc_accepts_wp_post_and_last_doc(self):
+        html = ('<div data-elementor-type="header" data-elementor-id="1" class="elementor"><p>h</p></div>'
+                '<div data-elementor-type="wp-post" data-elementor-id="7" class="elementor"><p>body</p></div>'
+                '<script>x</script>')
+        s, e = el.page_doc(html, 7)
+        self.assertIn("body", html[s:e])
+        self.assertNotIn("<script>", html[s:e])   # stops where the doc closes
+
+    def test_selector_string_in_script_is_not_a_doc(self):
+        html = ('<script>q(\'[data-elementor-type="wp-page"]\')</script>'
+                '<div data-elementor-type="wp-page" data-elementor-id="7"><p>ok</p></div>')
+        s, e = el.page_doc(html, 7)
+        self.assertTrue(html[s:].startswith("<div data-elementor-type"))
+
+
+class ElementorInventory(unittest.TestCase):
+    def setUp(self):
+        self.inv = el.inventory(LIVE, 1234, mini("elementor-data.json"))
+
+    def test_tiers_and_popups(self):
+        inv = self.inv
+        self.assertEqual(inv["post_id"], 1234)
+        self.assertIn("elementskit-funfact", inv["tier3"])
+        self.assertEqual(inv["tier3"], ["elementskit-funfact"])
+        self.assertEqual(inv["popups"], [900])        # header's 777 and footer's 901 are not the page's
+        self.assertEqual(inv["posts_queries"][0]["posts_per_page"], 3)
+        self.assertTrue(inv["flags"]["hidden"]["mobile"])
+        self.assertFalse(inv["flags"]["hidden"]["tablet"])
+        self.assertFalse(inv["flags"]["hidden"]["desktop"])
+
+    def test_widgets_carry_type_tier_section(self):
+        w = {(x["type"], x["tier"], x["section"]) for x in self.inv["widgets"]}
+        self.assertIn(("heading", 1, "s1"), w)
+        self.assertIn(("image", 1, "s1"), w)
+        self.assertIn(("nested-tabs", 2, "s2"), w)
+        self.assertIn(("button", 1, "s2"), w)
+        self.assertIn(("posts", 2, "s3"), w)             # ".classic" skin stripped
+        self.assertIn(("elementskit-funfact", 3, "s3"), w)
+        self.assertNotIn("social-icons", {x["type"] for x in self.inv["widgets"]})
+
+    def test_flags_and_template(self):
+        f = self.inv["flags"]
+        self.assertTrue(f["motion_fx"])
+        self.assertFalse(f["sticky"])                    # sticky is on the header, not the page
+        self.assertTrue(f["hubspot"])
+        self.assertEqual(self.inv["template"], "elementor_header_footer")
+
+    def test_sticky_flag_and_section_wrap(self):
+        html = ('<body class="page-template-default"><div data-elementor-type="wp-page" data-elementor-id="5">'
+                '<div class="elementor-section-wrap">'
+                '<section class="elementor-section elementor-top-section" data-element_type="section" '
+                'data-settings="{&quot;sticky&quot;:&quot;top&quot;}"><div class="elementor-container">'
+                '<div class="elementor-column" data-element_type="column">'
+                '<div class="elementor-widget" data-element_type="widget" data-widget_type="icon.default"></div>'
+                '</div></div></section>'
+                '<section class="elementor-section elementor-top-section" data-element_type="section">'
+                '<div class="elementor-container"><div class="elementor-column" data-element_type="column">'
+                '<section class="elementor-section elementor-inner-section" data-element_type="section">'
+                '<div class="elementor-widget" data-element_type="widget" data-widget_type="divider.default"></div>'
+                '</section></div></div></section>'
+                '</div></div></body>')
+        inv = el.inventory(html, 5)
+        self.assertTrue(inv["flags"]["sticky"])
+        self.assertFalse(inv["flags"]["motion_fx"])
+        self.assertEqual([(w["type"], w["section"]) for w in inv["widgets"]],
+                         [("icon", "s1"), ("divider", "s2")])   # inner section is not a new top section
+        self.assertEqual(inv["template"], "default")
+
+    def test_popup_ids_dedupe_pad_and_skip_junk(self):
+        import base64
+        b = lambda s: base64.b64encode(s.encode()).decode().replace("=", "%3D")
+        link = lambda s: ('<a href="#elementor-action%3Aaction%3Dpopup%3Aopen%26settings%3D' + s + '">x</a>')
+        html = ('<div data-elementor-type="wp-page" data-elementor-id="5">'
+                + link(b('{"id":"31"}')) + link(b('{"id":"9","toggle":false}')) + link(b('{"id":"31"}'))
+                + link("!!not-base64!!") + link(b('{"nope":1}')) + '</div>')
+        self.assertEqual(el.inventory(html, 5)["popups"], [31, 9])
+
+    def test_posts_queries_from_json_string_skin_and_empty(self):
+        data = [{"elType": "container", "elements": [
+            {"elType": "widget", "widgetType": "posts", "elements": [],
+             "settings": {"_skin": "cards", "cards_posts_per_page": 4, "classic_posts_per_page": 6,
+                          "posts_post_type": "post", "posts_include_term_ids": ["7"]}},
+            {"elType": "widget", "widgetType": "heading", "settings": {"title": "x"}, "elements": []}]}]
+        q = el.inventory(LIVE, 1234, json.dumps(data))["posts_queries"]
+        self.assertEqual(len(q), 1)
+        self.assertEqual(q[0]["posts_per_page"], 4)     # the active skin's count wins
+        self.assertEqual(q[0]["posts_include_term_ids"], ["7"])
+        self.assertNotIn("cards_posts_per_page", q[0])
+        self.assertEqual(el.inventory(LIVE, 1234)["posts_queries"], [])
+        self.assertEqual(el.inventory(LIVE, 1234, "not json")["posts_queries"], [])
+        self.assertEqual(el.inventory(LIVE, 1234, "[]")["posts_queries"], [])
+
+    def test_no_doc_gives_empty_inventory(self):
+        inv = el.inventory(LIVE, 4321)
+        self.assertEqual(inv["widgets"], [])
+        self.assertEqual(inv["popups"], [])
+
+    def test_tier_tables(self):
+        self.assertIn("heading", el.TIER1)
+        self.assertIn("social-icons", el.TIER1)
+        self.assertIn("nested-tabs", el.TIER2)
+        self.assertIn("posts", el.TIER2)
+        self.assertFalse(el.TIER1 & el.TIER2)
+
+
+class ElementorResponsiveRules(unittest.TestCase):
+    def test_responsive_rules_split_by_breakpoint(self):
+        r = el.responsive_rules(mini("post-1234.css"))
+        self.assertEqual(sorted(r), ["1024", "767"])
+        self.assertEqual(len(r["1024"]), 2)
+        self.assertEqual(len(r["767"]), 2)
+        self.assertIn("padding:40px 20px", r["1024"][0])
+        self.assertIn("font-size:30px", r["767"][1])
+        self.assertFalse([x for k in r for x in r[k] if "background-color" in x])   # unrelated rule left out
+
+    def test_only_plain_max_width_blocks(self):
+        css = ("/* c */@media (min-width:768px) and (max-width:1024px){.a{x:1}}"
+               "@media screen and (max-width: 1024px){.b{ y:2 }.c{z:3}}"
+               "@media(max-width:1024px){.d{w:4}}@media(max-width:480px){.e{v:5}}"
+               "@media(max-width:767px){@supports (display:grid){.f{u:6}}}")
+        r = el.responsive_rules(css)
+        self.assertEqual(r["1024"], [".b{ y:2 }", ".c{z:3}", ".d{w:4}"])
+        self.assertEqual(len(r["767"]), 1)
+        self.assertEqual(el.responsive_rules(""), {"1024": [], "767": []})
+
+
+class ElementorSnapshot(unittest.TestCase):
+    def snap(self, js="/*measure*/"):
+        return el.snapshot(LIVE, "https://example.test", 1234, js)
+
+    def test_snapshot_unlazies_images(self):
+        s = self.snap()
+        img = [t for t in __import__("re").findall(r"<img\b[^>]*>", s) if "hero" in t][0]
+        self.assertIn('src="/wp-content/uploads/hero.png"', img)
+        self.assertIn('srcset="/wp-content/uploads/hero-300.png 300w', img)
+        self.assertNotIn("loading=", img)
+        self.assertNotIn("data:image/gif", img)
+
+    def test_unlazy_data_lazy_src_and_no_src(self):
+        html = LIVE.replace('<img width="640"', '<img data-lazy-src="https://example.test/z.png" loading=lazy width="1"', 1)
+        s = el.snapshot(html, "https://example.test", 1234, "")
+        self.assertIn('src="/z.png"', s)
+
+    def test_snapshot_marks_root_and_sections(self):
+        s = self.snap()
+        self.assertEqual(s.count("data-fw-root"), 1)
+        self.assertIn('<div data-fw-root data-elementor-type="wp-page" data-elementor-id="1234"', s)
+        for n in (1, 2, 3):
+            self.assertEqual(s.count('data-section="s%d"' % n), 1, n)
+        self.assertNotIn('data-section="s4"', s)
+        # s2 is the e-con container, s1 and s3 legacy sections, never the header or footer
+        self.assertIn('<div data-section="s2" class="e-con e-parent', s)
+        self.assertNotRegex(s, r'data-section="[^"]*"[^>]*elementor-element-(?:h1a1|f1a1|p9a1)')
+
+    def test_snapshot_relativizes_origin_urls(self):
+        s = self.snap()
+        self.assertNotIn('href="https://example.test', s)
+        self.assertIn('href="/wp-content/uploads/elementor/css/post-1234.css"', s)
+        self.assertIn('src="/wp-content/uploads/logo.png"', s)
+        self.assertNotIn("example.test.evil", s)
+        t = el.snapshot(LIVE.replace("Example heading", '<a href="https://example.test">h</a> https://example.testing/x'),
+                        "https://example.test/", 1234, "")
+        self.assertIn('<a href="/">h</a>', t)
+        self.assertIn("https://example.testing/x", t)   # another host is left alone
+
+    def test_snapshot_injects_style_and_script(self):
+        s = self.snap("window.__m=1;")
+        self.assertEqual(s.count("<style data-fw>"), 1)
+        style = s.split("<style data-fw>")[1].split("</style>")[0]
+        self.assertIn("#hs-eu-cookie-confirmation", style)
+        self.assertIn('data-elementor-id="1234"', style)
+        self.assertIn("display:none", style.replace(" ", ""))
+        self.assertIn(".elementor-invisible", style)
+        self.assertIn("visibility:visible", style.replace(" ", ""))
+        self.assertTrue(s.index("<style data-fw>") < s.index("</head>"))
+        self.assertTrue(s.index("window.__m=1;") < s.rindex("</body>"))
+        self.assertRegex(s, r"<script>window\.__m=1;</script>\s*</body>")
+
+    def test_snapshot_marks_containers_lazyloaded(self):
+        # Elementor holds a container's background back until JS adds this class.
+        s = self.snap()
+        self.assertRegex(s, r'<div data-section="s2" class="e-con e-parent[^"]*e-lazyloaded')
+
+    def test_snapshot_without_page_doc_raises(self):
+        with self.assertRaises(ValueError):
+            el.snapshot(LIVE, "https://example.test", 4321, "")
+
+    def test_snapshot_handles_missing_head_and_body(self):
+        html = '<div data-elementor-type="wp-page" data-elementor-id="5"><section data-element_type="section"></section></div>'
+        s = el.snapshot(html, "https://example.test", 5, "J")
+        self.assertIn("<style data-fw>", s)
+        self.assertIn("<script>J</script>", s)
+        self.assertIn('data-section="s1"', s)
+
+
+class ElementorServeLive(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        with open(os.path.join(self.tmp, "live.html"), "w") as f:
+            f.write("<p>local snapshot</p>")
+        self.srv = el.serve_live(self.tmp, "https://example.test")
+        self.addCleanup(fw.stop_server, self.srv)
+
+    def get(self, path):
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", self.srv.server_address[1], timeout=5)
+        try:
+            c.request("GET", path)
+            r = c.getresponse()
+            return r.status, r.getheader("Content-Type"), r.read()
+        finally:
+            c.close()
+
+    def test_live_html_is_local_and_never_proxied(self):
+        with mock.patch("urllib.request.urlopen") as uo:
+            status, ctype, body = self.get("/live.html?x=1")
+        self.assertEqual((status, body), (200, b"<p>local snapshot</p>"))
+        self.assertIn("text/html", ctype)
+        uo.assert_not_called()
+
+    def test_serve_live_proxies_other_paths(self):
+        resp = mock.MagicMock()
+        resp.read.return_value = b"a{color:red}"
+        resp.status = 200
+        resp.headers.get.return_value = "text/css"
+        with mock.patch("urllib.request.urlopen", return_value=resp) as uo:
+            status, ctype, body = self.get("/wp-content/x.css?ver=3")
+        self.assertEqual((status, ctype, body), (200, "text/css", b"a{color:red}"))
+        req = uo.call_args.args[0]
+        self.assertEqual(req.full_url, "https://example.test/wp-content/x.css?ver=3")
+        self.assertEqual(req.get_header("User-agent"), el.UA)
+
+    def test_upstream_error_status_is_passed_through(self):
+        import urllib.error
+        err = urllib.error.HTTPError("https://example.test/x", 404, "nf", {"Content-Type": "text/plain"},
+                                     io.BytesIO(b"nope"))
+        self.addCleanup(err.close)
+        with mock.patch("urllib.request.urlopen", side_effect=err):
+            status, ctype, body = self.get("/missing")
+        self.assertEqual((status, ctype, body), (404, "text/plain", b"nope"))
+
+    def test_unreachable_origin_is_502(self):
+        import urllib.error
+        with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
+            status, _, _ = self.get("/x")
+        self.assertEqual(status, 502)
+
+
+class MeasureJs(unittest.TestCase):
+    def test_root_and_fonts(self):
+        with open(os.path.join(HERE, "..", "scripts", "measure.js")) as f:
+            js = f.read()
+        self.assertIn("document.querySelector('[data-fw-root]')||document.querySelector('.mc-page')||document.body", js)
+        self.assertIn("fonts:", js)
+        self.assertIn("status==='loaded'", js)
 
 
 if __name__ == "__main__":

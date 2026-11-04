@@ -11,7 +11,7 @@ function cls(el){
 }
 function fwMeasure(){
   var out=[], secs=[], seen=new Set(),
-      root=document.querySelector('.mc-page')||document.body;
+      root=document.querySelector('[data-fw-root]')||document.querySelector('.mc-page')||document.body;
   root.querySelectorAll('section,[data-section]').forEach(function(el){
     var r=el.getBoundingClientRect();
     if(r.height>40) secs.push({
@@ -188,8 +188,14 @@ function fwMeasure(){
                      box:Math.round(r.width)+'x'+Math.round(r.height),
                      ratio:c.aspectRatio});
   });
+  // The families the page really loaded, not the ones its font stack names:
+  // Raleway can be first in a stack and never arrive.
+  var fonts=[];
+  try{ document.fonts.forEach(function(f){
+         var n=(f.family||'').replace(/["']/g,'');
+         if(f.status==='loaded'&&n&&fonts.indexOf(n)<0) fonts.push(n); }); }catch(e){}
   s.textContent=JSON.stringify({runs:out, sections:secs, boxes:boxes,
-                                fontOK:fontOK, mobile:mob});
+                                fontOK:fontOK, fonts:fonts, mobile:mob});
   document.body.appendChild(s);
   // Headless Chrome will not open a window narrower than 500px, so a real
   // phone width can only be had by rendering into an iframe of that width.
