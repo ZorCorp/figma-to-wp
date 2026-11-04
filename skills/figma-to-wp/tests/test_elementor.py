@@ -635,7 +635,7 @@ class PushReplace(unittest.TestCase):
                          (self.ORIG, self.STAMP, "<p>old</p>"))
         for k, v in self.META.items():
             self.assertEqual(b["meta"][k], v)              # dict stays a dict
-        self.assertEqual(set(b["meta"]), set(fw.ELEMENTOR_META))
+        self.assertEqual(set(b["meta"]), set(fw.ELEMENTOR_META + fw.REPLACE_EXTRA_META))
         self.assertIsNone(b["meta"]["_elementor_css"])     # absent stays null
 
     def test_replace_clears_edit_mode_only(self):
@@ -773,6 +773,10 @@ class RestoreElementor(unittest.TestCase):
                         'class="elementor">x</div>']
         self.fetch_error = False
         self.seen = {}
+        self.bodies_posted = []
+        self.setUp_patches()
+
+    def setUp_patches(self):
         for name, repl in (
                 ("BUILD", self.build),
                 ("wp_creds", lambda: ("https://x", "u", "p")),
@@ -783,12 +787,13 @@ class RestoreElementor(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
 
-    def write_backup(self, rel, post_id=None, data=None):
+    def write_backup(self, rel, post_id=None, data=None, **extra_meta):
         rec = {"post_id": post_id or self.ORIG, "modified_gmt": "2026-02-02T00:00:00",
                "content_raw": "<!-- elementor -->",
                "meta": {"_elementor_edit_mode": "builder",
                         "_elementor_data": data if data is not None else self.DATA,
-                        "_wp_page_template": "elementor_header_footer"}}
+                        "_wp_page_template": "elementor_header_footer",
+                        **extra_meta}}
         path = os.path.join(self.out, rel) if not os.path.isabs(rel) else rel
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as fh:
@@ -819,6 +824,8 @@ class RestoreElementor(unittest.TestCase):
                     "modified_gmt": "2026-04-04T00:00:00",
                     "content": {"raw": self.body}}
         self.note((method, path))
+        if kw.get("body"):
+            self.bodies_posted.append(kw["body"])
         return {}
 
     def fake_ability(self, name, payload, creds=None):
@@ -884,7 +891,7 @@ class RestoreElementor(unittest.TestCase):
     def names(self):
         return [c[0] for c in self.calls]
 
-    def test_restore_writes_body_then_builder_mode(self):
+    def test_restore_writes_builder_mode_then_body(self):
         self.run_restore()
         # current body saved before the first write
         self.assertEqual(len(self.seen["bodies"]), 1)
@@ -896,11 +903,82 @@ class RestoreElementor(unittest.TestCase):
                                                       "content": "<!-- elementor -->"})])
         sm = [c for c in self.calls if c[0] == "set_meta"]
         self.assertEqual(sm, [("set_meta", "_elementor_edit_mode", "builder")])
-        i = self.calls.index(setp[0])
-        self.assertLess(i, self.calls.index(sm[0]))
+        # builder first: a failed body write still leaves the page on Elementor
+        self.assertLess(self.calls.index(sm[0]), self.calls.index(setp[0]))
         purge = ("PUT", "/wp-json/siteground-optimizer/v1/purge-cache")
-        self.assertLess(self.calls.index(sm[0]), self.calls.index(purge))
+        self.assertLess(self.calls.index(setp[0]), self.calls.index(purge))
         self.assertLess(self.calls.index(purge), self.names().index("fetch_live"))
+
+    def page_js_writes(self):
+        return [c for c in self.calls if c[0] == "POST"]
+
+    def test_restore_writes_back_the_backed_up_page_js(self):
+        self.write_backup(self.BACKUP, _wpbuddy_page_js="console.log(1);")
+        self.run_restore()
+        self.assertEqual(self.page_js_writes(), [("POST", "/wp-json/wp/v2/pages/50")])
+        self.assertEqual(self.bodies_posted, [{"meta": {"_wpbuddy_page_js": "console.log(1);"}}])
+        names = self.names()
+        self.assertLess(names.index("POST"), names.index("mc/set-post-html"))
+
+    def test_restore_blanks_page_js_when_the_backup_has_none(self):
+        for js in (None, ""):
+            self.bodies_posted.clear()
+            self.write_backup(self.BACKUP, _wpbuddy_page_js=js)
+            self.write_wp_json(post_id=self.ORIG,
+                               replaced={"draft": self.DRAFT, "backup": self.BACKUP})
+            self.fetched = ['<div data-elementor-type="wp-page" data-elementor-id="50">']
+            self.run_restore()
+            self.assertEqual(self.bodies_posted, [{"meta": {"_wpbuddy_page_js": ""}}])
+
+    def test_restore_blanks_page_js_for_a_backup_without_the_key(self):
+        self.run_restore()      # the default backup has no _wpbuddy_page_js at all
+        self.assertEqual(self.bodies_posted, [{"meta": {"_wpbuddy_page_js": ""}}])
+
+    def test_restore_accepts_an_empty_content_raw(self):
+        rec_path = os.path.join(self.out, self.BACKUP)
+        with open(rec_path) as fh:
+            rec = json.load(fh)
+        rec["content_raw"] = ""
+        with open(rec_path, "w") as fh:
+            json.dump(rec, fh)
+        self.run_restore()
+        self.assertEqual([c[1]["content"] for c in self.calls if c[0] == "mc/set-post-html"], [""])
+
+    def failing(self, which):
+        """Make one site write raise, as wp() does: die() -> SystemExit."""
+        def boom(*a, **kw):
+            raise SystemExit(1)
+        orig_wp = self.fake_wp
+        if which == "set_meta":
+            p = mock.patch.object(fw, "set_meta", boom)
+        elif which == "ability":
+            p = mock.patch.object(fw, "ability", boom)
+        else:
+            def wp(method, path, **kw):
+                if (which == "purge" and method == "PUT") or \
+                        (which == "pagejs" and method == "POST"):
+                    raise SystemExit(1)
+                return orig_wp(method, path, **kw)
+            p = mock.patch.object(fw, "wp", wp)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_restore_names_the_body_backup_when_a_write_fails_and_rerun_works(self):
+        for which in ("set_meta", "pagejs", "ability", "purge"):
+            with self.subTest(which):
+                self.write_wp_json(post_id=self.ORIG, replaced={
+                    "draft": self.DRAFT, "backup": self.BACKUP})
+                self.failing(which)
+                err = self.dies("RESTORE_INCOMPLETE")
+                self.assertIn("backups/50-", err)                     # the body backup
+                self.assertIn("elementor-restore p", err)
+                self.assertIn("safe", err)
+                self.assertIn("replaced", self.wp_json())             # untouched
+                mock.patch.stopall()
+                self.setUp_patches()
+                self.fetched = ['<div data-elementor-type="wp-page" data-elementor-id="50">']
+                self.run_restore()                                    # the rerun succeeds
+                self.assertNotIn("replaced", self.wp_json())
 
     def test_restore_does_not_rewrite_elementor_data(self):
         self.run_restore()
@@ -908,7 +986,8 @@ class RestoreElementor(unittest.TestCase):
                          [c[1] for c in self.calls if c[0] == "set_meta"])
 
     def test_restore_verifies_front_end(self):
-        url = [c for c in (self.run_restore() and self.calls) if c[0] == "fetch_live"][0][1]
+        self.run_restore()
+        url = [c for c in self.calls if c[0] == "fetch_live"][0][1]
         self.assertTrue(url.startswith("https://x/example/?fwcb="))   # cache-busted
 
     def test_restore_dies_when_front_end_is_not_the_elementor_page(self):
@@ -920,6 +999,8 @@ class RestoreElementor(unittest.TestCase):
             self.fetched = [html]
             err = self.dies("RESTORE_FAILED")
             self.assertIn("-elementor-", err)
+            self.assertIn("backups/50-", err)             # the body it held before
+            self.assertIn("again", err)
             self.assertIn("replaced", self.wp_json())     # wp.json left as it was
 
     def test_restore_accepts_either_attribute_order(self):
@@ -929,7 +1010,9 @@ class RestoreElementor(unittest.TestCase):
 
     def test_restore_dies_cleanly_when_front_end_cannot_be_read(self):
         self.fetch_error = True
-        self.dies("RESTORE_FAILED")
+        err = self.dies("RESTORE_FAILED")
+        self.assertIn("backups/50-", err)
+        self.assertIn("safe", err)
         self.assertIn("replaced", self.wp_json())
 
     def test_restore_clears_replaced_and_keeps_the_original_id(self):
@@ -940,6 +1023,37 @@ class RestoreElementor(unittest.TestCase):
         self.assertEqual(w["post_id"], self.ORIG)
         self.assertEqual(w["modified_gmt"], "2026-04-04T00:00:00")
         self.assertIn("#50", out)
+
+    def test_restore_says_how_to_replace_again(self):
+        out = self.run_restore()
+        self.assertIn("on Elementor again", out)
+        self.assertIn('drop "post_id"', out)          # post_id is the original now
+        self.assertIn("push p --replace 50", out)
+        self.write_wp_json(post_id=self.DRAFT,
+                           replacing={"orig": self.ORIG, "backup": self.BACKUP})
+        self.fetched = ['<div data-elementor-type="wp-page" data-elementor-id="50">']
+        out = self.run_restore()
+        self.assertNotIn("post_id", out)              # the draft is still there
+        self.assertIn("push p --replace 50", out)
+
+    def test_backup_elementor_keeps_the_page_js(self):
+        out = os.path.join(self.tmp, "b")
+        self.metas.update({"_elementor_edit_mode": "builder", "_wpbuddy_page_js": "x();"})
+        real = lambda m, path, **kw: {"id": 50, "modified_gmt": "2026-02-02T00:00:00",
+                                      "content": {"raw": "<p>r</p>"}}
+        with mock.patch.object(fw, "wp", real):
+            path = fw.backup_elementor(50, out)
+        with open(path) as fh:
+            self.assertEqual(json.load(fh)["meta"]["_wpbuddy_page_js"], "x();")
+
+    def test_backup_body_dies_when_it_cannot_write(self):
+        err = io.StringIO()
+        blocked = os.path.join(self.tmp, "file")
+        with open(blocked, "w") as fh:
+            fh.write("x")
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+            fw.backup_body(blocked, 50, {"modified_gmt": "1", "content": {"raw": "x"}})
+        self.assertIn("BACKUP_FAILED", err.getvalue())
 
     def test_restore_clears_replacing_of_an_unfinished_run(self):
         self.write_wp_json(post_id=self.DRAFT,

@@ -4744,6 +4744,12 @@ ELEMENTOR_META = ("_elementor_edit_mode", "_elementor_data", "_elementor_page_se
                   "_elementor_page_assets", "_elementor_controls_usage")
 
 
+# What --replace also writes on the original, beyond the Elementor meta above:
+# the page's own JS rides in post meta. Backed up with the rest so restore can
+# put it back; kept apart because ELEMENTOR_META is what makes a page Elementor.
+REPLACE_EXTRA_META = ("_wpbuddy_page_js",)
+
+
 def page_json(res):
     """A REST page as a dict. A plugin can print a <style> block ahead of the
     JSON, and wp() then hands back the whole thing as text."""
@@ -4764,7 +4770,8 @@ def backup_elementor(post_id, out, creds=None):
                         creds=creds))
     rec = {"post_id": int(post_id), "modified_gmt": page.get("modified_gmt"),
            "content_raw": (page.get("content") or {}).get("raw", ""),
-           "meta": {k: get_meta(post_id, k, creds=creds) for k in ELEMENTOR_META}}
+           "meta": {k: get_meta(post_id, k, creds=creds)
+                    for k in ELEMENTOR_META + REPLACE_EXTRA_META}}
     # A backup that cannot bring the page back is no backup: refuse before
     # anything is written, rather than let --replace overwrite a page it
     # cannot restore (or one that was never built with Elementor).
@@ -4793,11 +4800,14 @@ def backup_body(out, post_id, cur):
     """Keep the body `cur` (a REST page, context=edit) holds now in
     backups/<id>-<stamp>.html before it is overwritten. Revisions are off."""
     bdir = os.path.join(out, "backups")
-    os.makedirs(bdir, exist_ok=True)
     stamp = re.sub(r"\D", "", str(cur.get("modified_gmt") or "prev"))
     bpath = os.path.join(bdir, f"{post_id}-{stamp}.html")
-    with open(bpath, "w", encoding="utf-8") as fh:
-        fh.write((cur.get("content") or {}).get("raw", ""))
+    try:
+        os.makedirs(bdir, exist_ok=True)
+        with open(bpath, "w", encoding="utf-8") as fh:
+            fh.write((cur.get("content") or {}).get("raw", ""))
+    except OSError as e:
+        die("BACKUP_FAILED", f"{bpath}: {e}. Nothing was changed.")
     return bpath
 
 
@@ -5141,8 +5151,6 @@ def cmd_push(args):
 
     if post_id:
         # Revisions are off site-wide. Keep the old body before overwriting it.
-
-
         print(f"backup    {backup_body(out, post_id, cur)}")
     else:
         if post_type == "post":
@@ -5319,31 +5327,56 @@ def cmd_elementor_restore(args):
             f"edited since; nothing was changed. Compare it with {path} and decide.")
 
     cur = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit", creds=creds))
-    print(f"backup    {backup_body(out, orig, cur)}  (the body it holds now)")
-    ability("mc/set-post-html", {"post_id": orig, "content": raw}, creds=creds)
-    print(f"body      #{orig} set from the backup ({len(raw)} bytes)")
-    # --replace blanked this one switch and nothing else of the backed-up meta
-    # (_elementor_data stays in place), so this is all the meta there is to undo.
-    set_meta(orig, "_elementor_edit_mode", "builder", creds=creds)
+    bbody = backup_body(out, orig, cur)
+    print(f"backup    {bbody}  (the body it holds now)")
+
+    def write(what, fn):
+        """Any write that fails leaves wp.json alone, so a rerun starts over
+        from the same backup; say so and where the old body is."""
+        try:
+            fn()
+        except (Exception, SystemExit):
+            die("RESTORE_INCOMPLETE",
+                f"{what} failed for #{orig}; wp.json was not changed. Running "
+                f"`elementor-restore {args.slug}` again is safe. The body the page "
+                f"held before is {bbody}, the Elementor backup is {path}.")
+
+    # Builder mode first: Elementor then draws _elementor_data whatever
+    # post_content holds, so a body write that fails afterwards still leaves
+    # the page on Elementor. --replace blanked this switch and overwrote the
+    # page JS (it is not Elementor's data, so it is not in _elementor_data);
+    # those two are all there is to undo, and _elementor_data is never touched.
+    write("setting the edit mode",
+          lambda: set_meta(orig, "_elementor_edit_mode", "builder", creds=creds))
     print("elementor  edit mode back to builder")
-    wp("PUT", "/wp-json/siteground-optimizer/v1/purge-cache", creds=creds)
+    js = rec["meta"].get("_wpbuddy_page_js")
+    js = js if isinstance(js, str) else (json.dumps(js) if js else "")
+    write("restoring the page js", lambda: wp(
+        "POST", f"/wp-json/wp/v2/pages/{orig}", body={"meta": {"_wpbuddy_page_js": js}},
+        creds=creds))
+    print(f"page js   {len(js)} bytes restored" if js else "page js   none")
+    write("writing the body", lambda: ability(
+        "mc/set-post-html", {"post_id": orig, "content": raw}, creds=creds))
+    print(f"body      #{orig} set from the backup ({len(raw)} bytes)")
+    write("purging the cache", lambda: wp(
+        "PUT", "/wp-json/siteground-optimizer/v1/purge-cache", creds=creds))
 
     page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit&_fields="
                                f"id,link,status,modified_gmt", creds=creds))
+    again = (f"The body it held before is {bbody}, the Elementor backup is {path}. "
+             f"Running `elementor-restore {args.slug}` again is safe.")
     try:
         html = fetch_live(bust(page["link"]))[1]
     except (urllib.error.URLError, OSError) as e:
         die("RESTORE_FAILED",
-            f"#{orig} could not be read back from {page['link']} ({e}). The body "
-            f"and edit mode were written; check the page. The body it held before "
-            f"is in build/{args.slug}/backups/, the Elementor backup is {path}.")
+            f"#{orig} could not be read back from {page['link']} ({e}); wp.json "
+            f"was not changed. {again}")
     if not _is_elementor_doc(html, orig):
         die("RESTORE_FAILED",
             f"{page['link']} does not render #{orig} as an Elementor page "
             f"(no data-elementor-type=\"wp-page\" data-elementor-id=\"{orig}\"). "
-            f"Is it a cached copy? wp.json was left as it was. The Elementor "
-            f"backup is {path}.")
-    print(f"front end #{orig} is Elementor again")
+            f"Is it a cached copy? wp.json was not changed. {again}")
+    print(f"front end #{orig} is on Elementor again")
     if meta.get("replaced") or meta.get("replacing"):
         # post_id stays: the original after a finished replace, the draft after
         # an unfinished one (still there, so --replace can be tried again).
@@ -5353,6 +5386,13 @@ def cmd_elementor_restore(args):
                         modified_gmt=page["modified_gmt"])
         write_wp_meta(out, rest)
         print("wp.json   replaced/replacing removed")
+        if meta.get("post_id") == orig:
+            # push updates whatever post_id names, and the draft is in the trash.
+            print(f"to replace it again: drop \"post_id\" from build/{args.slug}/"
+                  f"wp.json, push a fresh draft (push {args.slug} --title ...), "
+                  f"then push {args.slug} --replace {orig}")
+        else:
+            print(f"to replace it again: push {args.slug} --replace {orig}")
 
 
 def main():
@@ -5484,8 +5524,9 @@ def main():
                         help="put a page that push --replace swapped back on Elementor")
     er.add_argument("slug")
     er.add_argument("--backup", metavar="PATH",
-                    help="the Elementor backup to restore from (default: the one "
-                         "wp.json's replaced/replacing names)")
+                    help="the Elementor backup to restore from, relative to the "
+                         "current directory (default: the one wp.json's "
+                         "replaced/replacing names, relative to the build folder)")
     er.set_defaults(fn=cmd_elementor_restore)
 
     args = p.parse_args()
