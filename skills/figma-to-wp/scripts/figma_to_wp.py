@@ -1784,6 +1784,36 @@ def section_range(out, name, through=False):
     return lo - 8, v["design_y"] + v["design_span"] + 8
 
 
+def css_shortcode_hits(css):
+    """Shortcode-looking text in a stylesheet.
+
+    page.css is inlined into post_content, and WordPress runs do_shortcode over
+    all of it — a CSS comment that says "[wpb_post_list]" executes the
+    shortcode and takes the stylesheet down with it. Inside a comment any
+    "[name" counts; outside one only a name with an underscore does, because
+    attribute selectors (`[data-x]`, `[href^=...]`) never carry one.
+    """
+    hits = []
+    for m in re.finditer(r"/\*.*?\*/", css, re.S):
+        hits += re.findall(r"\[/?[a-z_][a-z0-9_-]*", m.group(0), re.I)
+    bare = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
+    hits += re.findall(r"\[/?[a-z][a-z0-9]*_[a-z0-9_]*", bare, re.I)
+    return hits
+
+
+def spaced_hyphens(html):
+    """Text-node runs like "Gemini - Google Workspace".
+
+    The site's wptexturize turns a spaced hyphen into an en dash on the live
+    page, so the copy no longer matches the design. Writing it as &#45; stops
+    that, and strip_tags unescapes entities, so the copy check still passes.
+    Entities are deliberately NOT decoded here: that is what lets &#45; clear.
+    """
+    t = re.sub(r"<(script|style)\b.*?</\1>|<!--.*?-->", " ", html, flags=re.S | re.I)
+    t = re.sub(r"<[^>]*>", "", t)
+    return [m.group(0) for m in re.finditer(r"\S - \S", t)]
+
+
 def run_checks(out, report=False, section=None, through=None):
     """Every check, returned rather than printed, so push can run them too."""
     dj = os.path.join(out, "design.json")
@@ -1881,6 +1911,16 @@ def run_checks(out, report=False, section=None, through=None):
                 f'hard break not reproduced (#{t["i"]}, y={t["y"]}): the file '
                 f'breaks after {squash(parts[0])[-28:]!r} — put a <br> there. '
                 f'U+2028 in the markup will not do it.')
+
+    # CSS and text rules that only the assembled page can break.
+    page_css = "\n".join(re.findall(r"<style[^>]*>(.*?)</style>", html, re.S | re.I))
+    for hit in sorted(set(css_shortcode_hits(page_css))):
+        errors.append(f'shortcode in CSS: {hit!r} — WordPress runs shortcodes '
+                      f'over the whole body, comments included, and the '
+                      f'stylesheet dies. Reword the comment or the selector')
+    for hit in sorted(set(spaced_hyphens(html))):
+        warnings.append(f'spaced hyphen: {hit!r} — the site turns " - " into an '
+                        f'en dash. Write &#45; for the hyphen')
 
     # The theme paints bare <button>s itself. elementor-kit-7676 sets a
     # background on `button` and a different one on `button:hover, button:focus`
