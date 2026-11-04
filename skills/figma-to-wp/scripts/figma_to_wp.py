@@ -23,6 +23,7 @@ read off the picture, not a number a heuristic invents.
     audit    <slug>             per-element deltas, and per-section drift
     mobile   <slug>             overflow / text size / tap targets / gutter
     push     <slug>             media upload -> draft page -> permalink
+    elementor-restore <slug>    put a page push --replace swapped back on Elementor
 
 The browser-side measurement is `measure.js`, next to this file. It used to be
 a 183-line string in here, where nothing checked its syntax; `doctor` runs
@@ -43,6 +44,7 @@ import argparse
 import base64
 import glob
 import collections
+import contextlib
 import hashlib
 from html import unescape
 import shutil
@@ -52,6 +54,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +63,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wpsafe  # noqa: E402
+import elementor  # noqa: E402
 
 HOME = os.path.expanduser(os.environ.get("FIGMA_WP_HOME", "~/.figma-wp"))
 BUILD = os.path.join(os.getcwd(), "build")
@@ -925,22 +929,33 @@ def cmd_diff(args):
     """
     from PIL import Image, ImageChops, ImageDraw
     out = os.path.join(BUILD, args.slug)
-    design = json.load(open(os.path.join(out, "design.json"), encoding="utf-8"))
+    with open(os.path.join(out, "design.json"), encoding="utf-8") as fh:
+        design = json.load(fh)
+    w = args.width or design["source"]["width"]
+    # An Elementor build has one reference per width it was extracted at, and a
+    # narrow page is shot in an iframe at that width rather than in a window
+    # Chrome will not shrink.
+    el = design["source"].get("type") == "elementor"
+    framed = el and w != design["source"]["width"]
     # A reference handed over by someone else is worth supporting: it is how
     # a designer says "this is what it should look like" without going near
     # the API, and it keeps that claim checkable instead of a conversation.
-    ref_path = args.ref or os.path.join(out, "design.png")
+    ref_path = args.ref or os.path.join(out, f"design-{w}.png" if framed else "design.png")
     if not os.path.exists(ref_path):
+        if framed and not args.ref:
+            die("NO_REFERENCE", f"no reference at {ref_path} — extract made "
+                                f"design-<w>.png for "
+                                f"{', '.join(str(k) for k in design.get('widths') or {})}"
+                                f" only. Pass --ref, or a width it has.")
         die("NO_RENDER", f"no reference at {ref_path} — run extract without "
                          f"--no-render, or pass --ref.")
     print(f"reference {ref_path}")
     ref = Image.open(ref_path).convert("RGB")
-    w = args.width or design["source"]["width"]
 
     url = args.url
     if not url:
         die("NO_URL", "pass --url: the live page, or the local preview.")
-    if w < 500:
+    if w < 500 and not framed:
         print(f"width     {w}px requested — macOS Chrome will not size a window "
               f"below ~500px, so the page lays out wider than this and the shot "
               f"is merely cropped. Every band will read as 'cut off on the "
@@ -963,7 +978,14 @@ def cmd_diff(args):
 
     dd = os.path.join(out, "diff")
     os.makedirs(dd, exist_ok=True)
-    live = shoot(url, os.path.join(dd, "live.png"), w)
+    if framed:
+        # Tall enough for the reference and some over: a page that grew still
+        # has to fit, and shoot trims the empty tail either way.
+        lp = os.path.join(dd, "live.png")
+        shoot_framed(url, lp, w, min(SHOT_TALL, ref.height + REF_MARGIN))
+        live = Image.open(lp).convert("RGB")
+    else:
+        live = shoot(url, os.path.join(dd, "live.png"), w)
 
     ref = ref.resize((w, round(ref.height * w / ref.width)), Image.LANCZOS)
 
@@ -1494,9 +1516,731 @@ def extract_claude_design(args):
     print(f"\nbuild/{slug}/ is ready. Next: verify {slug}, preview, diff.")
 
 
+# ----------------------------------------------------------- elementor source
+
+# vh lengths are pinned to this before any shot or measurement. shoot() opens
+# a 14000px-tall window so the whole page fits in one capture; left alone, a
+# 96vh hero renders 13440px tall there and nowhere else.
+VIEWPORT_H = 1000
+SHOT_TALL = 14000
+# One virtual-time budget for every render of the snapshot, and room below the
+# measured body so position:fixed furniture lands outside the crop.
+EL_BUDGET = 6000
+REF_MARGIN = 400
+DRIFT_TOL = 6
+# measure.js runs once, when the fonts are ready; a snapshot keeps moving after
+# that (images arrive, widget scripts lay out tables and card grids), and the
+# screenshot is taken at the end of the budget. Measure again whenever the body
+# changes size and after load, so the last report is of what the shot shows.
+EL_REMEASURE = """
+(function(){
+  var t, root=document.querySelector('[data-fw-root]');
+  function again(){ clearTimeout(t); t=setTimeout(fwMeasure, 300); }
+  addEventListener('load', again);
+  if (root && window.ResizeObserver) new ResizeObserver(again).observe(root);
+})();"""
+EL_WIDTHS = (768, 390)
+IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif")
+
+
+def http_get(url, timeout=60):
+    """(final_url, body) of a front-end GET, redirects followed. It carries UA:
+    the site's WAF turns away urllib's default one."""
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.geturl(), r.read()
+
+
+def fetch_live(url):
+    """(final_url, html) of a page as a visitor who is not logged in sees it."""
+    final, body = http_get(url)
+    return final, body.decode("utf-8", "replace")
+
+
+def _fw_measure(dom, what):
+    m = re.search(r'<script type="application/json" id="fw-measure">(.*?)</script>',
+                  dom, re.S)
+    if not m:
+        die("NO_MEASURE", f"{what} never reported a measurement. Is measure.js "
+                          f"in the page, and did it finish loading?")
+    return json.loads(m.group(1))
+
+
+@contextlib.contextmanager
+def _framed(url, width, height):
+    """MOBILE_WRAP around url, served from a scratch folder: Chrome's window
+    will not go under 500px, an iframe goes to any width, and the wrapper
+    republishes the frame's measurement for --dump-dom."""
+    tmp = tempfile.mkdtemp(prefix="fw-frame-")
+    srv = None
+    try:
+        with open(os.path.join(tmp, "frame.html"), "w", encoding="utf-8") as fh:
+            fh.write(MOBILE_WRAP.replace('src="preview.html"',
+                                         'src="%s"' % url.replace('"', "%22"))
+                     .replace("__W__", str(width)).replace("__H__", str(height)))
+        srv = serve_dir(tmp)
+        yield f"http://127.0.0.1:{srv.server_port}/frame.html"
+    finally:
+        if srv:
+            stop_server(srv)
+        shutil.rmtree(tmp, True)
+
+
+def measure_at(url, width, png=None, tall=SHOT_TALL, budget=EL_BUDGET):
+    """measure.js's report for url rendered width px wide, in a window (or
+    iframe) tall px high. With png, a screenshot of that very render, cropped
+    to the iframe's width when there is one."""
+    if width >= 1440:
+        return _fw_measure(dump_dom(url, width=width, tall=tall, budget=budget, png=png), url)
+    with _framed(url, width, tall) as wrap:
+        m = _fw_measure(dump_dom(wrap, width=max(width + 120, 800), tall=tall,
+                                 budget=budget, png=png), f"{url} at {width}px")
+    if png:
+        from PIL import Image
+        with Image.open(png) as im:
+            cut = im.crop((0, 0, min(width, im.width), im.height))
+        cut.save(png)
+    return m
+
+
+def shoot_framed(url, png, width, height):
+    """shoot() of url inside a width x height iframe, cropped to the frame."""
+    from PIL import Image
+    with _framed(url, width, height) as wrap:
+        shoot(wrap, png, max(width + 120, 800), tall=height).close()
+    with Image.open(png) as im:
+        cut = im.crop((0, 0, min(width, im.width), im.height))
+    cut.save(png)
+
+
+def _crop_to_root(png, root):
+    """The reference is the page body only, and the same origin its
+    coordinates use: the data-fw-root element's box."""
+    from PIL import Image
+    with Image.open(png) as im:
+        x, y = max(0, root.get("x", 0)), max(0, root.get("y", 0))
+        cut = im.crop((x, y, min(im.width, x + root.get("w", im.width)),
+                       min(im.height, y + root.get("h", im.height))))
+    cut.save(png)
+
+
+def _blank_boxes(png, texts):
+    """The texts whose box has nothing drawn in it on the reference: the
+    measurement put copy there and the picture did not. A box with any glyph
+    in it spans a wide range of grey; an empty one is flat."""
+    from PIL import Image
+    out = []
+    with Image.open(png) as im:
+        g = im.convert("L")
+        for t in texts:
+            if t.get("hidden") or t.get("clipped") or not t.get("w") or not t.get("h"):
+                continue
+            # w/h are the element's, so place them at its box, not the ink.
+            bx, by = t.get("box_x", t["x"]), t.get("box_y", t["y"])
+            box = (bx + 1, by + 1, bx + t["w"] - 1, by + t["h"] - 1)
+            if box[2] <= box[0] or box[3] <= box[1] or box[1] >= g.height or box[0] >= g.width:
+                continue
+            lo, hi = g.crop(box).getextrema()
+            if hi - lo < 40:
+                out.append(t)
+    return out
+
+
+def _css_fill(v):
+    """A computed colour in design.json's own spelling: #RRGGBB, or
+    rgba(r,g,b,a) when it is not opaque."""
+    m = re.match(r"rgba?\((\d+),\s*(\d+),\s*(\d+)(?:,\s*([\d.]+))?\)", str(v or ""))
+    if not m:
+        return v
+    r, g, b = (int(x) for x in m.groups()[:3])
+    a = m.group(4)
+    if a is None or float(a) >= 0.999:
+        return f"#{r:02X}{g:02X}{b:02X}"
+    return f"rgba({r},{g},{b},{round(float(a), 3)})"
+
+
+def _el_text(r, ox, oy):
+    """One measure.js run in design.json's text shape, relative to the root.
+    x/y are where the text starts (the run's tx/ty), because that is what a
+    position check should compare: the parent element's box depends on the
+    markup (Elementor's padding-free button-text span against a raw build's
+    padded <a>) while the ink does not. Whenever tx/ty is present the
+    element's own box is also kept as box_x/box_y (w/h are always the
+    element's, and a centred or right-aligned string is placed by its box, not
+    its first glyph); a run without tx/ty (an older measurement) is placed by its box and carries no box_x/box_y."""
+    w = str(r.get("weight") or "")
+    ink = r.get("tx") is not None and r.get("ty") is not None
+    rec = {"text": r.get("text", ""),
+           "x": (r["tx"] if ink else r["x"]) - ox, "y": (r["ty"] if ink else r["y"]) - oy,
+           "w": r.get("w"), "h": r.get("h"),
+           "align": {"start": "left", "end": "right"}.get(r.get("align"), r.get("align") or "left"),
+           "type": {"family": r.get("family"), "size": r.get("size"),
+                    "weight": int(w) if w.isdigit() else w or None,
+                    "lh": css_px(r.get("lh")), "ls": css_px(r.get("ls")) or 0,
+                    "fill": _css_fill(r.get("color"))},
+           "tag": r.get("tag"), "sec": r.get("sec")}
+    # A collapsed accordion answer is copy all the same, but its position is
+    # the closed state's, not a place anything should be put.
+    if r.get("clipped"):
+        rec["clipped"] = True
+    if ink:
+        rec["box_x"], rec["box_y"] = r["x"] - ox, r["y"] - oy
+    return rec
+
+
+def el_texts(m):
+    """measure.js runs as design.json texts, relative to the root's top-left.
+    Used for widths[w].texts, which serve position checks only: a run is the
+    first text node of an element, cut at 90 chars, and nothing unrendered."""
+    root = m.get("root") or {}
+    ox, oy = root.get("x", 0), root.get("y", 0)
+    return [{"i": i, **_el_text(r, ox, oy)}
+            for i, r in enumerate(m.get("runs") or [], 1)]
+
+
+def el_copy(copy, m, window=60):
+    """design.json texts: every copy string whole (copy_texts), placed by the
+    1440 run that renders it. Runs are matched in order, an exact string
+    first, else a run whose text the string starts with. A string with no run
+    is not rendered at 1440 (a closed tab, a phone-only block): it is kept,
+    flagged hidden, at the position of the text above it, so a section-scoped
+    verify still finds it in its section. measure.js skips strings under 3
+    characters, so those ("42", a ✅ cell) are flagged unmeasured instead."""
+    root = m.get("root") or {}
+    ox, oy = root.get("x", 0), root.get("y", 0)
+    runs = [(norm_text(r.get("text", "")), r) for r in m.get("runs") or []]
+    out, cur, last = [], 0, {"x": 0, "y": 0}
+    for i, s in enumerate(copy, 1):
+        cand = range(cur, min(len(runs), cur + window))
+        hit = next((j for j in cand if runs[j][0] == s), None)
+        if hit is None:
+            hit = next((j for j in cand if len(runs[j][0]) >= 3
+                        and s.startswith(runs[j][0])), None)
+        if hit is None:
+            out.append({"i": i, "text": s, "x": last["x"], "y": last["y"], "w": 0, "h": 0,
+                        "align": "left", "type": {}, "tag": None,
+                        "unmeasured" if len(s) < 3 else "hidden": True})
+            continue
+        cur = hit + 1
+        rec = {"i": i, **_el_text(runs[hit][1], ox, oy), "text": s}
+        last = rec
+        out.append(rec)
+    return out
+
+
+def el_sections(m):
+    root = m.get("root") or {}
+    oy = root.get("y", 0)
+    return [{"name": s.get("name"), "y": s["y"] - oy, "h": s.get("h")}
+            for s in m.get("sections") or []]
+
+
+POS_MIN_CHARS = 6        # shorter strings pair with the wrong twin; audit uses the same floor
+
+
+def compare_positions(ref, live, tol):
+    """Where each text sits on the page against where the reference put it.
+    Both sides are lists of {text, x, y} in the same root-relative coordinates.
+    Texts pair by their first 40 normalised characters, a text that repeats
+    pairs in order of appearance, and one too short to be told apart from its
+    twins (under 6 characters) or collapsed in either picture is not compared.
+    Returns {text, dx, dy} (live minus reference) for every pair that is out by
+    more than tol in either direction."""
+    pool = {}
+    for r in live:
+        pool.setdefault(norm_text(r.get("text", ""))[:40], []).append(r)
+    seen, out = {}, []
+    for r in ref:
+        full = norm_text(r.get("text", ""))
+        if len(full) < POS_MIN_CHARS:
+            continue
+        key = full[:40]
+        n = seen[key] = seen.get(key, -1) + 1
+        mates = pool.get(key, [])
+        if n >= len(mates):
+            continue
+        m = mates[n]
+        if r.get("clipped") or m.get("clipped"):
+            continue
+        dx, dy = round(m["x"] - r["x"]), round(m["y"] - r["y"])
+        if abs(dx) > tol or abs(dy) > tol:
+            out.append({"text": full, "dx": dx, "dy": dy})
+    return out
+
+
+def compare_sections(ref, live, tol):
+    """Section by section, in order: how far each one's top (dy) and height
+    (dh) are from the reference. Only sections out by more than tol are
+    listed; a section with no counterpart in order is not compared."""
+    out = []
+    for r, m in zip(ref, live):
+        dy, dh = round(m["y"] - r["y"]), round(m["h"] - r["h"])
+        if abs(dy) > tol or abs(dh) > tol:
+            out.append({"name": r.get("name"), "dy": dy, "dh": dh})
+    return out
+
+
+def _same_page(a, b):
+    """Two URLs name the same page: scheme, case of the host, a trailing slash
+    and percent-encoding aside."""
+    def key(u):
+        p = urllib.parse.urlsplit(u)
+        return p.netloc.lower(), unquote(p.path).rstrip("/"), p.query
+    return key(a) == key(b)
+
+
+def _el_post(post_id, rest, creds):
+    return wp("GET", f"/wp-json/wp/v2/{rest}/{int(post_id)}?context=edit&_fields="
+                     f"id,slug,title,status,link,parent,modified_gmt,type", creds=creds)
+
+
+def _el_public(post):
+    if post.get("status") != "publish":
+        die("NOT_PUBLIC", f"#{post.get('id')} is {post.get('status')!r}, not "
+                          f"published. extract reads the page as a visitor sees it, "
+                          f"and a visitor sees a login page or a 404 there.")
+
+
+def _el_post_css(origin, post_id, html):
+    """(css, where) of the page's own Elementor stylesheet: the uploaded
+    post-<id>.css, else its own inline <style>, else the page's rules out of
+    whatever inline <style> carries them (elementor-frontend-inline-css holds
+    every document's when the site prints CSS inline), else nothing."""
+    url = f"{origin}/wp-content/uploads/elementor/css/post-{post_id}.css"
+    try:
+        _, body = http_get(url)
+        return body.decode("utf-8", "replace"), f"post-{post_id}.css"
+    except (urllib.error.URLError, OSError):
+        pass
+    m = re.search(r"<style\b[^>]*\bid=[\"']elementor-post-%d(?:-inline-css)?[\"'][^>]*>"
+                  r"(.*?)</style>" % int(post_id), html, re.S | re.I)
+    if m:
+        return m.group(1), f"the inline <style id=elementor-post-{post_id}>"
+    parts, ids = [], []
+    for m in re.finditer(r"<style\b([^>]*)>(.*?)</style>", html, re.S | re.I):
+        mine = elementor.doc_css(m.group(2), post_id)
+        if mine:
+            parts.append(mine)
+            i = re.search(r"\bid=[\"']([^\"']+)", m.group(1))
+            ids.append(i.group(1) if i else "<style>")
+    if parts:
+        return "\n".join(parts), f".elementor-{post_id} rules in {', '.join(ids)}"
+    return "", None
+
+
+def el_image_urls(text, origin):
+    """Every uploaded image the page body or its stylesheet uses, in order: the
+    real src of an <img>/<source> (lazy loaders keep it in data-*), and url()
+    in CSS. The page's own CSS file and other hosts are not images."""
+    host = urllib.parse.urlsplit(origin).netloc.lower()
+    found = []
+
+    def add(u):
+        u = unescape(u).strip()
+        if not u or u.startswith("data:"):
+            return
+        u = urllib.parse.urljoin(origin + "/", u)
+        p = urllib.parse.urlsplit(u)
+        if p.netloc.lower() != host or "/wp-content/uploads/" not in p.path \
+                or "/uploads/elementor/css/" in p.path \
+                or not p.path.lower().endswith(IMG_EXT):
+            return
+        if u not in found:
+            found.append(u)
+    for m in re.finditer(r"<(?:img|source)\b[^>]*>", text, re.I):
+        tag = m.group(0)
+        for attr in ("data-lazy-src", "data-src", "src"):
+            v = re.search(r"\s%s\s*=\s*[\"']([^\"']+)[\"']" % attr, tag)
+            if v and not v.group(1).startswith("data:"):
+                add(v.group(1))
+                break
+    for m in re.finditer(r"url\(\s*([\"']?)([^\"')]+)\1\s*\)", text):
+        add(m.group(2))
+    return found
+
+
+def _upload_key(path):
+    """An upload's path with the size suffix WordPress adds to a resized copy
+    (-1024x683) and the -scaled of a big original taken off."""
+    stem, ext = os.path.splitext(path)
+    return re.sub(r"-(?:\d+x\d+|scaled)$", "", stem) + ext
+
+
+def el_media_id(url, creds):
+    """The attachment id behind an uploaded image, or None. Elementor's own
+    thumbnails are generated files with no attachment and are not looked up."""
+    path = urllib.parse.urlsplit(url).path
+    if "/uploads/elementor/thumbs/" in path:
+        return None
+    stem = os.path.splitext(os.path.basename(_upload_key(path)))[0]
+    hits = wp("GET", f"/wp-json/wp/v2/media?search={urllib.parse.quote(stem)}"
+                     f"&per_page=20&_fields=id,source_url", creds=creds) or []
+    paths = [(h.get("id"), urllib.parse.urlsplit(h.get("source_url") or "").path)
+             for h in hits if isinstance(h, dict)]
+    for hid, sp in paths:
+        if sp == path:
+            return hid
+    # A resized copy (hero-1024x683.png) belongs to its original's attachment.
+    for hid, sp in paths:
+        if _upload_key(sp) == _upload_key(path):
+            return hid
+    return None
+
+
+def el_assets(out, urls, creds):
+    """Download every image for the local preview and record where it lives.
+
+    Each manifest entry is {"id", "url", "sha"}: the sha of the bytes
+    downloaded, the same one push keys on. While the file is unchanged push
+    points the page at url instead of uploading; edited in place, it is
+    uploaded. A download that failed has no sha and stays on its url.
+    """
+    os.makedirs(os.path.join(out, "assets"), exist_ok=True)
+    manifest = read_manifest(out)
+    taken = {rec.get("url"): rel for rel, rec in manifest.items()}
+    assets, matched, failed = [], 0, []
+    for n, u in enumerate(urls, 1):
+        rel = taken.get(u)
+        if not rel:
+            name = unquote(os.path.basename(urllib.parse.urlsplit(u).path))
+            stem, ext = os.path.splitext(name)
+            rel, k = f"assets/{name}", 2
+            while rel in manifest and manifest[rel].get("url") != u:
+                rel, k = f"assets/{stem}-{k}{ext}", k + 1
+        mid = el_media_id(u, creds)
+        matched += mid is not None
+        manifest[rel] = {"id": mid, "url": u}
+        try:
+            _, body = http_get(u)
+            with open(os.path.join(out, rel), "wb") as fh:
+                fh.write(body)
+            manifest[rel]["sha"] = hashlib.sha256(body).hexdigest()
+        except (urllib.error.URLError, OSError) as e:
+            failed.append(f"{u} ({e})")
+        assets.append({"id": f"a{n}", "file": rel, "name": "", "w": None, "h": None,
+                       "url": u, "media_id": mid})
+    with open(os.path.join(out, "manifest.json"), "w") as fh:
+        json.dump(manifest, fh, indent=1)
+    return assets, matched, failed
+
+
+def _font_get(url):
+    """Body of a font or stylesheet URL, or None. Only http(s) is fetched (a
+    page's CSS can name file: or data: URLs), and anything that goes wrong —
+    InvalidURL, a non-ASCII URL, a cut-off read — is a skip, not a traceback."""
+    try:
+        if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+            return None
+        return http_get(url)
+    except Exception as e:
+        print(f"fonts     download failed: {url} ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        return None
+
+
+def _join(base, url):
+    """urljoin that answers None for a URL it cannot parse (http://[bad)."""
+    try:
+        return urllib.parse.urljoin(base, url)
+    except ValueError:
+        return None
+
+
+def el_fonts(out, html, base, families):
+    """Download the font files behind `families` into assets/fonts, from the
+    page's own @font-face rules: its inline <style> blocks and the stylesheets
+    it links, plus what those @import (one level). Only the weights and styles
+    declared are fetched, woff2 preferred; where a weight is split by script,
+    the latin file, and a family with no latin slice gets nothing.
+    Returns (files written by family, {family: why it has none}). Nothing here
+    is allowed to stop an extract."""
+    inline, links = elementor.style_sources(html)
+    sheets = [(c, base) for c in inline]
+
+    def add(url, depth):
+        got = _font_get(url)
+        if not got:
+            return
+        final, body = got
+        css = body.decode("utf-8", "replace")
+        sheets.append((css, final))
+        if depth == 0:
+            for imp in elementor.css_imports(css):
+                if _join(final, imp):
+                    add(_join(final, imp), 1)
+    for href in links:
+        if _join(base, href):
+            add(_join(base, href), 0)
+
+    want = {f.lower(): f for f in families}
+    chosen, nolatin = {}, {}         # (family, weight, style) -> (rank, url, ext)
+    for css, where in sheets:
+        for face in elementor.font_faces(css):
+            fam = want.get(face["family"].lower())
+            best = elementor.best_font(face)
+            if not fam or not best or not re.fullmatch(r"\d+(-\d+)?", face["weight"]):
+                continue
+            rng = face["range"].upper().replace(" ", "")
+            rank = 0 if not rng or "U+0000-00FF" in rng else 1
+            key = (fam, face["weight"], face["style"])
+            url = _join(where, best[0])
+            if url and (key not in chosen or rank < chosen[key][0]):
+                chosen[key] = (rank, url, best[1])
+    written, why = {}, {}
+    d = os.path.join(out, "assets", "fonts")
+    for (fam, weight, style), (rank, url, ext) in sorted(chosen.items()):
+        if rank:
+            nolatin.setdefault(fam, []).append(weight)
+            continue
+        name = (f"{font_slug(fam)}-{weight}" + ("-italic" if style == "italic" else "")
+                + "." + ext)
+        got = _font_get(url)
+        if not got:
+            continue
+        try:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, name), "wb") as fh:
+                fh.write(got[1])
+        except OSError as e:
+            print(f"fonts     could not write {name} ({e})", file=sys.stderr)
+            continue
+        written.setdefault(fam, []).append(name)
+    for fam in families:
+        if fam not in written:
+            if fam in nolatin:
+                why[fam] = (f"{fam!r} is split by unicode-range with no latin slice (CJK?), "
+                            f"so nothing was downloaded — the preview falls back to the "
+                            f"system face, as the live site does")
+            else:
+                why[fam] = (f"no @font-face file found for {fam!r} that could be downloaded "
+                            f"from the page's styles — the preview will not have its glyph widths")
+        elif fam in nolatin:
+            why[fam] = (f"{fam!r} weight(s) {', '.join(sorted(set(nolatin[fam])))} have no "
+                        f"latin slice (CJK?) and were not downloaded — the preview falls "
+                        f"back to the system face for them")
+    return written, why
+
+
+def extract_elementor(args):
+    """A live Elementor page as the design: the page body shot at 1440, 768 and
+    390, its copy and geometry measured at each, its widgets listed, its
+    images mapped to the media library they already sit in."""
+    creds = wp_creds()
+    target = str(args.source).strip()
+    post, url = None, target
+    if target.isdigit():
+        post = _el_post(target, "pages", creds)
+        url = post.get("link") or die("NO_SUCH_PAGE", f"#{target} has no link")
+    elif not target.startswith("http"):
+        hits = find_page(target, creds)
+        if not hits:
+            die("NO_SUCH_PAGE", f"nothing matches {target!r}. Pass the post id or "
+                                f"the page's URL.")
+        if len(hits) > 1:
+            die("AMBIGUOUS", f"{target!r} matches {len(hits)} pages: "
+                             + ", ".join(f"#{h['id']} {h.get('link')}" for h in hits[:8])
+                             + ". Re-run with the post id.")
+        post, url = hits[0], hits[0].get("link")
+    if post:
+        _el_public(post)
+
+    # Only what a visitor sees can be the reference. A redirect, a password
+    # form or a login page shot as design.png would be built faithfully.
+    try:
+        final, html = fetch_live(url)
+    except urllib.error.HTTPError as e:
+        die("NOT_PUBLIC", f"{url} answers HTTP {e.code} to a visitor who is not "
+                          f"logged in; extract only reads public pages.")
+    except urllib.error.URLError as e:
+        die("NETWORK_ERROR", f"GET {url} -> {e.reason}")
+    if not _same_page(final, url):
+        die("NOT_PUBLIC", f"{url} redirects to {final}; extract will not shoot "
+                          f"another page as this one's reference.")
+    # The form itself, not the words: the site's stylesheet styles
+    # .post-password-form on every page, and a footer may link to wp-login.
+    for pat, what in ((r"<form\b[^>]*\bclass\s*=\s*[\"'][^\"']*\bpost-password-form\b",
+                       "a password form"),
+                      (r"<form\b[^>]*\baction\s*=\s*[\"'][^\"']*wp-login\.php",
+                       "a login form")):
+        if re.search(pat, html, re.I):
+            die("NOT_PUBLIC", f"{url} shows {what}, not the page; extract only "
+                              f"reads public pages.")
+    if not post:
+        m = re.search(r"<body\b[^>]*\bclass\s*=\s*[\"'][^\"']*?\b(page-id|postid)-(\d+)",
+                      html, re.I)
+        if not m:
+            die("NO_SUCH_PAGE", f"{url} names no post in its <body> class; "
+                                f"pass the post id instead.")
+        post = _el_post(m.group(2), "pages" if m.group(1) == "page-id" else "posts",
+                        creds)
+        _el_public(post)
+    post_id = int(post["id"])
+
+    if get_meta(post_id, "_elementor_edit_mode", creds=creds) != "builder":
+        die("NOT_ELEMENTOR", f"#{post_id} is not built with Elementor "
+                             f"(_elementor_edit_mode is not 'builder').")
+    # A translation that still renders the original's document measures the
+    # wrong page — or the header, with nothing to tell the two apart.
+    if elementor.page_doc(html, post_id) is None:
+        die("NO_ELEMENTOR_DOC", f"{url} renders no Elementor document with id "
+                                f"{post_id}; it is showing some other page's.")
+
+    for flag in ("no_render", "no_assets"):
+        if getattr(args, flag, False):
+            print(f"note      --{flag.replace('_', '-')} ignored with --from elementor")
+    slug = args.slug or post.get("slug") or slugify(target)
+    out = os.path.join(BUILD, slug)
+    dj = os.path.join(out, "design.json")
+    page = os.path.join(out, "page.html")
+    # extract never writes page.html, but a build made from another source
+    # would be left with a design.json and references that are not its own.
+    if os.path.exists(page) and not args.force:
+        prev = {}
+        if os.path.exists(dj):
+            with open(dj, encoding="utf-8") as fh:
+                prev = json.load(fh).get("source", {})
+        if prev.get("type") != "elementor":
+            why = "no design.json" if not os.path.exists(dj) else f"source.type={prev.get('type')!r}"
+            die("NOT_AN_ELEMENTOR_BUILD",
+                f"{page} exists but is not an Elementor build ({why}); extracting "
+                f"here would replace its design. Pass --force to overwrite.")
+
+    origin = "{0.scheme}://{0.netloc}".format(urllib.parse.urlsplit(final))
+    print(f"page      #{post_id} {url} ({post.get('status')}, "
+          f"edited {post.get('modified_gmt')})")
+
+    inv = elementor.inventory(html, post_id,
+                              get_meta(post_id, "_elementor_data", creds=creds))
+    css, css_from = _el_post_css(origin, post_id, html)
+    inv["responsive"] = elementor.responsive_rules(css)
+
+    live_dir = os.path.join(out, "elementor")
+    os.makedirs(live_dir, exist_ok=True)
+    with open(os.path.join(live_dir, "live.html"), "w", encoding="utf-8") as fh:
+        fh.write(elementor.pin_vh_html(
+            elementor.snapshot(html, origin, post_id, MEASURE_SRC + EL_REMEASURE),
+            VIEWPORT_H))
+    write_json(os.path.join(out, "elementor.json"), inv)
+
+    # Per width, one sizing run, then one run that measures and shoots the
+    # same render: same window, same budget, same moment. The window is the
+    # measured body plus a margin, so a long page is never cut at a fixed
+    # height. What still differs is reported, not corrected: ref_drift is the
+    # reference's height against the body measured in that run (a body that
+    # grew past the window is cut), render_drift is how far the body moved
+    # between the two runs (a widget that settles differently each load).
+    from PIL import Image
+    meas, ref_drift, render_drift, blank = {}, {}, {}, {}
+    srv = elementor.serve_live(live_dir, origin, ua=UA, viewport_h=VIEWPORT_H)
+    try:
+        base = f"http://127.0.0.1:{srv.server_port}/live.html"
+        for w in (1440,) + EL_WIDTHS:
+            probe = (measure_at(base, w).get("root") or {})
+            tall = max(VIEWPORT_H, probe.get("y", 0) + probe.get("h", 0) + REF_MARGIN)
+            png = os.path.join(out, "design.png" if w == 1440 else f"design-{w}.png")
+            meas[w] = measure_at(base, w, png=png, tall=tall)
+            root = meas[w].get("root") or {}
+            _crop_to_root(png, root)
+            with Image.open(png) as im:
+                ref_drift[str(w)] = im.height - root.get("h", im.height)
+            render_drift[str(w)] = root.get("h", 0) - probe.get("h", 0)
+            blank[str(w)] = _blank_boxes(png, el_texts(meas[w]))
+    finally:
+        stop_server(srv)
+
+    start, end = elementor.page_doc(html, post_id)
+    urls = el_image_urls(html[start:end] + "\n" + css, origin)
+    assets, matched, failed = el_assets(out, urls, creds)
+
+    fonts = meas[1440].get("fonts") or []
+    texts = el_copy(elementor.copy_texts(html, post_id), meas[1440])
+    write_json(dj, {
+        "source": {"type": "elementor", "post_id": post_id, "url": url,
+                   "modified_gmt": post.get("modified_gmt"), "width": 1440,
+                   "viewport_h": VIEWPORT_H, "fonts": fonts,
+                   "ref_drift": ref_drift, "render_drift": render_drift,
+                   "ref_blank": {w: len(b) for w, b in blank.items()},
+                   "shot_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+        "texts": texts, "sections": el_sections(meas[1440]),
+        "widths": {str(w): {"texts": el_texts(meas[w]), "sections": el_sections(meas[w])}
+                   for w in EL_WIDTHS},
+        "frames": [], "tokens": {}, "comments": [], "assets": assets})
+
+    print(f"snapshot  build/{slug}/elementor/live.html (vh pinned to {VIEWPORT_H}px)")
+    print(f"design    design.png 1440, " + ", ".join(f"design-{w}.png" for w in EL_WIDTHS)
+          + " — header, footer, popups hidden")
+    hidden = sum(1 for t in texts if t.get("hidden"))
+    short = sum(1 for t in texts if t.get("unmeasured"))
+    print(f"copy      {len(texts)} string(s) from the page's HTML: {hidden} not "
+          f"rendered at 1440 (flagged hidden), {short} too short to measure "
+          f"(flagged unmeasured)")
+    print("runs      " + ", ".join(f"{len(meas[w].get('runs') or [])} at {w}"
+                                   for w in (1440,) + EL_WIDTHS))
+    for w in (1440,) + EL_WIDTHS:
+        d, r = ref_drift[str(w)], render_drift[str(w)]
+        if abs(d) > DRIFT_TOL:
+            print(f"WARN      ref drift at {w}: design{'' if w == 1440 else '-%d' % w}.png "
+                  f"is {d:+d}px against the body measured in the same render — the "
+                  f"body outgrew the window and the reference is cut; positions "
+                  f"below that point have no picture.")
+        if blank[str(w)]:
+            b = blank[str(w)]
+            print(f"WARN      ref mismatch at {w}: {len(b)} of "
+                  f"{len(meas[w].get('runs') or [])} text boxes have nothing drawn "
+                  f"under them in design{'' if w == 1440 else '-%d' % w}.png, first "
+                  f"{b[0]['text'][:30]!r} at y={b[0]['y']} — the picture and the "
+                  f"numbers disagree from there down.")
+        if abs(r) > DRIFT_TOL:
+            print(f"WARN      render drift at {w}: the body measured {r:+d}px "
+                  f"between two loads — some widget settles differently each time; "
+                  f"positions below it are not reliable to {DRIFT_TOL}px.")
+    print(f"fonts     {', '.join(fonts) or '(none reported)'}")
+    wanted = el_font_families(fonts)
+    got, lacking = el_fonts(out, html, final, wanted)
+    n = sum(len(v) for v in got.values())
+    if n:
+        print(f"fonts     {n} file(s) -> build/{slug}/assets/fonts "
+              f"({', '.join(sorted(got))}); the preview serves them from the build")
+    for fam, why in lacking.items():
+        print(f"warn      fonts: {why}")
+    if not {"Roboto", "Raleway"} & set(fonts):
+        print("warn      fonts: neither Roboto nor Raleway loaded on this page — "
+              "the raw page only gets the fonts the site's header and kit load, "
+              "so check what this page's copy will fall back to.")
+    tiers = collections.Counter(w_["tier"] for w_ in inv["widgets"])
+    print(f"widgets   {len(inv['widgets'])} (tier 1: {tiers[1]}, tier 2: {tiers[2]}, "
+          f"tier 3: {tiers[3]}), template {inv['template'] or '(default)'}")
+    for t in inv["tier3"]:
+        print(f"tier 3: {t} — no recipe in references/elementor-widgets.md yet")
+    pq = [q for q in inv["posts_queries"] if q.get("posts_include_term_ids")]
+    if pq:
+        terms = sorted({str(i) for q in pq for i in q["posts_include_term_ids"]},
+                       key=lambda x: (len(x), x))
+        print(f"posts     {len(inv['posts_queries'])} widget(s), term id(s) "
+              f"{', '.join(terms)} — check these exist in the target language "
+              f"(push --language warns for each one that does not)")
+    print("popups    " + (", ".join(str(p) for p in inv["popups"]) or "none")
+          + ("  — check which popup each language actually loads" if inv["popups"] else ""))
+    if css_from:
+        print(f"responsive {len(inv['responsive']['1024'])} rule(s) at <=1024, "
+              f"{len(inv['responsive']['767'])} at <=767, from {css_from}")
+    else:
+        print(f"responsive none: no post-{post_id}.css and no .elementor-{post_id} "
+              f"rules inline either")
+    print(f"assets    {len(urls)} image(s): {matched} in the media library, "
+          f"{len(urls) - matched} not (Elementor thumbs or unmatched) — "
+          f"none is re-uploaded by push")
+    for f_ in failed:
+        print(f"          download failed: {f_}", file=sys.stderr)
+    print(f"\nbuild/{slug}/ is ready. Next: write page.html against design.png, "
+          f"then verify {slug}, preview, diff.")
+
+
 def cmd_extract(args):
     if getattr(args, "from_", None) == "claude-design":
         return extract_claude_design(args)
+    if getattr(args, "from_", None) == "elementor":
+        return extract_elementor(args)
     if os.path.isdir(args.source):
         return extract_from_export(args)
     args.url = args.source
@@ -1784,6 +2528,90 @@ def section_range(out, name, through=False):
     return lo - 8, v["design_y"] + v["design_span"] + 8
 
 
+def css_shortcode_hits(css):
+    """Shortcode-looking text in a stylesheet.
+
+    page.css is inlined into post_content, and WordPress runs do_shortcode over
+    all of it — a CSS comment that says "[wpb_post_list]" executes the
+    shortcode and takes the stylesheet down with it. Inside a comment any
+    "[name" counts; outside one only a name with an underscore does, because
+    attribute selectors (`[data-x]`, `[href^=...]`) never carry one.
+    """
+    hits = []
+    for m in re.finditer(r"/\*.*?\*/", css, re.S):
+        hits += re.findall(r"\[/?[a-z_][a-z0-9_-]*", m.group(0), re.I)
+    bare = re.sub(r"/\*.*?\*/", " ", css, flags=re.S)
+    hits += re.findall(r"\[/?[a-z][a-z0-9]*_[a-z0-9_]*", bare, re.I)
+    return hits
+
+
+def spaced_hyphens(html):
+    """Text-node runs like "Gemini - Google Workspace".
+
+    The site's wptexturize turns a spaced hyphen into an en dash on the live
+    page, so the copy no longer matches the design. Writing it as &#45; stops
+    that, and strip_tags unescapes entities, so the copy check still passes.
+    Entities are deliberately NOT decoded here: that is what lets &#45; clear.
+    """
+    t = re.sub(r"<(script|style)\b.*?</\1>|<!--.*?-->", " ", html, flags=re.S | re.I)
+    t = re.sub(r"<[^>]*>", "", t)
+    return [m.group(0) for m in re.finditer(r"\S - \S", t)]
+
+
+def load_copy(out):
+    """build/<slug>/copy.json, or None when the page has none.
+
+    A page built in another language than its design (the Elementor original
+    is English, the page being built is Chinese) cannot pass a check against
+    the design's own strings. copy.json says what each one becomes:
+    {"mode": "verbatim" | "translated", "source": "user" | "claude-draft",
+     "approved": bool, "entries": [{"i": <design.json texts[].i>, "from": str,
+     "to": str | null}]}. A file that cannot be read the way it was written is
+    refused outright, because every check after this one would run on a guess.
+    """
+    path = os.path.join(out, "copy.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cp = json.load(fh)
+    except ValueError as e:
+        die("BAD_COPY_JSON", f"copy.json is not valid JSON: {e}")
+    if not isinstance(cp, dict):
+        die("BAD_COPY_JSON", "copy.json must be an object")
+    if cp.get("mode") not in ("verbatim", "translated"):
+        die("BAD_COPY_JSON", f"mode {cp.get('mode')!r} is not 'verbatim' or 'translated'")
+    cp.setdefault("source", "user")
+    if cp["source"] not in ("user", "claude-draft"):
+        die("BAD_COPY_JSON", f"source {cp['source']!r} is not 'user' or 'claude-draft'")
+    entries = cp.setdefault("entries", [])
+    if not isinstance(entries, list):
+        die("BAD_COPY_JSON", "entries must be a list")
+    for n, e in enumerate(entries):
+        if not isinstance(e, dict) or type(e.get("i")) is not int:
+            die("BAD_COPY_JSON", f"entries[{n}] needs an integer 'i'")
+        if e.get("to") is not None and not isinstance(e["to"], str):
+            die("BAD_COPY_JSON", f"entries[{n}] (#{e['i']}): 'to' must be a string or null")
+    return cp
+
+
+def translated_texts(design_texts, cp, warnings):
+    """design texts with `text` swapped for the translation, so the copy and
+    hard-break checks run on what the page should say. Position and scope stay
+    the design's own. `src` keeps the design string, which is what dropped.json
+    keys are written against. A string with no translation keeps text "" and
+    is reported by the caller as untranslated."""
+    by_i = {e["i"]: e for e in cp["entries"]}
+    out = []
+    for t in design_texts:
+        e = by_i.get(t["i"])
+        to = ((e or {}).get("to") or "")
+        if e and isinstance(e.get("from"), str) and squash(e["from"]) != squash(t["text"]):
+            warnings.append(f"copy.json #{t['i']} 'from' differs from design.json")
+        out.append({**t, "text": to if squash(to) else "", "src": t["text"]})
+    return out
+
+
 def run_checks(out, report=False, section=None, through=None):
     """Every check, returned rather than printed, so push can run them too."""
     dj = os.path.join(out, "design.json")
@@ -1807,6 +2635,18 @@ def run_checks(out, report=False, section=None, through=None):
     errors, warnings, skipped = [], [], 0
     used = set()
     texts = design["texts"]
+    # Translated: every check below reads the `to` string instead of the
+    # design's. verbatim, or no copy.json at all, is the design's own copy.
+    cp = load_copy(out)
+    translated = bool(cp) and cp["mode"] == "translated"
+    if translated:
+        if cp["source"] == "claude-draft" and cp.get("approved") is not True:
+            errors.append("COPY_NOT_APPROVED: copy.json source is claude-draft "
+                          "and approved is not true")
+        texts = translated_texts(texts, cp, warnings)
+        all_to = texts          # before --section narrows it
+    else:
+        texts = [{**t, "src": t["text"]} for t in texts]
     band = None
     if section or through:
         band = section_range(out, through or section, through=bool(through))
@@ -1819,9 +2659,18 @@ def run_checks(out, report=False, section=None, through=None):
                   f"before pushing.")
     for t in texts:
         s = squash(t["text"])
+        # A dropped key is written against the design's string; the page's
+        # translation of it may not hold the key at all.
+        hit = [k for k in dropped if k and (k in squash(t["src"]) or k in s)]
+        if translated and not s:
+            if hit:
+                skipped += 1
+                used |= set(hit)
+            else:
+                errors.append(f'untranslated (#{t["i"]}): {t["src"].strip()[:70]}')
+            continue
         if not s or s in body:
             continue
-        hit = [k for k in dropped if k and k in s]
         if hit:
             skipped += 1
             used |= set(hit)
@@ -1849,6 +2698,8 @@ def run_checks(out, report=False, section=None, through=None):
             if nm:
                 assetish.add(squash("%s (%s)" % (f_, nm)))
     all_copy = [squash(t["text"]) for t in design["texts"]]
+    if translated:
+        all_copy += [squash(t["text"]) for t in all_to]
     for k in sorted(dropped):
         if not k or k in assetish:
             continue
@@ -1874,13 +2725,23 @@ def run_checks(out, report=False, section=None, through=None):
         parts = [p for p in re.split(r"[\u2028\u2029\n]", t["text"]) if squash(p)]
         if len(parts) < 2:
             continue
-        if any(k and k in squash(t["text"]) for k in dropped):
+        if any(k and (k in squash(t["text"]) or k in squash(t["src"])) for k in dropped):
             continue
         if "\x00".join(squash(p) for p in parts) not in marked:
             errors.append(
                 f'hard break not reproduced (#{t["i"]}, y={t["y"]}): the file '
                 f'breaks after {squash(parts[0])[-28:]!r} — put a <br> there. '
                 f'U+2028 in the markup will not do it.')
+
+    # CSS and text rules that only the assembled page can break.
+    page_css = "\n".join(re.findall(r"<style[^>]*>(.*?)</style>", html, re.S | re.I))
+    for hit in sorted(set(css_shortcode_hits(page_css))):
+        errors.append(f'shortcode in CSS: {hit!r} — WordPress runs shortcodes '
+                      f'over the whole body, comments included, and the '
+                      f'stylesheet dies. Reword the comment or the selector')
+    for hit in sorted(set(spaced_hyphens(html))):
+        warnings.append(f'spaced hyphen: {hit!r} — the site turns " - " into an '
+                        f'en dash. Write &#45; for the hyphen')
 
     # The theme paints bare <button>s itself. elementor-kit-7676 sets a
     # background on `button` and a different one on `button:hover, button:focus`
@@ -2342,7 +3203,7 @@ def run_checks(out, report=False, section=None, through=None):
     for w in warnings:
         print(f"warn  {w}")
     total = len(texts)
-    print(f"\n{total - len([e for e in errors if e.startswith('copy')])}/{total} "
+    print(f"\n{total - len([e for e in errors if e.startswith(('copy missing', 'untranslated'))])}/{total} "
           f"strings matched ({skipped} dropped on purpose)")
     print(f"{len(errors)} errors, {len(warnings)} warnings")
     return errors, warnings
@@ -2358,17 +3219,21 @@ def run_checks(out, report=False, section=None, through=None):
 # like a browser problem. `doctor` syntax-checks the file now.
 with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                        "measure.js"), encoding="utf-8") as _fh:
-    MEASURE_JS = "<script>\n" + _fh.read() + "</script>"
+    MEASURE_SRC = _fh.read()
+MEASURE_JS = "<script>\n" + MEASURE_SRC + "</script>"
 
 
-def dump_dom(url, width=1440, timeout=180):
-    """The page's DOM after its scripts have run."""
+def dump_dom(url, width=1440, timeout=180, tall=20000, budget=6000, png=None):
+    """The page's DOM after its scripts have run. With png, the same run also
+    saves a screenshot of the window, so the picture and the numbers describe
+    one render rather than two that may have settled differently."""
     # Without a window size Chrome uses its default width, the page reflows to
     # something no one will ever see, and every measurement describes that
     # instead. The design's own width is the only one worth measuring at.
+    shot = ["--force-device-scale-factor=1", f"--screenshot={png}"] if png else []
     r = subprocess.run([chrome("audit"), *CHROME_FLAGS,
-                        f"--window-size={width},20000",
-                        "--virtual-time-budget=6000", "--dump-dom", url],
+                        f"--window-size={width},{tall}",
+                        f"--virtual-time-budget={budget}", *shot, "--dump-dom", url],
                        capture_output=True, timeout=timeout)
     return r.stdout.decode("utf-8", "replace")
 
@@ -2538,14 +3403,29 @@ def cmd_audit(args):
           + f"\n          {len(sure)} of them unique on both sides and used "
             f"to place it\n")
 
+    def frag(el, t):
+        return (el.get("by") is not None
+                and len(norm_text(el["text"])) + 4 < len(norm_text(t["text"])))
+
     def rect(el, t):
         """Where to measure this pair. A page run that carries only part of
         the design string is an inline fragment of a bigger block — the design
         node covers the whole block, so compare block to block. Otherwise the
         run's own rect is the tighter, better answer."""
-        if el.get("by") is not None and len(norm_text(el["text"])) + 4 < len(norm_text(t["text"])):
+        if frag(el, t):
             return el["by"], el["bh"]
+        # An Elementor reference's y is where the text starts, so measure the
+        # page the same way; the element's own top says nothing once padding
+        # or a wrapper span differs. Older runs and Figma designs: the box.
+        if "box_y" in t and el.get("ty") is not None:
+            return el["ty"], el["h"]
         return el["y"], el["h"]
+
+    def ry(el, t):
+        """The reference's y on the same footing as rect(): a block-to-block
+        comparison takes the design element's own top, which an Elementor
+        design.json keeps as box_y while its y is where the text starts."""
+        return t["box_y"] if frag(el, t) and "box_y" in t else t["y"]
 
     rows = []
     prev = None
@@ -2565,7 +3445,7 @@ def cmd_audit(args):
                    and lcount[norm_text(el["text"])[:40]] == 1
                    and 0 <= t["x"] < fw_w)
         if certain and not el.get("inner"):
-            dy = rect(el, t)[0] - t["y"]
+            dy = rect(el, t)[0] - ry(el, t)
             if prev is not None and abs(dy - prev) > args.tolerance:
                 bad.append(("gap above", f"{dy - prev:+d}px"))
             prev = dy
@@ -2583,11 +3463,22 @@ def cmd_audit(args):
             da = t.get("align", "left")
             if da != el.get("align", "left"):
                 bad.append(("align", f'{el.get("align","left")} vs {da}'))
+            # On an Elementor design.json x is where the text starts but w is
+            # still the element's width, so a centre or right edge has to come
+            # from the kept element box (box_x), not from x. A Figma text node
+            # has no box_x: its x and w are one box already.
+            rx = t.get("box_x", t["x"])
+            edge = {el.get("align"), da} & {"center", "right"}
             if (el.get("align") == "center" or da == "center") and t.get("w"):
                 ox = ((el["x"] + pl + (el.get("w", 0) - pl - pr) / 2)
-                      - (t["x"] + t["w"] / 2) - dx)
+                      - (rx + t["w"] / 2) - dx)
                 ox = int(round(ox))
                 label = "centre"
+            elif edge and "box_x" in t:
+                # A centred or right-aligned line's ink start moves with the
+                # line's width, so compare box to box.
+                ox = int(round(el["x"] - rx - dx))
+                label = "x"
             else:
                 ox = int(round(el["x"] + pl - t["x"] - dx))
                 label = "x"
@@ -2674,18 +3565,18 @@ def cmd_audit(args):
         # further down the frame, and the section read -197px when its own
         # content was within 30. Every honest pair in a section shares roughly
         # one offset, so keep the ones near the median and say how many went.
-        offs = sorted(rect(e, t)[0] - t["y"] for e, t in mine)
+        offs = sorted(rect(e, t)[0] - ry(e, t) for e, t in mine)
         med = offs[len(offs) // 2]
         dev = sorted(abs(o - med) for o in offs)
         tol = max(150.0, 4 * dev[len(dev) // 2])
-        keep = [(e, t) for e, t in mine if abs((rect(e, t)[0] - t["y"]) - med) <= tol]
+        keep = [(e, t) for e, t in mine if abs((rect(e, t)[0] - ry(e, t)) - med) <= tol]
         outliers = len(mine) - len(keep)
         if len(keep) >= 2:
             mine = keep
         mine = mine + segs
-        dy0 = min(t["y"] for _, t in mine)
-        dy1 = max(t["y"] + (t.get("h") or (t.get("type") or {}).get("lh") or 0)
-                  for _, t in mine)
+        dy0 = min(ry(e, t) for e, t in mine)
+        dy1 = max(ry(e, t) + (t.get("h") or (t.get("type") or {}).get("lh") or 0)
+                  for e, t in mine)
         py0 = min(rect(e, t)[0] for e, t in mine)
         py1 = max(sum(rect(e, t)) for e, t in mine)
         smap[sec["name"]] = {"page_y": sec["y"], "page_box_h": sec["h"],
@@ -3187,15 +4078,100 @@ def site_shell(out, refresh=False, sample=None):
     return sheet, shell
 
 
-def local_font_css(out):
-    """@font-face for a face shipped in the build, so a measurement never
-    depends on a network fetch that headless Chrome does not make."""
-    f = os.path.join(out, "assets", "fonts", "raleway.woff2")
-    if not os.path.exists(f):
-        return ""
-    return ("<style>@font-face{font-family:'Raleway';"
-            "src:url('assets/fonts/raleway.woff2') format('woff2');"
-            "font-weight:100 900;font-style:normal;font-display:block}</style>")
+def local_font_css(out, families=("Raleway",)):
+    """@font-face for a face shipped in the build (assets/fonts/<family>.woff2),
+    so a measurement never depends on a network fetch that headless Chrome does
+    not make."""
+    css = ""
+    for fam in families:
+        rel = "assets/fonts/" + font_slug(fam) + ".woff2"
+        if os.path.exists(os.path.join(out, rel)):
+            css += (f"<style>@font-face{{font-family:'{fam}';"
+                    f"src:url('{rel}') format('woff2');"
+                    "font-weight:100 900;font-style:normal;font-display:block}</style>")
+    return css
+
+
+# Icon faces are in document.fonts too, but Google Fonts does not host them and
+# one unknown family makes the whole css2 request fail.
+ICON_FONT = re.compile(r"icon|awesome|dashicons|swiper|glyph|symbol|elementskit", re.I)
+WEIGHTED = {"Roboto", "Raleway"}
+FONT_MIME = {"woff2": "woff2", "woff": "woff", "ttf": "truetype", "otf": "opentype"}
+FONT_FILE = re.compile(r"^(?P<fam>.+?)-(?P<w>\d+(?:-\d+)?)(?P<it>-italic)?\.(?P<ext>woff2|woff|ttf|otf)$")
+
+
+def font_slug(family):
+    return re.sub(r"[^a-z0-9]+", "-", family.lower()).strip("-")
+
+
+def el_font_families(fonts):
+    """The families of a reference worth loading: what it reported, minus icon
+    faces; Roboto (the site's own) when it reported nothing."""
+    fams = []
+    for f in fonts or []:
+        if f and not ICON_FONT.search(f) and f not in fams:
+            fams.append(f)
+    return fams or ["Roboto"]
+
+
+def read_design(out):
+    try:
+        with open(os.path.join(out, "design.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def downloaded_font_css(out, family):
+    """@font-face rules for the files extract downloaded for family
+    (assets/fonts/<family>-<weight>[-italic].<ext>)."""
+    d = os.path.join(out, "assets", "fonts")
+    css = ""
+    for name in sorted(os.listdir(d)) if os.path.isdir(d) else []:
+        m = FONT_FILE.match(name)
+        if not m or m.group("fam") != font_slug(family):
+            continue
+        css += (f"@font-face{{font-family:'{family}';"
+                f"src:url('assets/fonts/{name}') format('{FONT_MIME[m.group('ext')]}');"
+                f"font-weight:{m.group('w').replace('-', ' ')};"
+                f"font-style:{'italic' if m.group('it') else 'normal'};"
+                "font-display:block}")
+    return f"<style>{css}</style>" if css else ""
+
+
+def preview_fonts(out, design):
+    """The preview's (font <link>, local faces). Figma and Claude Design
+    builds get Raleway, as they always did. An Elementor build gets what the
+    reference actually loaded (design.json source.fonts): the site names Raleway
+    in its stylesheets and loads Roboto, so a Raleway preview measures glyph
+    widths no visitor sees. The faces come from the files extract downloaded
+    into assets/fonts, so nothing is fetched at preview time; only a family with
+    no file falls back to a Google Fonts link (headless Chrome never receives
+    it, but a person's browser does)."""
+    src = (design or {}).get("source") or {}
+    if src.get("type") != "elementor":
+        return ('<link href="https://fonts.googleapis.com/css2?family=Raleway:'
+                'wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700'
+                '&display=swap" rel="stylesheet">', local_font_css(out))
+    local, linked = "", []
+    for fam in el_font_families(src.get("fonts")):
+        css = downloaded_font_css(out, fam) or local_font_css(out, [fam])
+        if css:
+            local += css
+        else:
+            linked.append(fam)
+    link = ""
+    if linked:
+        q = "&family=".join(urllib.parse.quote_plus(f) + (":wght@400;500;600;700"
+                                                          if f in WEIGHTED else "")
+                            for f in linked)
+        link = ('<link href="https://fonts.googleapis.com/css2?family=' + q +
+                '&display=swap" rel="stylesheet">')
+    return link, local
+
+
+def preview_font_html(out, design):
+    return "".join(preview_fonts(out, design))
 
 
 MOBILE_WRAP = """<!doctype html><meta charset="utf-8"><title>mobile</title>
@@ -3209,12 +4185,34 @@ MOBILE_WRAP = """<!doctype html><meta charset="utf-8"><title>mobile</title>
 // top document only, so republish what the frame sends up.
 addEventListener('message', function (e) {
   if (!e.data || !e.data.fwMeasure) { return; }
-  var s = document.createElement('script');
+  var s = document.getElementById('fw-measure') || document.createElement('script');
   s.type = 'application/json'; s.id = 'fw-measure';
   s.textContent = e.data.fwMeasure;
   document.body.appendChild(s);
 });
 </script>"""
+
+
+def el_reference_keys(ref_texts, cp, n):
+    """What each text the original had at a width is called on the rebuilt page,
+    as (record, first n normalised characters). A translated build says
+    different words in the same places, so a string pairs through the copy
+    entry that names it (`from` -> `to`); an untranslated one, or no copy.json,
+    is its own text. A reference run is cut at 90 characters and the entry's
+    `from` is the whole string, so a run pairs with the entry it is the start of."""
+    to = {}
+    if cp and cp["mode"] == "translated":
+        for e in cp["entries"]:
+            if isinstance(e.get("from"), str) and e.get("to"):
+                to.setdefault(norm_text(e["from"]), norm_text(e["to"]))
+    out = []
+    for r in ref_texts:
+        t = norm_text(r.get("text", ""))
+        word = to.get(t)
+        if word is None and to and len(t) >= 3:
+            word = next((v for k, v in to.items() if k.startswith(t)), None)
+        out.append((r, (word or t)[:n]))
+    return out
 
 
 def cmd_mobile(args):
@@ -3242,9 +4240,24 @@ def cmd_mobile(args):
     if not m:
         die("NO_MEASURE", "the frame never reported. Is the preview server "
                           "running, and is measure.js loading?")
-    mob = json.loads(m.group(1)).get("mobile")
+    meas = json.loads(m.group(1))
+    mob = meas.get("mobile")
     if not mob:
         die("NO_MOBILE", "measure.js is older than this command.")
+
+    # An Elementor build kept the original page's own phone and tablet layouts
+    # as references: what the page did at this width is the answer to "is this
+    # phone layout right", so it is the yardstick instead of the house rules
+    # alone.
+    el_ref = None
+    try:
+        with open(os.path.join(out, "design.json"), encoding="utf-8") as fh:
+            design = json.load(fh)
+    except (OSError, ValueError):
+        design = {}
+    el = (design.get("source") or {}).get("type") == "elementor"
+    if el:
+        el_ref = (design.get("widths") or {}).get(str(args.width))
 
     # The phone rules restate desktop values — line-heights above all, since
     # every one of them is an absolute px taken from the frame. Writing them
@@ -3283,7 +4296,19 @@ def cmd_mobile(args):
     else:
         print(f"overflow  none (scrollWidth {mob['scrollW']})")
 
+    # copy.json first: a translated page is paired with the original through it.
+    cp = load_copy(out)
+    translated = bool(cp) and cp["mode"] == "translated"
+
     small = mob["small"]
+    # Small text the original page has too is the design's own, not a slip of
+    # the rebuild: keyed on the first 26 characters, which is all `small` keeps.
+    noted = []
+    if el_ref:
+        had = {k for r, k in el_reference_keys(el_ref.get("texts") or [], cp, 26)
+               if ((r.get("type") or {}).get("size") or 16) < 16}
+        noted = [t for t in small if norm_text(t["txt"])[:26] in had]
+        small = [t for t in small if t not in noted]
     if small:
         bad += 1
         print(f"under 16  {len(small)} text element(s) — the site holds 16px as "
@@ -3292,8 +4317,25 @@ def cmd_mobile(args):
             print(f"          {t['fs']:<6} .{t['cls'][:30]:<30} {t['txt']!r}")
     else:
         print("under 16  none")
+    if noted:
+        print(f"          note: {len(noted)} more are under 16 on the original "
+              f"page at {args.width}px too")
+        for t in noted[:8]:
+            print(f"          {t['fs']:<6} .{t['cls'][:30]:<30} {t['txt']!r}")
 
     tap = mob["tap"]
+    # The original is the spec here too. All design.json keeps of its links is
+    # a text run with its element's box, so only a run that IS the <a> or
+    # <button> says how big the original's target was: Elementor's button label
+    # sits in a span inside the link, whose box is the span's. Those decide
+    # nothing, and the finding stays (keyed on the 18 characters `tap` keeps).
+    tap_noted = []
+    if el_ref:
+        had = {k for r, k in el_reference_keys(el_ref.get("texts") or [], cp, 18)
+               if r.get("tag") in ("a", "button")
+               and ((r.get("h") or 99) < 40 or (r.get("w") or 99) < 40)}
+        tap_noted = [t for t in tap if norm_text(t["txt"])[:18] in had]
+        tap = [t for t in tap if t not in tap_noted]
     if tap:
         bad += 1
         print(f"tap < 40  {len(tap)} link(s)/button(s)")
@@ -3301,6 +4343,11 @@ def cmd_mobile(args):
             print(f"          {t['box']:<10} .{t['cls'][:28]:<28} {t['txt']!r}")
     else:
         print("tap < 40  none")
+    if tap_noted:
+        print(f"          note: {len(tap_noted)} more are under 40 on the original "
+              f"page at {args.width}px too")
+        for t in tap_noted[:8]:
+            print(f"          {t['box']:<10} .{t['cls'][:28]:<28} {t['txt']!r}")
 
     lefts = sorted(((int(k), v) for k, v in mob["lefts"].items()),
                    key=lambda kv: -kv[1])
@@ -3310,10 +4357,22 @@ def cmd_mobile(args):
     if lefts:
         print("gutter    " + "  ".join(f"{x}px×{n_}" for x, n_ in lefts[:4]))
         jammed = [(x, n_) for x, n_ in lefts if x < 12]
+        # Content the original sat just as close to the edge is its own
+        # design. The reference has the same tally's inputs: a run wider than
+        # 120px, its element's left edge (box_x; x for a run measured without
+        # one). An edge offset within 1px of one of those is a note.
+        edge = {round(r.get("box_x", r.get("x", 99))) for r in
+                (el_ref or {}).get("texts") or [] if (r.get("w") or 0) > 120}
+        shared = [(x, n_) for x, n_ in jammed if any(abs(x - e) <= 1 for e in edge)]
+        jammed = [j for j in jammed if j not in shared]
         if jammed:
             bad += 1
             print("          content against the edge: "
                   + ", ".join(f"{x}px × {n_}" for x, n_ in jammed[:4]))
+        if shared:
+            print("          note: against the edge on the original page at "
+                  f"{args.width}px too: "
+                  + ", ".join(f"{x}px × {n_}" for x, n_ in shared[:4]))
 
     # A square box is only wrong when the file is not square — three 60x60
     # icons drawn 60x60 are fine, a 467x67 wordmark drawn 240x240 is not.
@@ -3328,6 +4387,45 @@ def cmd_mobile(args):
               f"give them aspect-ratio")
         for i in odd[:6]:
             print(f"          .{i['cls'][:30]:<30} nat {i['nat']} box {i['box']}")
+
+    # A translated page has other words in the same places: a Chinese line is
+    # narrower and an English one wraps differently, so a text-by-text position
+    # check would flag every string. What must still hold is the page's
+    # rhythm: where each section starts and how tall it is.
+    if el:
+        label = "sections" if translated else "positions"
+        if not el_ref:
+            print(f"{label} skipped — the original was only measured at "
+                  f"{', '.join(str(k) for k in design.get('widths') or {})}px, "
+                  f"not {args.width}")
+        elif translated:
+            live = el_sections(meas)
+            off = compare_sections(el_ref.get("sections") or [], live, args.tolerance)
+            if off:
+                bad += 1
+                print(f"sections  {len(off)} section(s) more than ±{args.tolerance}px "
+                      f"from the original at {args.width}px")
+                for o_ in off[:8]:
+                    print(f"          dy {o_['dy']:+d} dh {o_['dh']:+d}  "
+                          f"{str(o_['name'])[:50]!r}")
+            else:
+                print(f"sections  none beyond ±{args.tolerance}px "
+                      f"({len(live)} section(s) measured)")
+        else:
+            # The run's own coordinates are the frame's; the reference's are
+            # the root's. Subtract the root so both start at the same corner.
+            live = el_texts(meas)
+            off = compare_positions(el_ref.get("texts") or [], live, args.tolerance)
+            if off:
+                bad += 1
+                print(f"positions {len(off)} text(s) more than ±{args.tolerance}px "
+                      f"from the original at {args.width}px")
+                for o_ in off[:8]:
+                    print(f"          dx {o_['dx']:+d} dy {o_['dy']:+d}  "
+                          f"{o_['text'][:50]!r}")
+            else:
+                print(f"positions none beyond ±{args.tolerance}px "
+                      f"({len(live)} run(s) measured)")
 
     print()
     print("0 findings" if not bad else f"{bad} kind(s) of finding above")
@@ -3377,8 +4475,11 @@ def cmd_preview(args):
         # shows its content, not the behaviour the file's own comment asks for
         # ("click a title to open, the previous one closes"). Open them for the
         # measurement only, so the two sides describe the same content; the
-        # page keeps shipping one-at-a-time.
-        page = re.sub(r'(<div class="acc-item)(")', r'\1 open\2', page)
+        # page keeps shipping one-at-a-time. An Elementor reference is the
+        # page as it loads (usually one item open), so there the build's own
+        # state is the one to compare.
+        if (read_design(root).get("source") or {}).get("type") != "elementor":
+            page = re.sub(r'(<div class="acc-item)(")', r'\1 open\2', page)
         return re.sub(r'src="(assets/[^"?]+)"', bust, page)
 
     # Claim the port first. Writing preview.html before binding means a second
@@ -3408,22 +4509,23 @@ def cmd_preview(args):
                           for w in reversed(wraps))
 
     def write_preview():
+        fonts_link, fonts_local = preview_fonts(root, read_design(root))
         with open(os.path.join(root, "preview.html"), "w", encoding="utf-8") as fh:
             fh.write('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                      '<meta name="viewport" content="width=device-width,initial-scale=1">'
                      f"<title>{args.slug} — preview</title>"
-                     '<link href="https://fonts.googleapis.com/css2?family=Raleway:'
-                     'wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700'
-                     '&display=swap" rel="stylesheet">'
                      # Headless Chrome never receives the Google Fonts file —
                      # document.fonts.check reported every weight of Raleway
                      # unloaded — so it measured a wider fallback, and boxes
                      # were being widened to compensate for a font that was
                      # never missing on the site itself. Serve the face out of
                      # the build when it is there.
-                     + (f'<link rel="stylesheet" href="site/site.css">'
-                        if site_css else "")
-                     + local_font_css(root) +
+                     + fonts_link +
+                     (f'<link rel="stylesheet" href="site/site.css">'
+                      if site_css else "") +
+                     # After the site's CSS, so these faces win over any the
+                     # cached stylesheet declares for the same family.
+                     fonts_local +
                      "<style>body{margin:0}</style></head>"
                      f'<body class="{body_cls}">' + open_wraps + build_page() +
                      close_wraps + MEASURE_JS +
@@ -3522,6 +4624,156 @@ def wp(method, path, *, body=None, raw=None, headers=None, creds=None):
 def ability(name, payload, creds=None):
     return wp("POST", f"/wp-json/wp-abilities/v1/abilities/{name}/run",
               body={"input": payload}, creds=creds)
+
+
+def ability_destructive(name, payload, creds=None):
+    """Run an ability the site marks destructive.
+
+    Those refuse POST (rest_ability_invalid_method) and a JSON `input=` param
+    ("not of type object"); they want DELETE with the input spelled as
+    bracketed query params, input[key]=value.
+    """
+    qs = "&".join(f"input[{k}]={urllib.parse.quote(str(v), safe='')}"
+                  for k, v in payload.items())
+    return wp("DELETE", f"/wp-json/wp-abilities/v1/abilities/{name}/run?{qs}",
+              creds=creds)
+
+
+def get_meta(post_id, key, creds=None):
+    """One post meta value via mc/get-meta: str, dict/list for structured meta
+    (e.g. _elementor_page_settings), "" when empty, None when absent.
+
+    The ability's input is {post_id: integer (required), meta_key: string}.
+    It answers flat {id, type, status, title, meta_key, meta_value}; an
+    {"output": {...}} wrapper is accepted too, the same two shapes push takes
+    for a created post's id. The value is returned as the site sent it: str()
+    on a dict is a Python repr, not JSON, and would corrupt the meta if
+    written back. `value` is a fallback name, in case an older build used it.
+    """
+    res = ability("mc/get-meta", {"post_id": int(post_id), "meta_key": key},
+                  creds=creds)
+    o = res.get("output") or res if isinstance(res, dict) else {}
+    for field in ("meta_value", "value"):
+        if o.get(field) is not None:
+            return o[field]
+    return None
+
+
+def set_meta(post_id, key, value, creds=None):
+    """Write one post meta value. ewpa/update-post-meta is destructive, so it
+    goes through ability_destructive."""
+    ability_destructive("ewpa/update-post-meta",
+                        {"post_id": int(post_id), "meta_key": key,
+                         "meta_value": value}, creds=creds)
+
+
+def wpml_languages(creds=None):
+    """The site's WPML language codes, read off the home page's hreflang links.
+
+    A public front-end page, not REST, so no auth header. WPML gives each
+    language a URL prefix (/zh-hk/); the default language has none, which is
+    `en` here. x-default repeats one of the others and is skipped.
+    """
+    base = creds[0] if creds else wp_creds()[0]
+    try:
+        with urllib.request.urlopen(
+                urllib.request.Request(base + "/", headers={"User-Agent": UA}),
+                timeout=60) as r:
+            html = r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError) as e:
+        # Runs before any write, so stopping here changes nothing.
+        die("NETWORK_ERROR", f"GET {base}/ (for the WPML languages) -> "
+                             f"{getattr(e, 'reason', e)}. Nothing was changed.")
+    langs = []
+    for tag in re.findall(r"<link\b[^>]*>", html, re.I):
+        attr = {k.lower(): v for k, _, v in
+                re.findall(r'([\w-]+)\s*=\s*(["\'])(.*?)\2', tag)}
+        if attr.get("rel", "").lower() != "alternate" or \
+                attr.get("hreflang", "").lower() in ("", "x-default"):
+            continue
+        seg = urllib.parse.urlparse(attr.get("href", "")).path.strip("/").split("/")[0]
+        code = (seg or "en").lower()
+        if code not in langs:
+            langs.append(code)
+    return langs
+
+
+def wpml_group(post_id, creds=None):
+    """(language, {post ids in its WPML group}) of a post, or None when the
+    answer cannot be read.
+
+    ewpa/get-post-translations is a read: {post_id, language, plugin,
+    translations: [{language, post_id, title, permalink, status}]}, flat or
+    under "output" like every ability here. REST pages carry no language or
+    group, and the front end lists only published translations (no drafts),
+    so this is the one place a draft's membership shows."""
+    res = ability("ewpa/get-post-translations", {"post_id": int(post_id)}, creds=creds)
+    o = (res.get("output") or res) if isinstance(res, dict) else None
+    tr = o.get("translations") if isinstance(o, dict) else None
+    if isinstance(tr, dict):         # a map keyed by language is the same list
+        tr = list(tr.values())
+    if not isinstance(tr, list):
+        return None
+    # This feeds a safety gate: an entry it cannot read means the group is
+    # not known, not that the entry is absent.
+    ids = set()
+    for t in tr:
+        try:
+            ids.add(int(t["post_id"]))
+        except (TypeError, ValueError, KeyError):
+            return None
+    return str(o.get("language") or "").lower(), ids
+
+
+def clear_elementor(post_id, *, data, creds=None):
+    """Turn a page WPML copied Elementor onto back into a raw-HTML page.
+
+    Joining a raw page to an Elementor original as its translation copies
+    _elementor_edit_mode ("builder"), and the page then renders Elementor
+    instead of post_content. Blank it. `data` also empties _elementor_data;
+    set_meta stringifies, so "[]" is the JSON empty list, not a Python repr.
+    """
+    set_meta(post_id, "_elementor_edit_mode", "", creds=creds)
+    if data:
+        set_meta(post_id, "_elementor_data", "[]", creds=creds)
+
+
+def page_wrapper(out):
+    """The page's own wrapper class (gehk-page) from page.html: the first
+    class ending in -page other than the shared mc-page. "" when there is none."""
+    with open(os.path.join(out, "page.html"), encoding="utf-8") as fh:
+        html = fh.read()
+    for attr in re.findall(r'class="([^"]*)"', html):
+        for c in attr.split():
+            if c.endswith("-page") and c != "mc-page":
+                return c
+    return ""
+
+
+def assert_raw(post_id, rendered, wrapper, creds=None, hint=""):
+    """After a push, the page must be raw HTML on the front end, not Elementor.
+
+    The meta check is what decides: _elementor_edit_mode empty or not (the live
+    experiment showed it alone switches the front end between Elementor and the
+    body). The wrapper-class check is only meaningful when `rendered` is the
+    front end's HTML, as after --replace. REST content.rendered, which usage A
+    passes, never runs Elementor, so it carries the wrapper whatever the meta
+    says and that check proves nothing there. `hint` ends either message:
+    after --replace it names the way back.
+    """
+    mode = get_meta(post_id, "_elementor_edit_mode", creds=creds)
+    if mode:
+        die("STILL_ELEMENTOR",
+            f"#{post_id} still has _elementor_edit_mode={mode!r}, so the site "
+            f"renders Elementor and not the pushed HTML.{hint}")
+    if not wrapper:
+        print("check     wrapper class not found in page.html; checked the "
+              "Elementor meta only")
+        return
+    if not re.search(r'class="[^"]*' + re.escape(wrapper), rendered or ""):
+        die("STILL_ELEMENTOR",
+            f"#{post_id} renders without class \"{wrapper}\", so the page "
+            f"is not drawing the pushed HTML (Elementor or a cached copy).{hint}")
 
 
 def cmd_setup(args):
@@ -3763,7 +5015,10 @@ def cmd_pull(args):
         print("page      this looks like an Elementor page — its layout is not "
               "in the body, so there is nothing here to edit. Stopping.",
               file=sys.stderr)
-        die("ELEMENTOR_PAGE", "pull only works on pages whose HTML is the body.")
+        die("ELEMENTOR_PAGE",
+            "pull only works on pages whose HTML is the body. To rebuild an "
+            "Elementor page as raw HTML, start from its render instead: "
+            "extract --from elementor <url>")
 
     styles = re.findall(r"<style[^>]*>.*?</style>", body, re.S)
     css = "\n\n".join(re.sub(r"</?style[^>]*>", "", x).strip() for x in styles)
@@ -3819,6 +5074,403 @@ def read_manifest(out):
         return json.load(fh)
 
 
+ELEMENTOR_META = ("_elementor_edit_mode", "_elementor_data", "_elementor_page_settings",
+                  "_wp_page_template", "_elementor_version", "_elementor_css",
+                  "_elementor_page_assets", "_elementor_controls_usage")
+
+
+# What --replace also writes on the original, beyond the Elementor meta above:
+# the page's own JS rides in post meta. Backed up with the rest so restore can
+# put it back; kept apart because ELEMENTOR_META is what makes a page Elementor.
+REPLACE_EXTRA_META = ("_wpbuddy_page_js",)
+
+
+def page_json(res):
+    """A REST page as a dict. A plugin can print a <style> block ahead of the
+    JSON, and wp() then hands back the whole thing as text."""
+    if isinstance(res, str):
+        i = res.find('{"id":')
+        if i < 0:
+            die("BAD_RESPONSE", f"no page JSON in: {res[:200]!r}")
+        res = json.loads(res[i:])
+    return res
+
+
+def backup_elementor(post_id, out, creds=None):
+    """Write everything that makes `post_id` an Elementor page to
+    backups/<id>-elementor-<stamp>.json and read it back. Revisions are off, so
+    this file is the only way back; if it cannot be written and read, nothing
+    may be overwritten. Meta goes in exactly as the site sent it."""
+    page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{int(post_id)}?context=edit",
+                        creds=creds))
+    rec = {"post_id": int(post_id), "modified_gmt": page.get("modified_gmt"),
+           "content_raw": (page.get("content") or {}).get("raw", ""),
+           "meta": {k: get_meta(post_id, k, creds=creds)
+                    for k in ELEMENTOR_META + REPLACE_EXTRA_META}}
+    # A backup that cannot bring the page back is no backup: refuse before
+    # anything is written, rather than let --replace overwrite a page it
+    # cannot restore (or one that was never built with Elementor).
+    mode, data = rec["meta"]["_elementor_edit_mode"], rec["meta"]["_elementor_data"]
+    if mode != "builder" or not data or data == "[]":
+        die("BACKUP_FAILED",
+            f"#{post_id} has nothing to restore (_elementor_edit_mode={mode!r}, "
+            f"_elementor_data empty={not data or data == '[]'}). Nothing was changed.")
+    stamp = re.sub(r"\D", "", str(rec["modified_gmt"] or "prev"))
+    path = os.path.join(out, "backups", f"{int(post_id)}-elementor-{stamp}.json")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(rec, fh, ensure_ascii=False, indent=1)
+        with open(path, encoding="utf-8") as fh:
+            back = json.load(fh)
+    except (OSError, ValueError) as e:
+        die("BACKUP_FAILED", f"{path}: {e}. Nothing was changed.")
+    if back != rec:
+        die("BACKUP_FAILED", f"{path} does not read back as what was written. "
+                             f"Nothing was changed.")
+    return path
+
+
+def backup_body(out, post_id, cur):
+    """Keep the body `cur` (a REST page, context=edit) holds now in
+    backups/<id>-<stamp>.html before it is overwritten. Revisions are off."""
+    bdir = os.path.join(out, "backups")
+    stamp = re.sub(r"\D", "", str(cur.get("modified_gmt") or "prev"))
+    bpath = os.path.join(bdir, f"{post_id}-{stamp}.html")
+    try:
+        os.makedirs(bdir, exist_ok=True)
+        with open(bpath, "w", encoding="utf-8") as fh:
+            fh.write((cur.get("content") or {}).get("raw", ""))
+    except OSError as e:
+        die("BACKUP_FAILED", f"{bpath}: {e}. Nothing was changed.")
+    return bpath
+
+
+def parse_identity(html):
+    """What search engines and the language switcher key a page by."""
+    def attrs(tag):
+        return {k.lower(): v for k, _, v in
+                re.findall(r'([\w-]+)\s*=\s*(["\'])(.*?)\2', tag)}
+    ident = {"title": "", "description": "", "hreflang": {}, "canonical": ""}
+    m = re.search(r"<title\b[^>]*>(.*?)</title>", html, re.S | re.I)
+    if m:
+        ident["title"] = squash(m.group(1))
+    for tag in re.findall(r"<(?:meta|link)\b[^>]*>", html, re.I):
+        a = attrs(tag)
+        rel = a.get("rel", "").lower()
+        if tag[:5].lower() == "<meta":
+            if a.get("name", "").lower() == "description":
+                ident["description"] = a.get("content", "")
+        elif rel == "canonical":
+            ident["canonical"] = a.get("href", "")
+        elif rel == "alternate" and a.get("hreflang"):
+            ident["hreflang"][a["hreflang"].lower()] = a.get("href", "")
+    return ident
+
+
+def bust(url):
+    """url with a throwaway query, so a cache that was just purged cannot
+    answer with the page it held a moment ago."""
+    return url + ("&" if "?" in url else "?") + f"fwcb={int(time.time())}"
+
+
+def public_identity(url):
+    """{"title", "description", "hreflang": {code: href}, "canonical"} of a
+    public page, from its front-end HTML. A URL that lands somewhere else is
+    not that page's identity: die ORIGINAL_REDIRECTS."""
+    try:
+        final, html = fetch_live(bust(url))
+    except (urllib.error.URLError, OSError) as e:
+        die("NOT_PUBLIC", f"{url} could not be read as a visitor: {e}. "
+                          f"Nothing was changed.")
+    norm = lambda u: urllib.parse.urlsplit(u)._replace(query="", fragment="").geturl().rstrip("/")
+    if norm(final) != norm(url):
+        die("ORIGINAL_REDIRECTS",
+            f"{url} answers from {final}, so its identity is that page's, not "
+            f"this one's. Nothing was changed.")
+    return parse_identity(html)
+
+
+def _replace_args(args):
+    """--replace changes the body only. Refused before any site call, even the
+    parent lookup."""
+    # The original keeps its title, parent and URL; the swap changes the body only.
+    for flag, val in (("--title", args.title), ("--parent", args.parent),
+                      ("--parent-path", args.parent_path),
+                      ("--page-slug", args.page_slug), ("--force", args.force)):
+        if val:
+            die("REPLACE_ARG", f"{flag} cannot be combined with --replace: the "
+                               f"original's title, place and URL stay as they are, "
+                               f"and no check is skipped.")
+
+
+def _replace_gate(out, meta, orig, args):
+    """The checks --replace needs before it reads or writes anything on the site.
+    Returns the design.json `source`."""
+    if args.post_id or getattr(args, "translation_of", None):
+        die("REPLACE_CONFLICT", "--replace picks the page itself; drop --post-id "
+                                "and --translation-of.")
+    if (args.post_type or meta.get("post_type") or "page") != "page":
+        die("REPLACE_CONFLICT", "--replace only swaps pages.")
+    draft = meta.get("post_id")
+    if not draft:
+        die("REPLACE_NO_DRAFT",
+            f"build/{args.slug}/wp.json has no post_id: push the reviewed page "
+            f"as a draft first, then --replace swaps it in.")
+    if int(draft) == orig:
+        die("REPLACE_DRAFT_IS_ORIGINAL",
+            f"wp.json's page is #{orig} itself, so there is no draft to swap in.")
+    if meta.get("replacing"):
+        r = meta["replacing"]
+        die("REPLACE_UNFINISHED",
+            f"an earlier --replace of #{r.get('orig')} stopped after it began "
+            f"writing. Its Elementor backup is build/{args.slug}/{r.get('backup')}. "
+            f"Run `elementor-restore {args.slug}` to put the page back from it "
+            f"(that also clears \"replacing\" from wp.json), or check what the "
+            f"page shows now.")
+    if meta.get("replaced"):
+        die("ALREADY_REPLACED",
+            f"this build already replaced #{meta['post_id']} (draft "
+            f"#{meta['replaced'].get('draft')}); nothing left to swap.")
+    dj = os.path.join(out, "design.json")
+    src = {}
+    if os.path.exists(dj):
+        with open(dj, encoding="utf-8") as fh:
+            src = json.load(fh).get("source") or {}
+    if src.get("type") != "elementor" or src.get("post_id") != orig:
+        die("REPLACE_WRONG_PAGE",
+            f"design.json is not an extract of #{orig} (source: "
+            f"{src.get('type')!r} #{src.get('post_id')}).")
+    if not src.get("url") or not src.get("modified_gmt"):
+        die("REPLACE_WRONG_PAGE", "design.json's source has no url or modified_gmt; "
+                                  "extract the page again.")
+    return src
+
+
+def page_assets(html):
+    """The local files the assembled body points at: assets/..."""
+    return sorted(set(re.findall(r'(?:src|poster)="(assets/[^"]+)"', html)))
+
+
+def asset_upload(out, rel, manifest):
+    """(upload?, sha) for one asset. Key on the bytes, not the path: keying on
+    the path alone means a corrected asset under the same filename is never
+    uploaded and the page silently keeps serving the old one — which is how a
+    logo with its background keyed out stayed opaque on the live page. An
+    entry with a url and no sha is on the site with nothing to compare against
+    (an image extract could not download): never re-upload it, never insist
+    the file is local."""
+    rec = manifest.get(rel, {})
+    if rec.get("url") and "sha" not in rec:
+        return False, None
+    local = os.path.join(out, rel)
+    if not os.path.exists(local):
+        die("ASSET_MISSING", local)
+    with open(local, "rb") as fh:
+        sha = hashlib.sha256(fh.read()).hexdigest()
+    return rec.get("sha") != sha, sha
+
+
+def with_media_urls(html, manifest):
+    for rel, rec in manifest.items():
+        html = html.replace(f'"{rel}"', f'"{rec["url"]}"')
+    return html
+
+
+def body_sha(html):
+    """The sha256 of a body as sent to mc/set-post-html."""
+    return hashlib.sha256(html.encode("utf-8")).hexdigest()
+
+
+def _replace_draft_check(out, meta, orig, draft, html, args, creds):
+    """--replace swaps in the draft the user signed off, and nothing else.
+    Reads only (REST GET and a read ability); every refusal comes before the
+    first write.
+
+    The draft must be a usage-B draft: verbatim copy, not published, outside
+    the original's WPML group and in its language — a usage-A translation
+    pushed with --replace put another language on the original and trashed
+    the live translation. And the build must still be what the draft shows:
+    the same body (sha recorded by the draft push), no asset changed since,
+    and the draft not edited in WordPress since."""
+    cp = load_copy(out)
+    if cp and cp.get("mode") == "translated":
+        die("REPLACE_NOT_A_DRAFT",
+            f"build/{args.slug}/copy.json is a translation, and a replace is "
+            f"verbatim: the original keeps its own words. A translated build is "
+            f"a new page (SKILL.md, From Elementor, usage A). Nothing was changed.")
+    page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{int(draft)}?context=edit"
+                               f"&_fields=id,status,modified_gmt", creds=creds))
+    if page.get("status") not in ("draft", "pending", "private"):
+        die("REPLACE_NOT_A_DRAFT",
+            f"wp.json's page #{draft} is {page.get('status')!r}, not a draft. "
+            f"--replace swaps in an unpublished draft of the original "
+            f"(SKILL.md, From Elementor, usage B). Nothing was changed.")
+    og, dg = wpml_group(orig, creds=creds), wpml_group(draft, creds=creds)
+    if og is None or dg is None:
+        die("REPLACE_NOT_A_DRAFT",
+            f"could not read the WPML group of #{orig if og is None else draft} "
+            f"(ewpa/get-post-translations), so #{draft} is not known to be a "
+            f"draft of its own. Nothing was changed.")
+    if int(draft) in og[1] or orig in dg[1]:
+        die("REPLACE_NOT_A_DRAFT",
+            f"#{draft} is in #{orig}'s WPML group: it is a translation of the "
+            f"original, not a draft of it. Replacing would put that page's "
+            f"language on the original. Nothing was changed.")
+    if not og[0] or not dg[0]:
+        die("REPLACE_NOT_A_DRAFT",
+            f"the language of #{orig if not og[0] else draft} could not be read, "
+            f"so #{draft} is not known to be in the original's language. "
+            f"Nothing was changed.")
+    if og[0] != dg[0]:
+        die("REPLACE_NOT_A_DRAFT",
+            f"#{draft} is in {dg[0]!r} and #{orig} in {og[0]!r}; a replace keeps "
+            f"the original's language. Nothing was changed.")
+    again = "Nothing was changed: re-push the draft and have it reviewed again."
+    if not meta.get("body_sha"):
+        die("REPLACE_DRAFT_STALE",
+            f"wp.json does not record what the draft #{draft} was pushed with "
+            f"(a push from before body_sha), so the build is not known to be "
+            f"what was reviewed. {again}")
+    manifest = read_manifest(out)
+    changed = [rel for rel in page_assets(html) if asset_upload(out, rel, manifest)[0]]
+    if changed:
+        die("REPLACE_DRAFT_STALE",
+            f"{', '.join(changed)} changed since the draft #{draft} was pushed. {again}")
+    if body_sha(with_media_urls(html, manifest)) != meta["body_sha"]:
+        die("REPLACE_DRAFT_STALE",
+            f"the build is no longer the body the draft #{draft} was pushed with. "
+            f"{again}")
+    # The page JS goes onto the original too, so it is held to the draft the
+    # same way. A wp.json from before js_sha has none and is refused like one
+    # without body_sha.
+    if body_sha(page_js(out)) != meta.get("js_sha"):
+        die("REPLACE_DRAFT_STALE",
+            f"page.js is no longer what the draft #{draft} was pushed with. {again}")
+    if page.get("modified_gmt") != meta.get("modified_gmt"):
+        die("REPLACE_DRAFT_STALE",
+            f"the draft #{draft} was edited in WordPress after it was pushed "
+            f"({meta.get('modified_gmt')} -> {page.get('modified_gmt')}), so what "
+            f"was reviewed is not this build. {again}")
+
+
+def _replace_finish(out, meta, orig, draft, before, ebackup, url, creds):
+    """After the body is on the original: purge, prove the front end is raw
+    HTML and still the same page to a search engine, then retire the draft."""
+    wp("PUT", "/wp-json/siteground-optimizer/v1/purge-cache", creds=creds)
+    back = os.path.join(out, ebackup)
+    try:
+        html = fetch_live(bust(url))[1]
+    except (urllib.error.URLError, OSError) as e:
+        die("IDENTITY_CHANGED",
+            f"#{orig} could not be read back from {url} ({e}), so it is not "
+            f"known to be the same page. The draft #{draft} was left alone. "
+            f"Elementor backup: {back} (restore with elementor-restore).")
+    assert_raw(orig, html, page_wrapper(out), creds=creds,
+               hint=f" The draft #{draft} was left alone. Put the Elementor page "
+                    f"back with `elementor-restore {os.path.basename(out)}` from "
+                    f"the Elementor backup {back}.")
+    now = parse_identity(html)
+    diffs = []
+    for k in ("title", "description", "canonical"):
+        if now[k] != before[k]:
+            diffs.append(f"{k}: {before[k]!r} -> {now[k]!r}")
+    for code in sorted(set(before["hreflang"]) | set(now["hreflang"])):
+        if before["hreflang"].get(code) != now["hreflang"].get(code):
+            diffs.append(f"hreflang {code}: {before['hreflang'].get(code)!r} -> "
+                         f"{now['hreflang'].get(code)!r}")
+    if diffs:
+        die("IDENTITY_CHANGED",
+            f"#{orig} no longer looks the same to a search engine:\n    "
+            + "\n    ".join(diffs)
+            + f"\n  The draft #{draft} was left alone. Put the Elementor page back "
+              f"with elementor-restore from {back}.")
+    # No force: the draft goes to the trash, where it can still be fetched.
+    wp("DELETE", f"/wp-json/wp/v2/pages/{int(draft)}", creds=creds)
+    print(f"draft     #{draft} moved to the trash")
+    page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit&_fields="
+                               f"id,slug,title,status,link,parent,modified_gmt",
+                        creds=creds))
+    # meta carries no "replacing": the swap is complete.
+    write_wp_meta(out, {**{k: v for k, v in meta.items() if k != "replacing"},
+                        "post_id": orig, "slug": page["slug"],
+                        "title": (page["title"] or {}).get("raw", ""),
+                        "parent": page.get("parent"), "link": page["link"],
+                        "status": page["status"], "modified_gmt": page["modified_gmt"],
+                        "replaced": {"draft": int(draft), "backup": ebackup},
+                        "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+    print(f"wp.json   #{orig} now, replaced draft #{draft}, edited {page['modified_gmt']}")
+
+
+def posts_term_gaps(queries, language, creds):
+    """Terms named by Elementor posts widgets that have no counterpart in
+    `language`: [(query index, taxonomy rest_base, term id, name or None)].
+
+    elementor.json carries term ids of the original's language. Each is read
+    back to a slug and name, then looked up in the target language by slug,
+    then by name (WPML often gives a translated term its own slug). A term whose
+    id cannot be read back is reported with name None — it cannot be checked.
+    GET only."""
+    missing, taxes = [], {}
+    for qi, q in enumerate(queries):
+        ids = [str(i) for i in q.get("posts_include_term_ids") or []]
+        if not ids:
+            continue
+        ptype = q.get("posts_post_type") or "post"
+        if ptype not in taxes:
+            tx = wp("GET", f"/wp-json/wp/v2/taxonomies?type={urllib.parse.quote(ptype)}",
+                    creds=creds) or {}
+            taxes[ptype] = [t["rest_base"] for t in tx.values()
+                            if isinstance(t, dict) and t.get("rest_base")]
+        for tid in ids:
+            found = None
+            for rb in taxes[ptype]:
+                hit = wp("GET", f"/wp-json/wp/v2/{rb}?include={urllib.parse.quote(tid)}"
+                                f"&lang=all&_fields=id,slug,name", creds=creds) or []
+                if hit:
+                    found = (rb, hit[0])
+                    break
+            if not found:
+                missing.append((qi, None, tid, None))
+                continue
+            rb, term = found
+            lang = urllib.parse.quote(language)
+            there = wp("GET", f"/wp-json/wp/v2/{rb}?slug={urllib.parse.quote(term['slug'])}"
+                              f"&lang={lang}&_fields=id,slug", creds=creds) or []
+            if not there and term.get("name"):
+                there = wp("GET", f"/wp-json/wp/v2/{rb}?search={urllib.parse.quote(term['name'])}"
+                                  f"&lang={lang}&_fields=id,name", creds=creds) or []
+                there = [t for t in there if t.get("name") == term["name"]]
+            if not there:
+                missing.append((qi, rb, tid, term.get("name") or term["slug"]))
+    return missing
+
+
+def warn_posts_terms(out, language, creds):
+    """push of an Elementor build: say which posts-widget terms the target
+    language lacks. A warning only — the page is still pushed — and never a
+    failure: a lookup that goes wrong is itself one more warning."""
+    try:
+        with open(os.path.join(out, "elementor.json"), encoding="utf-8") as fh:
+            queries = json.load(fh).get("posts_queries") or []
+    except (OSError, ValueError):
+        return
+    if not any(q.get("posts_include_term_ids") for q in queries):
+        return
+    try:
+        gaps = posts_term_gaps(queries, language, creds)
+    except (Exception, SystemExit) as e:    # wp() dies on HTTP errors
+        print(f"warn      posts: could not check the posts widgets' terms in "
+              f"{language} ({type(e).__name__}); check by hand that they exist")
+        return
+    for qi, rb, tid, name in gaps:
+        what = (f"{rb} term {name!r} (id {tid})" if name else
+                f"term id {tid}, which could not be read back to a name,")
+        print(f"warn      posts: widget #{qi + 1} lists {what} with no "
+              f"{language} counterpart — its [wpb_post_list] will be empty; "
+              f"hide the section when the list is empty")
+
+
 def cmd_push(args):
     # The build directory name and the page's URL slug are different things:
     # you want to try a design at a throwaway URL before it takes the real one.
@@ -3826,7 +5478,17 @@ def cmd_push(args):
     # pulling a page into build/anything and pushing it back renamed a live
     # URL to "anything" and 404'd the real one. Only --page-slug may rename.
     out = os.path.join(BUILD, args.slug)
+    if getattr(args, "replace", None):
+        _replace_args(args)
     creds = wp_creds()
+    # The site decides which languages exist, not this script. Check before
+    # anything is read from or written to a page.
+    langs = wpml_languages(creds)
+    if args.language not in langs:
+        die("BAD_LANGUAGE",
+            f"--language {args.language!r} is not a WPML language on this "
+            f"site. Available: {', '.join(langs) or '(none found)'}")
+    translation_of = getattr(args, "translation_of", None)
     parent_id = args.parent
     if args.parent_path:
         parent_id = resolve_parent(args.parent_path, creds, args.language)
@@ -3864,9 +5526,36 @@ def cmd_push(args):
     rest = rest_base(post_type)
     post_id = args.post_id or meta.get("post_id")
     created = False
+    # --replace: the build's page is a reviewed draft; the body goes to the
+    # Elementor original instead. Settle every refusal before touching the site.
+    replace = getattr(args, "replace", None)
+    if replace:
+        replace = int(replace)
+        src = _replace_gate(out, meta, replace, args)
+        draft_id, post_id = int(post_id), replace
+        _replace_draft_check(out, meta, replace, draft_id, html, args, creds)
 
     if not post_id and not args.title:
         die("NO_TITLE", "--title is required when creating a page")
+    # A page this build created, by a push that stopped before the page was
+    # known to be raw: wp.json says so ("creating"), and this run finishes it.
+    creating = meta.get("creating") if (
+        not replace and post_id and meta.get("post_id")
+        and int(post_id) == int(meta["post_id"])) else None
+    if post_id and translation_of:
+        if not creating:
+            die("TRANSLATION_OF_ON_UPDATE",
+                f"--translation-of only applies when a page is created, and "
+                f"#{post_id} already exists. WPML groups are not changed by push.")
+        if int(translation_of) != creating.get("translation_of"):
+            die("TRANSLATION_OF_ON_UPDATE",
+                f"#{post_id} was created as a translation of "
+                f"#{creating.get('translation_of')} by a push that did not finish; "
+                f"--translation-of {translation_of} names another page. WPML "
+                f"groups are not changed by push. Nothing was changed.")
+    # Only a new page picks its language here; an update keeps the one it has.
+    if not post_id:
+        warn_posts_terms(out, args.language, creds)
 
     # Resolve every taxonomy term ONCE, before the page-moved-on check, the
     # media upload, or any write. Catching a bad slug after ewpa/create-post
@@ -3889,7 +5578,8 @@ def cmd_push(args):
     if post_id:
         if not args.post_id:
             print(f"page      #{post_id} from wp.json")
-        cur = wp("GET", f"/wp-json/wp/v2/{rest}/{post_id}?context=edit", creds=creds)
+        cur = page_json(wp("GET", f"/wp-json/wp/v2/{rest}/{post_id}?context=edit",
+                           creds=creds))
 
         # Renaming a published page breaks every link to it and leaves no
         # redirect behind. Never do it as a side effect of a folder name.
@@ -3901,8 +5591,19 @@ def cmd_push(args):
                 f"existing link would 404 and no redirect is created. Pass "
                 f"--force if that is genuinely what you want.")
 
-        seen, now = meta.get("modified_gmt"), cur.get("modified_gmt")
-        if seen and now and now != seen and not args.force:
+        # wp.json's stamp is the draft's; what the original must still match is
+        # the page extract read. And --force does not apply: this overwrites an
+        # Elementor page someone has just edited.
+        seen, now = (src["modified_gmt"] if replace else meta.get("modified_gmt")), \
+            cur.get("modified_gmt")
+        if seen and now and now != seen and (replace or not args.force):
+            if replace:
+                die("PAGE_MOVED_ON",
+                    f"#{post_id} was edited in WordPress after it was extracted:\n"
+                    f"    extract read       {seen}\n"
+                    f"    WordPress now says {now}\n"
+                    f"  Extract it again and rebuild against what it holds now; "
+                    f"nothing was changed.")
             die("PAGE_MOVED_ON",
                 f"#{post_id} was edited in WordPress after this build last "
                 f"touched it:\n"
@@ -3912,6 +5613,28 @@ def cmd_push(args):
                 f"overwrite it. The old body is only recoverable from "
                 f"build/<slug>/backups/ — site revisions are off.")
 
+        # An Elementor page holds its content in _elementor_data; set-post-html
+        # would overwrite post_content and the page would carry on rendering
+        # Elementor. Stop before the upload, backup or any write.
+        # A page this build created is raw by intent, whatever WPML copied.
+        if post_type == "page" and not replace and not creating and \
+                get_meta(post_id, "_elementor_edit_mode", creds=creds) == "builder":
+            die("ELEMENTOR_PAGE",
+                f"#{post_id} is an Elementor page: its content is Elementor's "
+                f"data, so a plain push would overwrite the body with no backup "
+                f"and the page would go on rendering Elementor. Nothing was "
+                f"changed. To replace it, follow SKILL.md, From Elementor, "
+                f"Usage B: push the build as a draft of its own, have it signed "
+                f"off, then push {args.slug} --replace {post_id}.")
+
+    if replace:
+        # Identity first, then the backup, both before the media upload: the
+        # first write to the site must find the way back already on disk.
+        before = public_identity(src["url"])
+        ebackup = os.path.relpath(backup_elementor(post_id, out, creds=creds), out)
+        print(f"elementor backup {os.path.join(out, ebackup)}  "
+              f"(restore with elementor-restore)")
+
     # Now that the page is known, the slug follows it — not the folder.
     page_slug = args.page_slug or (cur.get("slug") if post_id else None) \
         or args.slug
@@ -3919,16 +5642,10 @@ def cmd_push(args):
     man_path = os.path.join(out, "manifest.json")
     manifest = read_manifest(out)
     new = 0
-    for rel in sorted(set(re.findall(r'(?:src|poster)="(assets/[^"]+)"', html))):
+    for rel in page_assets(html):
         local = os.path.join(out, rel)
-        if not os.path.exists(local):
-            die("ASSET_MISSING", local)
-        # Key on the bytes, not the path. Keying on the path alone means a
-        # corrected asset under the same filename is never uploaded and the
-        # page silently keeps serving the old one — which is how a logo with
-        # its background keyed out stayed opaque on the live page.
-        sha = hashlib.sha256(open(local, "rb").read()).hexdigest()
-        if manifest.get(rel, {}).get("sha") == sha:
+        upload, sha = asset_upload(out, rel, manifest)
+        if not upload:
             continue
         send = local if args.no_webp else to_webp(local)
         ext = os.path.splitext(send)[1].lower()
@@ -3948,20 +5665,17 @@ def cmd_push(args):
     with open(man_path, "w") as fh:
         json.dump(manifest, fh, indent=1)
     print(f"media     {new} new, {len(manifest) - new} reused")
-    for rel, rec in manifest.items():
-        html = html.replace(f'"{rel}"', f'"{rec["url"]}"')
+    html = with_media_urls(html, manifest)
 
     if post_id:
         # Revisions are off site-wide. Keep the old body before overwriting it.
-
-
-        bdir = os.path.join(out, "backups")
-        os.makedirs(bdir, exist_ok=True)
-        stamp = re.sub(r"\D", "", str(cur.get("modified_gmt") or "prev"))
-        bpath = os.path.join(bdir, f"{post_id}-{stamp}.html")
-        with open(bpath, "w", encoding="utf-8") as fh:
-            fh.write((cur.get("content") or {}).get("raw", ""))
-        print(f"backup    {bpath}")
+        print(f"backup    {backup_body(out, post_id, cur)}")
+        if replace:
+            # Record the way back just before the first write to the original:
+            # if anything below stops, wp.json says where it is, and a rerun
+            # refuses (REPLACE_UNFINISHED). Not earlier: a run that stops
+            # before this has changed nothing on the original.
+            write_wp_meta(out, {**meta, "replacing": {"orig": post_id, "backup": ebackup}})
     else:
         if post_type == "post":
             res = ability("ewpa/create-post", {
@@ -3973,6 +5687,7 @@ def cmd_push(args):
                 "title": args.title, "language": args.language, "status": "draft",
                 "slug": page_slug,
                 **({"parent_id": parent_id} if parent_id else {}),
+                **({"translation_of": int(translation_of)} if translation_of else {}),
             }, creds=creds)
         # The ability may answer {"output": {...}} or the object itself, and
         # name the id "id" or "post_id" either way. Missing one shape here
@@ -3989,10 +5704,32 @@ def cmd_push(args):
         # that is also how the next push knows this one never finished.
         meta = {**meta, "post_id": int(post_id), "post_type": post_type,
                 "slug": page_slug}
+        # A page may come back from WPML carrying the original's Elementor
+        # meta. Until it is cleared and checked raw, a rerun must be able to
+        # finish the job instead of refusing the page as Elementor's
+        # (ELEMENTOR_PAGE) or its --translation-of as an update; "creating"
+        # goes once assert_raw has passed.
+        if post_type == "page":
+            meta["creating"] = {"translation_of": int(translation_of) if translation_of
+                                else None, "language": args.language}
         write_wp_meta(out, meta)
 
     ability("mc/set-post-html", {"post_id": int(post_id), "content": html}, creds=creds)
     print(f"body      set via mc/set-post-html ({len(html)} bytes)")
+
+    # Only the switch: with _elementor_edit_mode blank the front end prints
+    # post_content, and _elementor_data stays in place for elementor-restore.
+    if replace:
+        clear_elementor(post_id, data=False, creds=creds)
+        print("elementor  edit mode cleared")
+
+    # A page joined to an Elementor original as its translation inherits the
+    # builder meta and keeps rendering Elementor. A page created by this push
+    # is raw by intent, so blank what WPML copied. (Posts never use Elementor.)
+    if (created or creating) and post_type == "page" and \
+            get_meta(post_id, "_elementor_edit_mode", creds=creds) == "builder":
+        clear_elementor(post_id, data=True, creds=creds)
+        print("elementor  cleared (copied by WPML)")
 
     if post_type == "post" and regions:
         ability("mc/set-terms", {"post_id": int(post_id), "taxonomy": "region",
@@ -4009,10 +5746,17 @@ def cmd_push(args):
     # A build whose wp.json has a post_id but no modified_gmt was created by
     # a push that failed before finishing — its permalink may never have run.
     unfinished = bool(meta.get("post_id")) and not meta.get("modified_gmt")
-    if post_type == "page" or created or unfinished or args.page_slug:
-        perm = ability("mc/regenerate-permalink",
-                       {"post_id": int(post_id), "slug": page_slug}, creds=creds)
-        print(f"permalink {(perm.get('output') or perm).get('permalink', '')}")
+    # --replace never touches the original's URL, and neither does a later
+    # push of the page it replaced: regenerating may reset a Permalink Manager
+    # URI someone set by hand on the Elementor page. --page-slug still does.
+    if not replace and (post_type == "page" or created or unfinished or args.page_slug):
+        if meta.get("replaced") and not args.page_slug:
+            print("permalink kept (a replaced Elementor page keeps its URI; "
+                  "--page-slug regenerates it)")
+        else:
+            perm = ability("mc/regenerate-permalink",
+                           {"post_id": int(post_id), "slug": page_slug}, creds=creds)
+            print(f"permalink {(perm.get('output') or perm).get('permalink', '')}")
 
     # Read modified_gmt LAST. It used to be read straight after set-post-html,
     # but the post-meta write and the permalink call each bump it again, so the
@@ -4020,18 +5764,29 @@ def cmd_push(args):
     # push tripped its own PAGE_MOVED_ON guard. A guard that cries wolf every
     # time gets waved through with --force, which is the one thing it exists to
     # prevent.
-    after = wp("GET", f"/wp-json/wp/v2/{rest}/{post_id}"
-                      f"?context=edit&_fields=id,slug,title,status,link,parent,modified_gmt,content",
-               creds=creds)
-    write_wp_meta(out, {**meta, "post_id": after["id"], "slug": after["slug"],
-                        "title": (after["title"] or {}).get("raw", ""),
-                        "parent": after.get("parent"), "link": after["link"],
-                        "status": after["status"],
-                        "modified_gmt": after["modified_gmt"], "post_type": post_type,
-                        "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
-                                                   time.gmtime())})
+    after = page_json(wp("GET", f"/wp-json/wp/v2/{rest}/{post_id}"
+                                f"?context=edit&_fields=id,slug,title,status,link,parent,modified_gmt,content",
+                         creds=creds))
+    # --replace rewrites wp.json last, once the front end has been checked.
+    # body_sha is what --replace holds a draft to: the body actually sent.
+    if not replace:
+        final = {**meta, "post_id": after["id"], "slug": after["slug"],
+                 "title": (after["title"] or {}).get("raw", ""),
+                 "parent": after.get("parent"), "link": after["link"],
+                 "status": after["status"],
+                 "modified_gmt": after["modified_gmt"], "post_type": post_type,
+                 "body_sha": body_sha(html), "js_sha": body_sha(page_js(out)),
+                 "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        write_wp_meta(out, final)
 
     rendered = (after.get("content") or {}).get("rendered", "")
+    if replace:
+        _replace_finish(out, meta, post_id, draft_id, before, ebackup, src["url"], creds)
+        return
+    if post_type == "page":
+        assert_raw(post_id, rendered, page_wrapper(out), creds=creds)
+        if final.pop("creating", None) is not None:
+            write_wp_meta(out, final)
     delta = wpsafe.autop_delta(html, rendered)
     if not rendered:
         note = "  — could not compare: WordPress returned no rendered body"
@@ -4048,19 +5803,178 @@ def cmd_push(args):
     print("  PUT /wp-json/siteground-optimizer/v1/purge-cache")
 
 
+def _is_elementor_doc(html, post_id):
+    """True when one element carries both data-elementor-type="wp-page" and
+    data-elementor-id="<post_id>", in either attribute order. The page's own
+    document, not a header or template that happens to share the id."""
+    for tag in re.findall(r"<[^>]*\bdata-elementor-type\b[^>]*>", html or ""):
+        a = {k.lower(): v for k, _, v in
+             re.findall(r'([\w-]+)\s*=\s*(["\'])(.*?)\2', tag)}
+        if a.get("data-elementor-type") == "wp-page" and \
+                a.get("data-elementor-id") == str(post_id):
+            return True
+    return False
+
+
+def _json_or_raw(v):
+    """_elementor_data as JSON when it parses: the site may send the string or
+    the parsed list, and re-serialising alone is not a change."""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v
+    return v
+
+
+def cmd_elementor_restore(args):
+    """The way back from push --replace: put the Elementor page back on the
+    front end from the backup --replace took."""
+    out = os.path.join(BUILD, args.slug)
+    meta = read_wp_meta(out)
+    # What wp.json says is in flight: a finished replace keeps the original as
+    # post_id, an unfinished one names it under "replacing".
+    named = meta.get("replaced") or meta.get("replacing") or {}
+    named_orig = meta.get("post_id") if meta.get("replaced") else \
+        (meta.get("replacing") or {}).get("orig")
+    if args.backup:
+        path = args.backup
+    elif named.get("backup"):
+        path = os.path.join(out, named["backup"])
+    else:
+        die("NO_BACKUP", f"build/{args.slug}/wp.json has no replaced/replacing "
+                         f"backup, and --backup was not given. Nothing was changed.")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        orig = int(rec["post_id"])
+        raw = rec["content_raw"]
+        want = rec["meta"]["_elementor_data"]
+        if not isinstance(raw, str):
+            raise ValueError("content_raw is not text")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        die("NO_BACKUP", f"{path} is not an Elementor backup ({type(e).__name__}: "
+                         f"{e}). Nothing was changed.")
+    if named_orig and int(named_orig) != orig:
+        die("BACKUP_MISMATCH",
+            f"{path} is a backup of #{orig}, but build/{args.slug}/wp.json is "
+            f"replacing #{named_orig}. Nothing was changed.")
+    creds = wp_creds()
+
+    # Elementor's own data is what the restore stands on. If it moved, someone
+    # edited the page after the swap: do not guess which side wins.
+    if _json_or_raw(get_meta(orig, "_elementor_data", creds=creds)) != _json_or_raw(want):
+        die("ELEMENTOR_DATA_CHANGED",
+            f"#{orig}'s _elementor_data is no longer what the backup holds. It was "
+            f"edited since; nothing was changed. Compare it with {path} and decide.")
+
+    cur = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit", creds=creds))
+    bbody = backup_body(out, orig, cur)
+    print(f"backup    {bbody}  (the body it holds now)")
+
+    def write(what, fn):
+        """Any write that fails leaves wp.json alone, so a rerun starts over
+        from the same backup; say so and where the old body is."""
+        try:
+            fn()
+        except (Exception, SystemExit) as e:
+            # die() has already printed why; anything else has not.
+            why = "" if isinstance(e, SystemExit) else f" ({type(e).__name__}: {e})"
+            die("RESTORE_INCOMPLETE",
+                f"{what} failed for #{orig}{why}; wp.json was not changed. Running "
+                f"`elementor-restore {args.slug}` again is safe. The body the page "
+                f"held before is {bbody}, the Elementor backup is {path}.")
+
+    # Builder mode first: Elementor then draws _elementor_data whatever
+    # post_content holds, so a body write that fails afterwards still leaves
+    # the page on Elementor. --replace blanked this switch and overwrote the
+    # page JS (it is not Elementor's data, so it is not in _elementor_data);
+    # those two are all there is to undo, and _elementor_data is never touched.
+    write("setting the edit mode",
+          lambda: set_meta(orig, "_elementor_edit_mode", "builder", creds=creds))
+    print("elementor  edit mode back to builder")
+    js = rec["meta"].get("_wpbuddy_page_js")
+    js = js if isinstance(js, str) else (json.dumps(js) if js else "")
+    write("restoring the page js", lambda: wp(
+        "POST", f"/wp-json/wp/v2/pages/{orig}", body={"meta": {"_wpbuddy_page_js": js}},
+        creds=creds))
+    print(f"page js   {len(js)} bytes restored" if js else "page js   none")
+    write("writing the body", lambda: ability(
+        "mc/set-post-html", {"post_id": orig, "content": raw}, creds=creds))
+    print(f"body      #{orig} set from the backup ({len(raw)} bytes)")
+    write("purging the cache", lambda: wp(
+        "PUT", "/wp-json/siteground-optimizer/v1/purge-cache", creds=creds))
+
+    page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit&_fields="
+                               f"id,link,status,modified_gmt", creds=creds))
+    again = (f"The body it held before is {bbody}, the Elementor backup is {path}. "
+             f"Running `elementor-restore {args.slug}` again is safe.")
+    try:
+        html = fetch_live(bust(page["link"]))[1]
+    except (urllib.error.URLError, OSError) as e:
+        die("RESTORE_FAILED",
+            f"#{orig} could not be read back from {page['link']} ({e}); wp.json "
+            f"was not changed. {again}")
+    if not _is_elementor_doc(html, orig):
+        die("RESTORE_FAILED",
+            f"{page['link']} does not render #{orig} as an Elementor page "
+            f"(no data-elementor-type=\"wp-page\" data-elementor-id=\"{orig}\"). "
+            f"Is it a cached copy? wp.json was not changed. {again}")
+    print(f"front end #{orig} is on Elementor again")
+    if meta.get("replaced") or meta.get("replacing"):
+        # post_id stays: the original after a finished replace, the draft after
+        # an unfinished one (still there, so --replace can be tried again).
+        rest = {k: v for k, v in meta.items() if k not in ("replaced", "replacing")}
+        if meta.get("post_id") == orig:
+            rest.update(link=page["link"], status=page["status"],
+                        modified_gmt=page["modified_gmt"])
+        write_wp_meta(out, rest)
+        print("wp.json   replaced/replacing removed")
+    # The restore itself moved the original's modified_gmt, which is what
+    # --replace holds against the extract (PAGE_MOVED_ON). When the backup is
+    # of exactly the state extract read, and _elementor_data was just checked
+    # to still equal the backup, the page is that state again: re-stamp the
+    # extract instead of making the next replace extract a second time.
+    dpath = os.path.join(out, "design.json")
+    design = read_design(out)
+    src = design.get("source") or {}
+    restamped = (src.get("type") == "elementor" and src.get("post_id") == orig
+                 and rec.get("modified_gmt") and
+                 rec["modified_gmt"] == src.get("modified_gmt"))
+    if restamped:
+        src["modified_gmt"] = page["modified_gmt"]
+        src["restored_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(dpath, "w", encoding="utf-8") as fh:
+            json.dump(design, fh, ensure_ascii=False, indent=1)
+        print("design.json  source.modified_gmt moved to the restored page's stamp")
+    if meta.get("replaced") or meta.get("replacing"):
+        first = ("it is the state extract read, so no new extract is needed: "
+                 if restamped else
+                 "extract it again first (the page's edit time moved, so --replace "
+                 "would stop with PAGE_MOVED_ON), then ")
+        if meta.get("post_id") == orig:
+            # push updates whatever post_id names, and the draft is in the trash.
+            print(f"to replace it again: {first}drop \"post_id\" from build/"
+                  f"{args.slug}/wp.json, push a fresh draft (push {args.slug} "
+                  f"--title ...), then push {args.slug} --replace {orig}")
+        else:
+            print(f"to replace it again: {first}push {args.slug} --replace {orig}")
+
+
 def main():
     p = argparse.ArgumentParser(prog="figma_to_wp")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     e = sub.add_parser("extract")
-    e.add_argument("source", help="a Figma frame URL, or a folder of Figma exports")
+    e.add_argument("source", help="a Figma frame URL, or a folder of Figma exports; "
+                                  "with --from elementor, a public page's URL or post id")
     e.add_argument("--slug")
     e.add_argument("--frame", help="which frame is the page: a PDF name in "
                                    "export mode, a frame name for a page URL "
                                    "(default: the largest)")
     e.add_argument("--no-assets", action="store_true")
     e.add_argument("--no-render", action="store_true")
-    e.add_argument("--from", dest="from_", choices=["figma", "claude-design"],
+    e.add_argument("--from", dest="from_", choices=["figma", "claude-design", "elementor"],
                    default="figma", help="what SOURCE is (default: figma)")
     e.add_argument("--cd-project", help="Claude Design project id, recorded in design.json")
     e.add_argument("--cd-file", help="the export's path inside the project")
@@ -4081,7 +5995,9 @@ def main():
     df.add_argument("slug")
     df.add_argument("--url", help="the page to shoot: live URL or local preview")
     df.add_argument("--width", type=int, help="viewport width (default: the "
-                                              "design's own width)")
+                                              "design's own width; 768 or 390 "
+                                              "on an Elementor build compares "
+                                              "design-<w>.png)")
     df.add_argument("--bands", type=int, default=20)
     df.add_argument("--section", help="compare only this section (needs a "
                                       "sections.json from `audit`)")
@@ -4120,6 +6036,10 @@ def main():
                     help="viewport width (default 390; rendered in an iframe "
                          "because headless Chrome will not go below 500)")
     mo.add_argument("--height", type=int, default=844)
+    mo.add_argument("--tolerance", type=int, default=6,
+                    help="px a text may sit from the original page's at this "
+                         "width before it is reported (Elementor builds; "
+                         "default 6)")
     mo.set_defaults(fn=cmd_mobile)
 
     pv = sub.add_parser("preview")
@@ -4145,7 +6065,14 @@ def main():
                    help="parent by URL path, e.g. partners/work-collaboration")
     u.add_argument("--page-slug", help="the page's URL slug (default: the build slug)")
     u.add_argument("--post-id", type=int, help="update this page instead of creating one")
-    u.add_argument("--language", default="en", choices=["en", "zh-hant", "zh-hans"])
+    u.add_argument("--language", default="en",
+                   help="a WPML language code of the site, e.g. en, zh-hant, "
+                        "zh-hk (checked against the site before anything is written)")
+    u.add_argument("--translation-of", type=int, metavar="POST_ID",
+                   help="when creating, join this post's WPML translation group")
+    u.add_argument("--replace", type=int, metavar="ORIG_ID",
+                   help="swap the reviewed draft in wp.json for this Elementor page: "
+                        "back it up, write the body to it, trash the draft")
     u.add_argument("--force", action="store_true",
                    help="push even though WordPress has moved on since this "
                         "build last touched the page")
@@ -4158,6 +6085,15 @@ def main():
     u.add_argument("--region", action="append", default=[],
                    help="post region slug (hong-kong, taiwan, …), repeatable")
     u.set_defaults(fn=cmd_push)
+
+    er = sub.add_parser("elementor-restore",
+                        help="put a page that push --replace swapped back on Elementor")
+    er.add_argument("slug")
+    er.add_argument("--backup", metavar="PATH",
+                    help="the Elementor backup to restore from, relative to the "
+                         "current directory (default: the one wp.json's "
+                         "replaced/replacing names, relative to the build folder)")
+    er.set_defaults(fn=cmd_elementor_restore)
 
     args = p.parse_args()
     args.fn(args)

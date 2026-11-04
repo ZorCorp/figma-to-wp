@@ -138,8 +138,13 @@ authored by `wpbuddy` / `mcp`) is small: `.mc-container .mc-section
 .mc-img .mc-cta`. Use it for anything it covers; write page CSS for the rest.
 
 Brand tokens: `--mc-orange #FF9E1B`, `--mc-navy #1B365D`, `--mc-green #12BF6D`,
-`--mc-text #4D4D4D`, Raleway. CJK copy needs a font stack —
-`Raleway, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif`.
+`--mc-text #4D4D4D`. The brand face is Raleway and the theme forces it
+(`body,p,h1-h6,span,div,a,li,td,th{font-family:Raleway…!important}`), but the
+site loads no Raleway file anywhere: text renders in the next face of the
+stack that is there. On the pages measured (2026-11-04) that is **Roboto**,
+loaded by the Elementor header and kit, for raw and Elementor pages alike —
+so the page depends on that header continuing to load it. CJK copy needs a font
+stack — `Raleway, "Noto Sans TC", "PingFang TC", "Microsoft JhengHei", sans-serif`.
 
 ## Behaviour belongs in the enqueued script — but inline `<script>` does work
 
@@ -433,17 +438,22 @@ If the control shows nothing either, the harness is what is broken.
 
 The native `post_name` is not what the site serves. After setting or changing a
 slug, run `mc/regenerate-permalink`. The WPML language prefix (`/zh-hant/`,
-`/zh-hans/`) is added automatically, so the slug itself stays the plain English
-one with no language marker — and all languages in a translation group share it.
+`/zh-hk/`, `/zh-cn/`; English has none) is added automatically, so the slug
+itself stays the plain English one with no language marker — and all languages
+in a translation group share it.
 
 Changing a slug on a live page means adding a 301 from the old URL, including
 for child pages: `POST /wp-json/redirection/v1/redirect`.
 
 ## WPML
 
-Each language is a separate post. Creating three pages is not enough — they must
-share one translation group (`trid`) or the language switcher will not connect
-them. Use `mc/create-localized-page` with `translation_of`; do **not** use
+The site has four languages — `en`, `zh-hant`, `zh-hk`, `zh-cn`. `push`
+validates `--language` against the site's own list (`BAD_LANGUAGE` names what
+it has), so none of these is hard-coded here.
+
+Each language is a separate post. Creating one page per language is not enough —
+they must share one translation group (`trid`) or the language switcher will not
+connect them. Use `mc/create-localized-page` with `translation_of`; do **not** use
 `ewpa/set-post-language`, which reports success without persisting.
 
 Terms must be the language-appropriate translation (resolve via
@@ -479,7 +489,10 @@ measured off `/solutions/geospatial/` at a real 390px viewport:
 | section padding | 50px vertical | 50px | frame |
 
 - **The breakpoints are 768 and 1024**, not 767. geospatial is already on the
-  phone scale at exactly 768.
+  phone scale at exactly 768. That is the house scale for a page built from a
+  Figma frame. A raw page rebuilt from an Elementor original follows
+  Elementor's own: phone ≤767, tablet ≤1024
+  (`elementor-widgets.md`).
 - **16px is the floor for body copy.** A frame that says 14 for card text or an
   accordion answer is a desktop number; raise it. Label pills stay at 14.
 - **The site header is `position: fixed`, 81px tall**, on every page. geospatial
