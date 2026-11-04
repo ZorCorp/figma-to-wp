@@ -4026,7 +4026,7 @@ def local_font_css(out, families=("Raleway",)):
     not make."""
     css = ""
     for fam in families:
-        rel = "assets/fonts/" + fam.lower().replace(" ", "-") + ".woff2"
+        rel = "assets/fonts/" + font_slug(fam) + ".woff2"
         if os.path.exists(os.path.join(out, rel)):
             css += (f"<style>@font-face{{font-family:'{fam}';"
                     f"src:url('{rel}') format('woff2');"
