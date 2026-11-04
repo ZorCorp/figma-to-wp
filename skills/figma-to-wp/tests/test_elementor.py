@@ -1429,10 +1429,6 @@ class MobileDiffElementor(unittest.TestCase):
         self.assertIn("NO_REFERENCE", err.getvalue())
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class CopyJson(unittest.TestCase):
     """copy.json: a translated page is checked against its `to` strings."""
     TEXTS = [{"i": 1, "text": "Plans for every team", "y": 100},
@@ -1573,5 +1569,20 @@ class CopyJson(unittest.TestCase):
                     fw.run_checks(self.out)
             self.assertIn("BAD_COPY_JSON", err.getvalue())
 
+    def test_dropped_key_matching_only_an_out_of_scope_to_string_is_not_stale(self):
+        _write(os.path.join(self.out, "sections.json"), json.dumps(
+            {"hero": {"design_y": 100, "design_span": 100},
+             "cta": {"design_y": 600, "design_span": 200}}))
+        # the key matches the page's wording of #2 only, and #2 is outside the band
+        _write(os.path.join(self.out, "dropped.json"),
+               json.dumps({"\u7acb\u5373\u514d\u8cbb": "nav"}))
+        self.copy(self.good_entries())
+        _, warnings = self.checks(section="hero")
+        self.assertFalse([w for w in warnings if "dropped.json key" in w], warnings)
+
     def test_load_copy_without_file_is_none(self):
         self.assertIsNone(fw.load_copy(self.out))
+
+
+if __name__ == "__main__":
+    unittest.main()

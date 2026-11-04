@@ -2515,6 +2515,7 @@ def run_checks(out, report=False, section=None, through=None):
             errors.append("COPY_NOT_APPROVED: copy.json source is claude-draft "
                           "and approved is not true")
         texts = translated_texts(texts, cp, warnings)
+        all_to = texts          # before --section narrows it
     else:
         texts = [{**t, "src": t["text"]} for t in texts]
     band = None
@@ -2569,7 +2570,7 @@ def run_checks(out, report=False, section=None, through=None):
                 assetish.add(squash("%s (%s)" % (f_, nm)))
     all_copy = [squash(t["text"]) for t in design["texts"]]
     if translated:
-        all_copy += [squash(t["text"]) for t in texts]
+        all_copy += [squash(t["text"]) for t in all_to]
     for k in sorted(dropped):
         if not k or k in assetish:
             continue
