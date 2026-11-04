@@ -698,10 +698,10 @@ class MeasureJs(unittest.TestCase):
 
 
 
-def _measure_dom(runs, root, sections=(), fonts=("Roboto",), vw=1440):
+def _measure_dom(runs, root, sections=(), fonts=("Roboto",), vw=1440, small=()):
     data = {"runs": runs, "sections": list(sections), "boxes": [], "fontOK": {},
             "fonts": list(fonts), "root": root,
-            "mobile": {"vw": vw, "scrollW": vw, "over": [], "small": [], "tap": [],
+            "mobile": {"vw": vw, "scrollW": vw, "over": [], "small": list(small), "tap": [],
                        "lefts": {}, "imgs": []}}
     return ('<html><body><script type="application/json" id="fw-measure">%s'
             '</script></body></html>' % json.dumps(data))
@@ -1235,6 +1235,157 @@ class ElementorFramed(unittest.TestCase):
         with mock.patch.object(fw, "shoot", shoot):
             fw.shoot_framed("http://h/live.html", png, 390, 9000)
         self.assertEqual(_size(png), (390, 1200))
+
+
+def _rec(text, x, y, size=20, **kw):
+    """A design.json text: root-relative box, size under type."""
+    return {"text": text, "x": x, "y": y, "w": 300, "h": 40, "type": {"size": size}, **kw}
+
+
+class ComparePositions(unittest.TestCase):
+    def test_compare_positions_reports_only_beyond_tolerance(self):
+        ref = [_rec("Plans for every team", 20, 100), _rec("Start for free today", 20, 200),
+               _rec("Talk to our sales team", 20, 300)]
+        live = [_rec("Plans for every team", 24, 106),        # inside +-6
+                _rec("Start for free today", 20, 214),
+                _rec("Talk to our sales team", 11, 300)]
+        got = fw.compare_positions(ref, live, 6)
+        self.assertEqual(got, [{"text": "Start for free today", "dx": 0, "dy": 14},
+                               {"text": "Talk to our sales team", "dx": -9, "dy": 0}])
+
+    def test_compare_positions_pairs_repeated_text_in_order(self):
+        ref = [_rec("Learn more about it", 20, 100), _rec("Learn more about it", 20, 500)]
+        live = [_rec("Learn  more about it", 20, 100), _rec("Learn more about it", 20, 530)]
+        got = fw.compare_positions(ref, live, 6)
+        self.assertEqual(got, [{"text": "Learn more about it", "dx": 0, "dy": 30}])
+
+    def test_compare_positions_skips_short_and_unpaired_text(self):
+        ref = [_rec("Go", 0, 0), _rec("Only on the original", 0, 0),
+               _rec("Collapsed answer text", 0, 0, clipped=True)]
+        live = [_rec("Go", 90, 90), _rec("Collapsed answer text", 90, 90)]
+        self.assertEqual(fw.compare_positions(ref, live, 6), [])
+
+    def test_compare_sections_checks_y_and_h_in_order(self):
+        ref = [{"name": "s1", "y": 0, "h": 600}, {"name": "s2", "y": 600, "h": 400},
+               {"name": "s3", "y": 1000, "h": 300}]
+        live = [{"name": "s1", "y": 0, "h": 604}, {"name": "s2", "y": 640, "h": 400},
+                {"name": "s3", "y": 1040, "h": 330}]
+        self.assertEqual(fw.compare_sections(ref, live, 6),
+                         [{"name": "s2", "dy": 40, "dh": 0},
+                          {"name": "s3", "dy": 40, "dh": 30}])
+
+
+class MobileDiffElementor(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.build = os.path.join(self.tmp, "build")
+        self.out = os.path.join(self.build, "ex")
+        os.makedirs(self.out)
+        p = mock.patch.object(fw, "BUILD", self.build)
+        p.start()
+        self.addCleanup(p.stop)
+        self.design = {"source": {"type": "elementor", "width": 1440},
+                       "widths": {"390": {"texts": [
+                           _rec("Tiny legal line that is small", 20, 900, size=12),
+                           _rec("Plans for every team", 20, 100)], "sections": []}}}
+        _write(os.path.join(self.out, "design.json"), json.dumps(self.design))
+
+    def mobile(self, dom, **kw):
+        args = fw.argparse.Namespace(slug="ex", url="http://127.0.0.1:1/preview.html",
+                                     width=390, height=844, tolerance=6, **kw)
+        buf = io.StringIO()
+        with mock.patch.object(fw, "dump_dom", return_value=dom), \
+                contextlib.redirect_stdout(buf):
+            bad = fw.cmd_mobile(args)
+        return bad, buf.getvalue()
+
+    def dom(self, small=(), runs=(), root=None):
+        return _measure_dom(list(runs), root or {"x": 0, "y": 0, "w": 390, "h": 1000},
+                            vw=390, small=small)
+
+    def test_small_text_present_in_reference_is_a_note_not_a_finding(self):
+        small = [{"cls": "legal", "fs": "12px", "txt": "Tiny legal line that is sma"}]
+        bad, text = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 0)
+        self.assertIn("note", text)
+        self.assertIn("under 16", text)
+
+    def test_small_text_missing_from_reference_is_a_finding(self):
+        small = [{"cls": "new", "fs": "12px", "txt": "Added on the rebuild only"}]
+        bad, text = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 1)
+        self.assertIn("1 kind(s) of finding", text)
+
+    def test_positions_are_root_relative_and_counted(self):
+        # the root sits 50px down in the frame: a run at 170 is at 120 in the
+        # root, against a reference 100 (read unsubtracted it would be -30)
+        runs = [_run("Plans for every team", 20, 170, size=20)]
+        bad, text = self.mobile(self.dom(runs=runs, root={"x": 0, "y": 50, "w": 390, "h": 1000}))
+        self.assertEqual(bad, 1)
+        self.assertIn("positions", text)
+        self.assertIn("dy +20", text)
+
+    def test_positions_inside_tolerance_report_none(self):
+        runs = [_run("Plans for every team", 22, 148, size=20)]
+        bad, text = self.mobile(self.dom(runs=runs, root={"x": 0, "y": 50, "w": 390, "h": 1000}))
+        self.assertEqual(bad, 0)
+        self.assertRegex(text, r"positions\s+none")
+
+    def test_figma_build_keeps_the_old_behaviour(self):
+        self.design["source"] = {"width": 1440}
+        _write(os.path.join(self.out, "design.json"), json.dumps(self.design))
+        small = [{"cls": "legal", "fs": "12px", "txt": "Tiny legal line that is sma"}]
+        bad, text = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 1)
+        self.assertNotIn("positions", text)
+
+    def diff(self, width, ref=None):
+        from PIL import Image
+        for n in ("design.png", "design-390.png"):
+            Image.new("RGB", (1440 if n == "design.png" else 390, 600), "white").save(
+                os.path.join(self.out, n))
+        self.framed = []
+
+        def framed(url, png, w, h):
+            self.framed.append((url, png, w, h))
+            Image.new("RGB", (w, 600), "white").save(png)
+        args = fw.argparse.Namespace(slug="ex", url="http://127.0.0.1:1/preview.html",
+                                     width=width, bands=4, section=None, offset=0,
+                                     cols=3, ref=ref)
+        resp = mock.MagicMock()
+        resp.__enter__.return_value = resp
+        resp.read.return_value = b"<html>"
+        resp.status = 200
+        seen = {}
+        import warnings
+        cw = warnings.catch_warnings()
+        cw.__enter__()
+        self.addCleanup(cw.__exit__, None, None, None)
+        warnings.filterwarnings("ignore", message="Image.Image.getdata")   # cmd_diff's own
+        with mock.patch.object(fw, "shoot_framed", framed), \
+                mock.patch.object(fw, "shoot", side_effect=AssertionError("plain shoot")), \
+                mock.patch.object(fw.urllib.request, "urlopen", return_value=resp), \
+                contextlib.redirect_stdout(io.StringIO()) as buf:
+            fw.cmd_diff(args)
+        seen["out"] = buf.getvalue()
+        return seen
+
+    def test_diff_picks_width_reference_for_elementor(self):
+        seen = self.diff(390)
+        self.assertEqual(len(self.framed), 1)
+        self.assertEqual(self.framed[0][2], 390)
+        self.assertIn("design-390.png", seen["out"])
+
+    def test_diff_without_width_reference_dies_for_elementor(self):
+        from PIL import Image
+        Image.new("RGB", (1440, 600), "white").save(os.path.join(self.out, "design.png"))
+        args = fw.argparse.Namespace(slug="ex", url="http://127.0.0.1:1/p.html", width=768,
+                                     bands=4, section=None, offset=0, cols=3, ref=None)
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            fw.cmd_diff(args)
+        self.assertIn("NO_REFERENCE", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -928,22 +928,33 @@ def cmd_diff(args):
     """
     from PIL import Image, ImageChops, ImageDraw
     out = os.path.join(BUILD, args.slug)
-    design = json.load(open(os.path.join(out, "design.json"), encoding="utf-8"))
+    with open(os.path.join(out, "design.json"), encoding="utf-8") as fh:
+        design = json.load(fh)
+    w = args.width or design["source"]["width"]
+    # An Elementor build has one reference per width it was extracted at, and a
+    # narrow page is shot in an iframe at that width rather than in a window
+    # Chrome will not shrink.
+    el = design["source"].get("type") == "elementor"
+    framed = el and w != design["source"]["width"]
     # A reference handed over by someone else is worth supporting: it is how
     # a designer says "this is what it should look like" without going near
     # the API, and it keeps that claim checkable instead of a conversation.
-    ref_path = args.ref or os.path.join(out, "design.png")
+    ref_path = args.ref or os.path.join(out, f"design-{w}.png" if framed else "design.png")
     if not os.path.exists(ref_path):
+        if framed and not args.ref:
+            die("NO_REFERENCE", f"no reference at {ref_path} — extract made "
+                                f"design-<w>.png for "
+                                f"{', '.join(str(k) for k in design.get('widths') or {})}"
+                                f" only. Pass --ref, or a width it has.")
         die("NO_RENDER", f"no reference at {ref_path} — run extract without "
                          f"--no-render, or pass --ref.")
     print(f"reference {ref_path}")
     ref = Image.open(ref_path).convert("RGB")
-    w = args.width or design["source"]["width"]
 
     url = args.url
     if not url:
         die("NO_URL", "pass --url: the live page, or the local preview.")
-    if w < 500:
+    if w < 500 and not framed:
         print(f"width     {w}px requested — macOS Chrome will not size a window "
               f"below ~500px, so the page lays out wider than this and the shot "
               f"is merely cropped. Every band will read as 'cut off on the "
@@ -966,7 +977,14 @@ def cmd_diff(args):
 
     dd = os.path.join(out, "diff")
     os.makedirs(dd, exist_ok=True)
-    live = shoot(url, os.path.join(dd, "live.png"), w)
+    if framed:
+        # Tall enough for the reference and some over: a page that grew still
+        # has to fit, and shoot trims the empty tail either way.
+        lp = os.path.join(dd, "live.png")
+        shoot_framed(url, lp, w, min(SHOT_TALL, ref.height + REF_MARGIN))
+        live = Image.open(lp).convert("RGB")
+    else:
+        live = shoot(url, os.path.join(dd, "live.png"), w)
 
     ref = ref.resize((w, round(ref.height * w / ref.width)), Image.LANCZOS)
 
@@ -1701,6 +1719,51 @@ def el_sections(m):
     oy = root.get("y", 0)
     return [{"name": s.get("name"), "y": s["y"] - oy, "h": s.get("h")}
             for s in m.get("sections") or []]
+
+
+POS_MIN_CHARS = 6        # shorter strings pair with the wrong twin; audit uses the same floor
+
+
+def compare_positions(ref, live, tol):
+    """Where each text sits on the page against where the reference put it.
+    Both sides are lists of {text, x, y} in the same root-relative coordinates.
+    Texts pair by their first 40 normalised characters, a text that repeats
+    pairs in order of appearance, and one too short to be told apart from its
+    twins (under 6 characters) or collapsed in either picture is not compared.
+    Returns {text, dx, dy} (live minus reference) for every pair that is out by
+    more than tol in either direction."""
+    pool = {}
+    for r in live:
+        pool.setdefault(norm_text(r.get("text", ""))[:40], []).append(r)
+    seen, out = {}, []
+    for r in ref:
+        full = norm_text(r.get("text", ""))
+        if len(full) < POS_MIN_CHARS:
+            continue
+        key = full[:40]
+        n = seen[key] = seen.get(key, -1) + 1
+        mates = pool.get(key, [])
+        if n >= len(mates):
+            continue
+        m = mates[n]
+        if r.get("clipped") or m.get("clipped"):
+            continue
+        dx, dy = round(m["x"] - r["x"]), round(m["y"] - r["y"])
+        if abs(dx) > tol or abs(dy) > tol:
+            out.append({"text": full, "dx": dx, "dy": dy})
+    return out
+
+
+def compare_sections(ref, live, tol):
+    """Section by section, in order: how far each one's top (dy) and height
+    (dh) are from the reference. Only sections out by more than tol are
+    listed; a section with no counterpart in order is not compared."""
+    out = []
+    for r, m in zip(ref, live):
+        dy, dh = round(m["y"] - r["y"]), round(m["h"] - r["h"])
+        if abs(dy) > tol or abs(dh) > tol:
+            out.append({"name": r.get("name"), "dy": dy, "dh": dh})
+    return out
 
 
 def _same_page(a, b):
@@ -3838,9 +3901,24 @@ def cmd_mobile(args):
     if not m:
         die("NO_MEASURE", "the frame never reported. Is the preview server "
                           "running, and is measure.js loading?")
-    mob = json.loads(m.group(1)).get("mobile")
+    meas = json.loads(m.group(1))
+    mob = meas.get("mobile")
     if not mob:
         die("NO_MOBILE", "measure.js is older than this command.")
+
+    # An Elementor build kept the original page's own phone and tablet layouts
+    # as references: what the page did at this width is the answer to "is this
+    # phone layout right", so it is the yardstick instead of the house rules
+    # alone.
+    el_ref = None
+    try:
+        with open(os.path.join(out, "design.json"), encoding="utf-8") as fh:
+            design = json.load(fh)
+    except (OSError, ValueError):
+        design = {}
+    el = (design.get("source") or {}).get("type") == "elementor"
+    if el:
+        el_ref = (design.get("widths") or {}).get(str(args.width))
 
     # The phone rules restate desktop values — line-heights above all, since
     # every one of them is an absolute px taken from the frame. Writing them
@@ -3880,6 +3958,14 @@ def cmd_mobile(args):
         print(f"overflow  none (scrollWidth {mob['scrollW']})")
 
     small = mob["small"]
+    # Small text the original page has too is the design's own, not a slip of
+    # the rebuild: keyed on the first 26 characters, which is all `small` keeps.
+    noted = []
+    if el_ref:
+        had = {norm_text(t.get("text", ""))[:26] for t in el_ref.get("texts") or []
+               if ((t.get("type") or {}).get("size") or 16) < 16}
+        noted = [t for t in small if norm_text(t["txt"])[:26] in had]
+        small = [t for t in small if t not in noted]
     if small:
         bad += 1
         print(f"under 16  {len(small)} text element(s) — the site holds 16px as "
@@ -3888,6 +3974,11 @@ def cmd_mobile(args):
             print(f"          {t['fs']:<6} .{t['cls'][:30]:<30} {t['txt']!r}")
     else:
         print("under 16  none")
+    if noted:
+        print(f"          note: {len(noted)} more are under 16 on the original "
+              f"page at {args.width}px too")
+        for t in noted[:8]:
+            print(f"          {t['fs']:<6} .{t['cls'][:30]:<30} {t['txt']!r}")
 
     tap = mob["tap"]
     if tap:
@@ -3924,6 +4015,27 @@ def cmd_mobile(args):
               f"give them aspect-ratio")
         for i in odd[:6]:
             print(f"          .{i['cls'][:30]:<30} nat {i['nat']} box {i['box']}")
+
+    if el:
+        if not el_ref:
+            print(f"positions skipped — the original was only measured at "
+                  f"{', '.join(str(k) for k in design.get('widths') or {})}px, "
+                  f"not {args.width}")
+        else:
+            # The run's own coordinates are the frame's; the reference's are
+            # the root's. Subtract the root so both start at the same corner.
+            live = el_texts(meas)
+            off = compare_positions(el_ref.get("texts") or [], live, args.tolerance)
+            if off:
+                bad += 1
+                print(f"positions {len(off)} text(s) more than ±{args.tolerance}px "
+                      f"from the original at {args.width}px")
+                for o_ in off[:8]:
+                    print(f"          dx {o_['dx']:+d} dy {o_['dy']:+d}  "
+                          f"{o_['text'][:50]!r}")
+            else:
+                print(f"positions none beyond ±{args.tolerance}px "
+                      f"({len(live)} run(s) measured)")
 
     print()
     print("0 findings" if not bad else f"{bad} kind(s) of finding above")
@@ -4831,7 +4943,9 @@ def main():
     df.add_argument("slug")
     df.add_argument("--url", help="the page to shoot: live URL or local preview")
     df.add_argument("--width", type=int, help="viewport width (default: the "
-                                              "design's own width)")
+                                              "design's own width; 768 or 390 "
+                                              "on an Elementor build compares "
+                                              "design-<w>.png)")
     df.add_argument("--bands", type=int, default=20)
     df.add_argument("--section", help="compare only this section (needs a "
                                       "sections.json from `audit`)")
@@ -4870,6 +4984,10 @@ def main():
                     help="viewport width (default 390; rendered in an iframe "
                          "because headless Chrome will not go below 500)")
     mo.add_argument("--height", type=int, default=844)
+    mo.add_argument("--tolerance", type=int, default=6,
+                    help="px a text may sit from the original page's at this "
+                         "width before it is reported (Elementor builds; "
+                         "default 6)")
     mo.set_defaults(fn=cmd_mobile)
 
     pv = sub.add_parser("preview")
