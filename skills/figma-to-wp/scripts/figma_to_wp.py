@@ -23,6 +23,7 @@ read off the picture, not a number a heuristic invents.
     audit    <slug>             per-element deltas, and per-section drift
     mobile   <slug>             overflow / text size / tap targets / gutter
     push     <slug>             media upload -> draft page -> permalink
+    elementor-restore <slug>    put a page push --replace swapped back on Elementor
 
 The browser-side measurement is `measure.js`, next to this file. It used to be
 a 183-line string in here, where nothing checked its syntax; `doctor` runs
@@ -4788,6 +4789,18 @@ def backup_elementor(post_id, out, creds=None):
     return path
 
 
+def backup_body(out, post_id, cur):
+    """Keep the body `cur` (a REST page, context=edit) holds now in
+    backups/<id>-<stamp>.html before it is overwritten. Revisions are off."""
+    bdir = os.path.join(out, "backups")
+    os.makedirs(bdir, exist_ok=True)
+    stamp = re.sub(r"\D", "", str(cur.get("modified_gmt") or "prev"))
+    bpath = os.path.join(bdir, f"{post_id}-{stamp}.html")
+    with open(bpath, "w", encoding="utf-8") as fh:
+        fh.write((cur.get("content") or {}).get("raw", ""))
+    return bpath
+
+
 def parse_identity(html):
     """What search engines and the language switcher key a page by."""
     def attrs(tag):
@@ -4867,8 +4880,9 @@ def _replace_gate(out, meta, orig, args):
         die("REPLACE_UNFINISHED",
             f"an earlier --replace of #{r.get('orig')} stopped after it began "
             f"writing. Its Elementor backup is build/{args.slug}/{r.get('backup')}. "
-            f"Run elementor-restore from it, or check what the page shows now; "
-            f"then remove \"replacing\" from wp.json to try again.")
+            f"Run `elementor-restore {args.slug}` to put the page back from it "
+            f"(that also clears \"replacing\" from wp.json), or check what the "
+            f"page shows now.")
     if meta.get("replaced"):
         die("ALREADY_REPLACED",
             f"this build already replaced #{meta['post_id']} (draft "
@@ -5129,13 +5143,7 @@ def cmd_push(args):
         # Revisions are off site-wide. Keep the old body before overwriting it.
 
 
-        bdir = os.path.join(out, "backups")
-        os.makedirs(bdir, exist_ok=True)
-        stamp = re.sub(r"\D", "", str(cur.get("modified_gmt") or "prev"))
-        bpath = os.path.join(bdir, f"{post_id}-{stamp}.html")
-        with open(bpath, "w", encoding="utf-8") as fh:
-            fh.write((cur.get("content") or {}).get("raw", ""))
-        print(f"backup    {bpath}")
+        print(f"backup    {backup_body(out, post_id, cur)}")
     else:
         if post_type == "post":
             res = ability("ewpa/create-post", {
@@ -5243,6 +5251,108 @@ def cmd_push(args):
 
     print(f"\n{post_type} #{post_id} is {after['status']}. After publishing, purge the cache:")
     print("  PUT /wp-json/siteground-optimizer/v1/purge-cache")
+
+
+def _is_elementor_doc(html, post_id):
+    """True when one element carries both data-elementor-type="wp-page" and
+    data-elementor-id="<post_id>", in either attribute order. The page's own
+    document, not a header or template that happens to share the id."""
+    for tag in re.findall(r"<[^>]*\bdata-elementor-type\b[^>]*>", html or ""):
+        a = {k.lower(): v for k, _, v in
+             re.findall(r'([\w-]+)\s*=\s*(["\'])(.*?)\2', tag)}
+        if a.get("data-elementor-type") == "wp-page" and \
+                a.get("data-elementor-id") == str(post_id):
+            return True
+    return False
+
+
+def _json_or_raw(v):
+    """_elementor_data as JSON when it parses: the site may send the string or
+    the parsed list, and re-serialising alone is not a change."""
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v
+    return v
+
+
+def cmd_elementor_restore(args):
+    """The way back from push --replace: put the Elementor page back on the
+    front end from the backup --replace took."""
+    out = os.path.join(BUILD, args.slug)
+    meta = read_wp_meta(out)
+    # What wp.json says is in flight: a finished replace keeps the original as
+    # post_id, an unfinished one names it under "replacing".
+    named = meta.get("replaced") or meta.get("replacing") or {}
+    named_orig = meta.get("post_id") if meta.get("replaced") else \
+        (meta.get("replacing") or {}).get("orig")
+    if args.backup:
+        path = args.backup
+    elif named.get("backup"):
+        path = os.path.join(out, named["backup"])
+    else:
+        die("NO_BACKUP", f"build/{args.slug}/wp.json has no replaced/replacing "
+                         f"backup, and --backup was not given. Nothing was changed.")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            rec = json.load(fh)
+        orig = int(rec["post_id"])
+        raw = rec["content_raw"]
+        want = rec["meta"]["_elementor_data"]
+        if not isinstance(raw, str):
+            raise ValueError("content_raw is not text")
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        die("NO_BACKUP", f"{path} is not an Elementor backup ({type(e).__name__}: "
+                         f"{e}). Nothing was changed.")
+    if named_orig and int(named_orig) != orig:
+        die("BACKUP_MISMATCH",
+            f"{path} is a backup of #{orig}, but build/{args.slug}/wp.json is "
+            f"replacing #{named_orig}. Nothing was changed.")
+    creds = wp_creds()
+
+    # Elementor's own data is what the restore stands on. If it moved, someone
+    # edited the page after the swap: do not guess which side wins.
+    if _json_or_raw(get_meta(orig, "_elementor_data", creds=creds)) != _json_or_raw(want):
+        die("ELEMENTOR_DATA_CHANGED",
+            f"#{orig}'s _elementor_data is no longer what the backup holds. It was "
+            f"edited since; nothing was changed. Compare it with {path} and decide.")
+
+    cur = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit", creds=creds))
+    print(f"backup    {backup_body(out, orig, cur)}  (the body it holds now)")
+    ability("mc/set-post-html", {"post_id": orig, "content": raw}, creds=creds)
+    print(f"body      #{orig} set from the backup ({len(raw)} bytes)")
+    # --replace blanked this one switch and nothing else of the backed-up meta
+    # (_elementor_data stays in place), so this is all the meta there is to undo.
+    set_meta(orig, "_elementor_edit_mode", "builder", creds=creds)
+    print("elementor  edit mode back to builder")
+    wp("PUT", "/wp-json/siteground-optimizer/v1/purge-cache", creds=creds)
+
+    page = page_json(wp("GET", f"/wp-json/wp/v2/pages/{orig}?context=edit&_fields="
+                               f"id,link,status,modified_gmt", creds=creds))
+    try:
+        html = fetch_live(bust(page["link"]))[1]
+    except (urllib.error.URLError, OSError) as e:
+        die("RESTORE_FAILED",
+            f"#{orig} could not be read back from {page['link']} ({e}). The body "
+            f"and edit mode were written; check the page. The body it held before "
+            f"is in build/{args.slug}/backups/, the Elementor backup is {path}.")
+    if not _is_elementor_doc(html, orig):
+        die("RESTORE_FAILED",
+            f"{page['link']} does not render #{orig} as an Elementor page "
+            f"(no data-elementor-type=\"wp-page\" data-elementor-id=\"{orig}\"). "
+            f"Is it a cached copy? wp.json was left as it was. The Elementor "
+            f"backup is {path}.")
+    print(f"front end #{orig} is Elementor again")
+    if meta.get("replaced") or meta.get("replacing"):
+        # post_id stays: the original after a finished replace, the draft after
+        # an unfinished one (still there, so --replace can be tried again).
+        rest = {k: v for k, v in meta.items() if k not in ("replaced", "replacing")}
+        if meta.get("post_id") == orig:
+            rest.update(link=page["link"], status=page["status"],
+                        modified_gmt=page["modified_gmt"])
+        write_wp_meta(out, rest)
+        print("wp.json   replaced/replacing removed")
 
 
 def main():
@@ -5369,6 +5479,14 @@ def main():
     u.add_argument("--region", action="append", default=[],
                    help="post region slug (hong-kong, taiwan, …), repeatable")
     u.set_defaults(fn=cmd_push)
+
+    er = sub.add_parser("elementor-restore",
+                        help="put a page that push --replace swapped back on Elementor")
+    er.add_argument("slug")
+    er.add_argument("--backup", metavar="PATH",
+                    help="the Elementor backup to restore from (default: the one "
+                         "wp.json's replaced/replacing names)")
+    er.set_defaults(fn=cmd_elementor_restore)
 
     args = p.parse_args()
     args.fn(args)
