@@ -901,6 +901,9 @@ In a page repo, the `<slug>: extract` commit carries all of these.
 - `fonts` — what the original actually loaded. See *Fonts* below.
 - `widgets` and `tier 3:` — a tier-3 widget has no recipe. Stop, add one to
   `references/elementor-widgets.md` (generic — this repo is public), then build.
+- `posts` — the term ids the posts widgets query. The target language is only
+  known at push, which looks each one up in it and warns (never stops) for
+  every term it cannot find.
 - `popups` — each popup id is per language. Usage A in another language needs
   the one **that** language loads.
 - `responsive` and `assets` — how many rules and images were found.
@@ -930,11 +933,15 @@ skill applies unchanged: one section at a time, sourced numbers only,
 these pages: the Elementor original and the raw page both render in
 **Roboto**, which the site's Elementor header and kit load on every page. So the
 raw page needs to load no font of its own — but it depends on the header
-loading Roboto, and if that ever stops, the page falls back with it. The
-preview is not the site here: it loads Raleway, not the header's Roboto, so
-glyph widths in the preview can differ from the live page. When a whole block
-is off by the same few px, check which face the preview actually rendered
-before moving anything; the draft's front end has the last word.
+loading Roboto, and if that ever stops, the page falls back with it. For
+an Elementor build `preview` therefore loads the faces `extract` recorded in
+`design.json` → `source.fonts` (Roboto if it recorded none; icon faces left
+out), not Raleway, so the preview resolves the font stack the way the site
+does; Figma builds still get Raleway. Headless Chrome does not fetch the
+Google Fonts file, so put the face in `build/<slug>/assets/fonts/<family>.woff2`
+(`roboto.woff2`) for the measurement to use it. When a whole block is off by
+the same few px, check which face the preview actually rendered before moving
+anything; the draft's front end has the last word.
 
 ### 3. Check
 
@@ -1105,11 +1112,11 @@ Tested on throwaway pages in a WPML group of their own:
 | WPML copies builder mode and data onto a new translation | the front end still shows the Elementor original; the post-check misreads it as extra `<p>` | push clears both and checks (`STILL_ELEMENTOR`); look at the front end |
 | a shortcode's name in `page.css`, even in a comment | everything after it in the stylesheet dies, phone queries included; the preview runs no shortcodes and looks fine | `verify` fails it |
 | ` - ` in the copy | wptexturize makes it an en dash, inside `wp:html` too | `verify` warns; write `&#45;` |
-| Raleway assumed | the live page renders Roboto from the header and kit; the preview loads Raleway, so glyph widths differ | build to what the original loaded; check the preview's face |
+| Raleway assumed | the live page renders Roboto from the header and kit; a Raleway preview would measure other glyph widths | `preview` loads `source.fonts` for an Elementor build; ship `assets/fonts/roboto.woff2` so headless Chrome has it |
 | the theme's `padding-top:10px` on `h1`–`h5`, Elementor's 10px column padding | every section a little lower than the last | `references/elementor-widgets.md` |
 | `diff --width 390` as a narrowed window | Chrome will not go below ~500px; every number was off | Elementor builds diff at 768 and 390 in an iframe |
 | internal links in a translation | WPML rewrites them absolute on save | expected; not an error |
-| posts widget → `[wpb_post_list]` in a language with no matching term or posts | "No posts found." under a heading | hide the band when the list is empty (`elementor-widgets.md`, *posts*) |
+| posts widget → `[wpb_post_list]` in a language with no matching term or posts | "No posts found." under a heading | hide the band when the list is empty (`elementor-widgets.md`, *posts*); `extract` lists the term ids, `push --language` warns for each with no counterpart in that language |
 | a hero in `vh` | reference and build disagree on its height | references pin `vh` to 1000px; build in px |
 | the original's popup id kept on another language | the button does nothing | `elementor.json` → `popups`; use the id that language loads |
 | `push --post-id` on an Elementor page | the body is written, the page keeps rendering Elementor, nothing is backed up | refused (`ELEMENTOR_PAGE`); use `--replace` |
@@ -1138,9 +1145,9 @@ edit and push back — verified byte-identical on a 37KB page — but it is not
 the file someone originally wrote.
 
 An Elementor page keeps its layout in post meta, not the body. `pull` says so
-and stops (`ELEMENTOR_PAGE`) rather than writing a build folder that looks
-usable and is not. To work on one, start from `extract --from elementor`
-instead — see [From Elementor](#from-elementor).
+and stops (`ELEMENTOR_PAGE`, naming `extract --from elementor`) rather than
+writing a build folder that looks usable and is not. To work on one, start from
+`extract --from elementor` instead — see [From Elementor](#from-elementor).
 
 Without a `design.json` there is no copy to check and no render to diff
 against, so `verify` and `diff` have much less to say. That is the trade for

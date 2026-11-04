@@ -191,6 +191,7 @@ class PushElementor(unittest.TestCase):
         self.calls = []
         self.rendered = self.RENDERED
         self.meta = ["", ""]          # successive get_meta answers
+        self.routes = {}              # GET path prefix -> answer, ahead of the default page
         for name, repl in (
                 ("BUILD", self.build),
                 ("wp_creds", lambda: ("https://x", "u", "p")),
@@ -203,6 +204,11 @@ class PushElementor(unittest.TestCase):
 
     def fake_wp(self, method, path, **kw):
         self.calls.append((method, path))
+        for prefix, answer in self.routes.items():
+            if method == "GET" and path.startswith(prefix):
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
         if method == "GET":
             return {"id": 5, "slug": "p", "status": "draft", "link": "https://x/p/",
                     "title": {"raw": "T"}, "parent": 0,
@@ -243,6 +249,71 @@ class PushElementor(unittest.TestCase):
                 "modified_gmt": "2026-01-01T00:00:00"}
         meta.update(extra)
         put(os.path.join(self.out, "wp.json"), json.dumps(meta))
+
+    # --- posts widget terms in the target language (spec 9) -------------------
+
+    def posts_json(self, queries):
+        put(os.path.join(self.out, "elementor.json"),
+            json.dumps({"post_id": 1234, "posts_queries": queries}))
+
+    def term_routes(self, found_in_target):
+        self.routes = {
+            "/wp-json/wp/v2/taxonomies?type=post": {
+                "category": {"rest_base": "categories"}, "post_tag": {"rest_base": "tags"}},
+            "/wp-json/wp/v2/categories?include=12": [
+                {"id": 12, "slug": "news", "name": "News"}],
+            "/wp-json/wp/v2/tags?include=12": [],
+            "/wp-json/wp/v2/categories?slug=news&lang=zh-hk":
+                [{"id": 40, "slug": "news"}] if found_in_target else [],
+            "/wp-json/wp/v2/categories?search=News&lang=zh-hk": [],
+        }
+
+    def warns(self, out):
+        return [l for l in out.splitlines() if l.startswith("warn") and "posts" in l]
+
+    def test_missing_term_in_target_language_warns_once_and_push_goes_on(self):
+        self.posts_json([{"posts_post_type": "post", "posts_include_term_ids": ["12"],
+                          "posts_per_page": 3}])
+        self.term_routes(found_in_target=False)
+        out = self.push(language="zh-hk")
+        w = self.warns(out)
+        self.assertEqual(len(w), 1, out)
+        self.assertIn("zh-hk", w[0])
+        self.assertIn("News", w[0])
+        self.assertIn("empty", w[0])
+        self.assertIn("hide", w[0])
+        self.assertIn("mc/create-localized-page", self.names())     # a warning, not a stop
+        lookups = [c for c in self.calls if isinstance(c[1], str)
+                   and ("lang=" in c[1] or "taxonomies" in c[1])]
+        self.assertTrue(lookups)
+        self.assertEqual({c[0] for c in lookups}, {"GET"})          # read-only
+
+    def test_term_present_in_target_language_is_quiet(self):
+        self.posts_json([{"posts_post_type": "post", "posts_include_term_ids": ["12"]}])
+        self.term_routes(found_in_target=True)
+        self.assertEqual(self.warns(self.push(language="zh-hk")), [])
+
+    def test_no_posts_queries_means_no_term_lookup(self):
+        self.posts_json([])
+        self.push(language="zh-hk")
+        self.assertFalse([c for c in self.calls if "taxonomies" in str(c[1])])
+        os.remove(os.path.join(self.out, "elementor.json"))
+        self.push(language="zh-hk")
+        self.assertFalse([c for c in self.calls if "taxonomies" in str(c[1])])
+
+    def test_posts_query_without_terms_is_not_looked_up(self):
+        self.posts_json([{"posts_post_type": "post", "posts_per_page": 3}])
+        self.push(language="zh-hk")
+        self.assertFalse([c for c in self.calls if "taxonomies" in str(c[1])])
+
+    def test_failed_term_lookup_warns_and_never_dies(self):
+        self.posts_json([{"posts_post_type": "post", "posts_include_term_ids": ["12"]}])
+        self.routes = {"/wp-json/wp/v2/taxonomies?type=post": SystemExit(1)}
+        with contextlib.redirect_stderr(io.StringIO()):
+            out = self.push(language="zh-hk")
+        self.assertEqual(len(self.warns(out)), 1, out)
+        self.assertIn("could not check", self.warns(out)[0])
+        self.assertIn("mc/create-localized-page", self.names())
 
     def test_bad_language_dies_before_any_write(self):
         err = io.StringIO()
@@ -1708,6 +1779,18 @@ class ExtractElementor(ExtractFixture):
                       "references/elementor-widgets.md yet", printed)
         self.assertIn("900", printed)
 
+    def test_extract_notes_the_posts_queries_terms(self):
+        printed = self.extract()
+        line = [l for l in printed.splitlines() if l.startswith("posts")]
+        self.assertEqual(len(line), 1, printed)
+        self.assertIn("12", line[0])
+        self.assertIn("target language", line[0])
+
+    def test_extract_without_posts_widget_prints_no_posts_note(self):
+        self.meta["_elementor_data"] = "[]"
+        self.assertFalse([l for l in self.extract().splitlines()
+                          if l.startswith("posts")])
+
     def test_live_html_is_the_snapshot_with_vh_pinned(self):
         self.html = LIVE.replace("<head>", "<head><style>.full{height:100vh}</style>", 1)
         self.extract()
@@ -2304,6 +2387,94 @@ class CopyJson(unittest.TestCase):
 
     def test_load_copy_without_file_is_none(self):
         self.assertIsNone(fw.load_copy(self.out))
+
+
+class PreviewFonts(unittest.TestCase):
+    """The preview loads the fonts the reference loaded. Raleway is the Figma
+    builds' face; on the live site it is named and never loaded, so an
+    Elementor build resolves its stack the way the site does."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.out = os.path.join(self.tmp, "build", "p")
+        os.makedirs(os.path.join(self.out, "assets", "fonts"))
+
+    def face(self, name):
+        _write(os.path.join(self.out, "assets", "fonts", name), "x")
+
+    def elementor(self, fonts):
+        return {"source": {"type": "elementor", "fonts": fonts}}
+
+    def test_elementor_build_loads_what_the_reference_loaded_not_raleway(self):
+        html = fw.preview_font_html(self.out, self.elementor(["Roboto", "eicons"]))
+        self.assertIn("family=Roboto", html)
+        self.assertNotIn("Raleway", html)
+        self.assertNotIn("eicons", html)         # an icon face is not on Google Fonts
+
+    def test_elementor_build_without_reported_fonts_falls_back_to_roboto(self):
+        for design in (self.elementor([]), {"source": {"type": "elementor"}}):
+            html = fw.preview_font_html(self.out, design)
+            self.assertIn("family=Roboto", html)
+            self.assertNotIn("Raleway", html)
+
+    def test_elementor_build_serves_the_local_face_when_shipped(self):
+        self.face("roboto.woff2")
+        css = fw.preview_font_html(self.out, self.elementor(["Roboto"]))
+        self.assertIn("@font-face{font-family:'Roboto'", css)
+        self.assertIn("assets/fonts/roboto.woff2", css)
+        self.assertNotIn("raleway", css.lower())
+
+    def test_elementor_build_that_loaded_raleway_keeps_it(self):
+        self.face("raleway.woff2")
+        html = fw.preview_font_html(self.out, self.elementor(["Raleway", "Roboto"]))
+        self.assertIn("family=Raleway", html)
+        self.assertIn("assets/fonts/raleway.woff2", html)
+
+    def test_figma_and_claude_design_builds_are_unchanged(self):
+        self.face("raleway.woff2")
+        for design in ({}, {"source": {"type": "figma"}}, {"source": {"type": "claude-design"}}):
+            html = fw.preview_font_html(self.out, design)
+            self.assertIn("family=Raleway:wght@400;500;600;700", html)
+            self.assertIn("family=Noto+Sans+TC", html)
+            self.assertIn("assets/fonts/raleway.woff2", html)
+            self.assertNotIn("Roboto", html)
+
+    def test_preview_html_carries_it(self):
+        import http.server
+        _write(os.path.join(self.out, "page.html"), "<p id=\"x\">hi</p>")
+        _write(os.path.join(self.out, "design.json"), json.dumps(self.elementor(["Roboto"])))
+        args = fw.argparse.Namespace(slug="p", port=0, bare=True)
+        with mock.patch.object(fw, "BUILD", os.path.join(self.tmp, "build")), \
+                mock.patch.object(http.server, "ThreadingHTTPServer"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            fw.cmd_preview(args)
+        page = _read(os.path.join(self.out, "preview.html"))
+        self.assertIn("family=Roboto", page)
+        self.assertNotIn("family=Raleway", page)
+        _write(os.path.join(self.out, "design.json"), json.dumps({"source": {"type": "figma"}}))
+        with mock.patch.object(fw, "BUILD", os.path.join(self.tmp, "build")), \
+                mock.patch.object(http.server, "ThreadingHTTPServer"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            fw.cmd_preview(args)
+        self.assertIn("family=Raleway", _read(os.path.join(self.out, "preview.html")))
+
+
+class PullElementorPage(unittest.TestCase):
+    def test_pull_points_at_extract_from_elementor(self):
+        page = {"id": 7, "title": {"raw": "T"}, "status": "publish", "slug": "t",
+                "content": {"raw": "[elementor-template id=\"7\"]"}}
+        args = fw.argparse.Namespace(target="7", post_type="page", slug=None)
+        err = io.StringIO()
+        with mock.patch.object(fw, "wp_creds", lambda: ("https://x", "u", "p")), \
+                mock.patch.object(fw, "find_page", return_value=[{"id": 7}]), \
+                mock.patch.object(fw, "wp", return_value=page), \
+                mock.patch.object(fw, "BUILD", tempfile.mkdtemp()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit):
+            fw.cmd_pull(args)
+        self.assertIn("ELEMENTOR_PAGE", err.getvalue())
+        self.assertIn("extract --from elementor", err.getvalue())
 
 
 if __name__ == "__main__":

@@ -2091,6 +2091,13 @@ def extract_elementor(args):
           f"tier 3: {tiers[3]}), template {inv['template'] or '(default)'}")
     for t in inv["tier3"]:
         print(f"tier 3: {t} — no recipe in references/elementor-widgets.md yet")
+    pq = [q for q in inv["posts_queries"] if q.get("posts_include_term_ids")]
+    if pq:
+        terms = sorted({str(i) for q in pq for i in q["posts_include_term_ids"]},
+                       key=lambda x: (len(x), x))
+        print(f"posts     {len(inv['posts_queries'])} widget(s), term id(s) "
+              f"{', '.join(terms)} — check these exist in the target language "
+              f"(push --language warns for each one that does not)")
     print("popups    " + (", ".join(str(p) for p in inv["popups"]) or "none")
           + ("  — check which popup each language actually loads" if inv["popups"] else ""))
     if css_from:
@@ -3924,15 +3931,55 @@ def site_shell(out, refresh=False, sample=None):
     return sheet, shell
 
 
-def local_font_css(out):
-    """@font-face for a face shipped in the build, so a measurement never
-    depends on a network fetch that headless Chrome does not make."""
-    f = os.path.join(out, "assets", "fonts", "raleway.woff2")
-    if not os.path.exists(f):
-        return ""
-    return ("<style>@font-face{font-family:'Raleway';"
-            "src:url('assets/fonts/raleway.woff2') format('woff2');"
-            "font-weight:100 900;font-style:normal;font-display:block}</style>")
+def local_font_css(out, families=("Raleway",)):
+    """@font-face for a face shipped in the build (assets/fonts/<family>.woff2),
+    so a measurement never depends on a network fetch that headless Chrome does
+    not make."""
+    css = ""
+    for fam in families:
+        rel = "assets/fonts/" + fam.lower().replace(" ", "-") + ".woff2"
+        if os.path.exists(os.path.join(out, rel)):
+            css += (f"<style>@font-face{{font-family:'{fam}';"
+                    f"src:url('{rel}') format('woff2');"
+                    "font-weight:100 900;font-style:normal;font-display:block}</style>")
+    return css
+
+
+# Icon faces are in document.fonts too, but Google Fonts does not host them and
+# one unknown family makes the whole css2 request fail.
+ICON_FONT = re.compile(r"icon|awesome|dashicons|swiper|glyph|symbol", re.I)
+WEIGHTED = {"Roboto", "Raleway"}
+
+
+def read_design(out):
+    try:
+        with open(os.path.join(out, "design.json"), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def preview_font_html(out, design):
+    """The preview's font <link> and local faces. Figma and Claude Design
+    builds get Raleway, as they always did. An Elementor build gets what the
+    reference actually loaded (design.json source.fonts): the site names Raleway
+    in its stylesheets and loads Roboto, so a Raleway preview measures glyph
+    widths no visitor sees. Roboto stands in when extract reported nothing."""
+    src = (design or {}).get("source") or {}
+    if src.get("type") != "elementor":
+        return ('<link href="https://fonts.googleapis.com/css2?family=Raleway:'
+                'wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700'
+                '&display=swap" rel="stylesheet">' + local_font_css(out))
+    fams = []
+    for f in src.get("fonts") or []:
+        if f and not ICON_FONT.search(f) and f not in fams:
+            fams.append(f)
+    fams = fams or ["Roboto"]
+    q = "&family=".join(urllib.parse.quote_plus(f) + (":wght@400;500;600;700"
+                                                      if f in WEIGHTED else "")
+                        for f in fams)
+    return ('<link href="https://fonts.googleapis.com/css2?family=' + q +
+            '&display=swap" rel="stylesheet">' + local_font_css(out, fams))
 
 
 MOBILE_WRAP = """<!doctype html><meta charset="utf-8"><title>mobile</title>
@@ -4218,18 +4265,15 @@ def cmd_preview(args):
             fh.write('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                      '<meta name="viewport" content="width=device-width,initial-scale=1">'
                      f"<title>{args.slug} — preview</title>"
-                     '<link href="https://fonts.googleapis.com/css2?family=Raleway:'
-                     'wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700'
-                     '&display=swap" rel="stylesheet">'
                      # Headless Chrome never receives the Google Fonts file —
                      # document.fonts.check reported every weight of Raleway
                      # unloaded — so it measured a wider fallback, and boxes
                      # were being widened to compensate for a font that was
                      # never missing on the site itself. Serve the face out of
                      # the build when it is there.
-                     + (f'<link rel="stylesheet" href="site/site.css">'
-                        if site_css else "")
-                     + local_font_css(root) +
+                     + preview_font_html(root, read_design(root)) +
+                     (f'<link rel="stylesheet" href="site/site.css">'
+                      if site_css else "") +
                      "<style>body{margin:0}</style></head>"
                      f'<body class="{body_cls}">' + open_wraps + build_page() +
                      close_wraps + MEASURE_JS +
@@ -4425,9 +4469,12 @@ def page_wrapper(out):
 def assert_raw(post_id, rendered, wrapper, creds=None):
     """After a push, the page must be raw HTML on the front end, not Elementor.
 
-    Two signs: _elementor_edit_mode is empty, and the rendered body carries the
-    page's own wrapper class. Either one failing means the site is still
-    drawing the Elementor document, whatever post_content now says.
+    The meta check is what decides: _elementor_edit_mode empty or not (the live
+    experiment showed it alone switches the front end between Elementor and the
+    body). The wrapper-class check is only meaningful when `rendered` is the
+    front end's HTML, as after --replace. REST content.rendered, which usage A
+    passes, never runs Elementor, so it carries the wrapper whatever the meta
+    says and that check proves nothing there.
     """
     mode = get_meta(post_id, "_elementor_edit_mode", creds=creds)
     if mode:
@@ -4683,7 +4730,10 @@ def cmd_pull(args):
         print("page      this looks like an Elementor page — its layout is not "
               "in the body, so there is nothing here to edit. Stopping.",
               file=sys.stderr)
-        die("ELEMENTOR_PAGE", "pull only works on pages whose HTML is the body.")
+        die("ELEMENTOR_PAGE",
+            "pull only works on pages whose HTML is the body. To rebuild an "
+            "Elementor page as raw HTML, start from its render instead: "
+            "extract --from elementor <url>")
 
     styles = re.findall(r"<style[^>]*>.*?</style>", body, re.S)
     css = "\n\n".join(re.sub(r"</?style[^>]*>", "", x).strip() for x in styles)
@@ -4957,6 +5007,75 @@ def _replace_finish(out, meta, orig, draft, before, ebackup, url, creds):
     print(f"wp.json   #{orig} now, replaced draft #{draft}, edited {page['modified_gmt']}")
 
 
+def posts_term_gaps(queries, language, creds):
+    """Terms named by Elementor posts widgets that have no counterpart in
+    `language`: [(query index, taxonomy rest_base, term id, name or None)].
+
+    elementor.json carries term ids of the original's language. Each is read
+    back to a slug and name, then looked up in the target language by slug,
+    then by name (WPML often gives a translated term its own slug). A term whose
+    id cannot be read back is reported with name None — it cannot be checked.
+    GET only."""
+    missing, taxes = [], {}
+    for qi, q in enumerate(queries):
+        ids = [str(i) for i in q.get("posts_include_term_ids") or []]
+        if not ids:
+            continue
+        ptype = q.get("posts_post_type") or "post"
+        if ptype not in taxes:
+            tx = wp("GET", f"/wp-json/wp/v2/taxonomies?type={urllib.parse.quote(ptype)}",
+                    creds=creds) or {}
+            taxes[ptype] = [t["rest_base"] for t in tx.values()
+                            if isinstance(t, dict) and t.get("rest_base")]
+        for tid in ids:
+            found = None
+            for rb in taxes[ptype]:
+                hit = wp("GET", f"/wp-json/wp/v2/{rb}?include={urllib.parse.quote(tid)}"
+                                f"&lang=all&_fields=id,slug,name", creds=creds) or []
+                if hit:
+                    found = (rb, hit[0])
+                    break
+            if not found:
+                missing.append((qi, None, tid, None))
+                continue
+            rb, term = found
+            lang = urllib.parse.quote(language)
+            there = wp("GET", f"/wp-json/wp/v2/{rb}?slug={urllib.parse.quote(term['slug'])}"
+                              f"&lang={lang}&_fields=id,slug", creds=creds) or []
+            if not there and term.get("name"):
+                there = wp("GET", f"/wp-json/wp/v2/{rb}?search={urllib.parse.quote(term['name'])}"
+                                  f"&lang={lang}&_fields=id,name", creds=creds) or []
+                there = [t for t in there if t.get("name") == term["name"]]
+            if not there:
+                missing.append((qi, rb, tid, term.get("name") or term["slug"]))
+    return missing
+
+
+def warn_posts_terms(out, language, creds):
+    """push of an Elementor build: say which posts-widget terms the target
+    language lacks. A warning only — the page is still pushed — and never a
+    failure: a lookup that goes wrong is itself one more warning."""
+    try:
+        with open(os.path.join(out, "elementor.json"), encoding="utf-8") as fh:
+            queries = json.load(fh).get("posts_queries") or []
+    except (OSError, ValueError):
+        return
+    if not any(q.get("posts_include_term_ids") for q in queries):
+        return
+    try:
+        gaps = posts_term_gaps(queries, language, creds)
+    except (Exception, SystemExit) as e:    # wp() dies on HTTP errors
+        print(f"warn      posts: could not check the posts widgets' terms in "
+              f"{language} ({type(e).__name__}); check by hand that they exist")
+        return
+    for qi, rb, tid, name in gaps:
+        what = (f"{rb} term {name!r} (id {tid})" if name else
+                f"term id {tid}, which could not be read back to a name,")
+        print(f"warn      posts: widget #{qi + 1} lists {what} with no "
+              f"{language} counterpart — its [wpb_post_list] will be empty; "
+              f"hide the section when the list is empty")
+
+
 def cmd_push(args):
     # The build directory name and the page's URL slug are different things:
     # you want to try a design at a throwaway URL before it takes the real one.
@@ -5019,6 +5138,9 @@ def cmd_push(args):
         replace = int(replace)
         src = _replace_gate(out, meta, replace, args)
         draft_id, post_id = int(post_id), replace
+
+    if not replace:
+        warn_posts_terms(out, args.language, creds)
 
     if not post_id and not args.title:
         die("NO_TITLE", "--title is required when creating a page")
