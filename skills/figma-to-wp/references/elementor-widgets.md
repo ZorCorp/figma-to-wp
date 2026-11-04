@@ -187,7 +187,9 @@ The older tabs widget. Same recipe as `nested-tabs`.
 is single-open: opening one closes its siblings, and the open item carries
 `.open`. Write the body's hidden and open states in the page CSS. The
 reference shows whichever item was open when the page loaded — usually the
-first, or none.
+first, or none. Put `open` on that item in the markup: on an Elementor build
+`preview` leaves the accordions as written (it only force-opens them for Figma
+frames), so what you write is what `diff` shoots.
 
 ### accordion
 

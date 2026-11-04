@@ -973,6 +973,18 @@ straight in the padded link. A `design.json` extracted before this change holds
 element-box positions at 768 and 390: re-run `extract` to refresh the reference
 before trusting `mobile`'s positions. Body copy under 16px that is under 16px
 on the original too is printed as a note, not counted: the original is the spec.
+The same goes for a `tap < 40` link and for content against the screen edge
+(`gutter`) that the original has at that width too. Gutter is read from the
+original's texts; a tap target only from a reference run that is the `<a>` or
+`<button>` itself — Elementor's button label sits in a span inside the link,
+which says nothing about the link, so that finding stays. On a translated page
+(`copy.json`) the original's string is paired with the page's through its copy
+entry (`from` → `to`), so a translated button that is under 16px on the
+original is a note too.
+
+`preview` shows an accordion as the original loads it: on an Elementor build
+it no longer opens every item (that is for Figma frames, which are drawn
+all-open), so the reference and the preview agree on which one is open.
 
 ### Usage A — copy
 
@@ -1094,6 +1106,17 @@ there.
    is always safe.** It clears `replaced`/`replacing` from `wp.json` and prints
    how to replace again.
 
+   The restore itself changes the original's `modified_gmt`, which `--replace`
+   holds against `design.json` → `source.modified_gmt` (`PAGE_MOVED_ON`). When
+   the backup is of exactly the state extract read (same `modified_gmt`) —
+   which `--replace` guarantees — and `_elementor_data` was just verified to
+   equal the backup, restore writes the page's new stamp into
+   `source.modified_gmt` and adds `source.restored_at`, so **replacing again
+   works without a new extract**. With any other backup (`--backup` of another
+   state, or a `design.json` of another extract), `design.json` is left alone
+   and the hint starts with "extract it again first": extract, rebuild, then
+   replace.
+
 ### What the site was seen to do
 
 Tested on throwaway pages in a WPML group of their own:
@@ -1113,9 +1136,15 @@ Tested on throwaway pages in a WPML group of their own:
   while the front end draws Elementor. Check the front end.
 - **A draft can be checked** in a logged-in browser at
   `?page_id=N&preview=true` — nothing has to be published to be looked at.
-- Not yet settled: whether saving the original in Elementor copies its meta
-  back onto a translation that push made raw — the acceptance run will answer
-  it.
+- **Saving the original in Elementor does not reach the raw translations.**
+  Save Draft on a draft and Update on a published page, each with a real
+  content change, left a raw translation's edit mode, Elementor data and
+  modified time as they were. No re-check command is needed.
+- **A logged-in browser loads one more stylesheet than a visitor.** It pulls a
+  Google Fonts sheet (Raleway, Lato, Roboto) anonymous visitors do not get, so
+  a page looked at in `?preview=true` while logged in renders Raleway where
+  visitors see Roboto. Judge type widths from `diff`, the preview, or an
+  anonymous window, never from a logged-in look.
 
 ### Traps already met
 

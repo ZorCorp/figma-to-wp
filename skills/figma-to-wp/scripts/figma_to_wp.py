@@ -4190,6 +4190,28 @@ addEventListener('message', function (e) {
 </script>"""
 
 
+def el_reference_keys(ref_texts, cp, n):
+    """What each text the original had at a width is called on the rebuilt page,
+    as (record, first n normalised characters). A translated build says
+    different words in the same places, so a string pairs through the copy
+    entry that names it (`from` -> `to`); an untranslated one, or no copy.json,
+    is its own text. A reference run is cut at 90 characters and the entry's
+    `from` is the whole string, so a run pairs with the entry it is the start of."""
+    to = {}
+    if cp and cp["mode"] == "translated":
+        for e in cp["entries"]:
+            if isinstance(e.get("from"), str) and e.get("to"):
+                to.setdefault(norm_text(e["from"]), norm_text(e["to"]))
+    out = []
+    for r in ref_texts:
+        t = norm_text(r.get("text", ""))
+        word = to.get(t)
+        if word is None and to and len(t) >= 3:
+            word = next((v for k, v in to.items() if k.startswith(t)), None)
+        out.append((r, (word or t)[:n]))
+    return out
+
+
 def cmd_mobile(args):
     """What only goes wrong on a phone.
 
@@ -4271,13 +4293,17 @@ def cmd_mobile(args):
     else:
         print(f"overflow  none (scrollWidth {mob['scrollW']})")
 
+    # copy.json first: a translated page is paired with the original through it.
+    cp = load_copy(out)
+    translated = bool(cp) and cp["mode"] == "translated"
+
     small = mob["small"]
     # Small text the original page has too is the design's own, not a slip of
     # the rebuild: keyed on the first 26 characters, which is all `small` keeps.
     noted = []
     if el_ref:
-        had = {norm_text(t.get("text", ""))[:26] for t in el_ref.get("texts") or []
-               if ((t.get("type") or {}).get("size") or 16) < 16}
+        had = {k for r, k in el_reference_keys(el_ref.get("texts") or [], cp, 26)
+               if ((r.get("type") or {}).get("size") or 16) < 16}
         noted = [t for t in small if norm_text(t["txt"])[:26] in had]
         small = [t for t in small if t not in noted]
     if small:
@@ -4295,6 +4321,18 @@ def cmd_mobile(args):
             print(f"          {t['fs']:<6} .{t['cls'][:30]:<30} {t['txt']!r}")
 
     tap = mob["tap"]
+    # The original is the spec here too. All design.json keeps of its links is
+    # a text run with its element's box, so only a run that IS the <a> or
+    # <button> says how big the original's target was: Elementor's button label
+    # sits in a span inside the link, whose box is the span's. Those decide
+    # nothing, and the finding stays (keyed on the 18 characters `tap` keeps).
+    tap_noted = []
+    if el_ref:
+        had = {k for r, k in el_reference_keys(el_ref.get("texts") or [], cp, 18)
+               if r.get("tag") in ("a", "button")
+               and ((r.get("h") or 99) < 40 or (r.get("w") or 99) < 40)}
+        tap_noted = [t for t in tap if norm_text(t["txt"])[:18] in had]
+        tap = [t for t in tap if t not in tap_noted]
     if tap:
         bad += 1
         print(f"tap < 40  {len(tap)} link(s)/button(s)")
@@ -4302,6 +4340,11 @@ def cmd_mobile(args):
             print(f"          {t['box']:<10} .{t['cls'][:28]:<28} {t['txt']!r}")
     else:
         print("tap < 40  none")
+    if tap_noted:
+        print(f"          note: {len(tap_noted)} more are under 40 on the original "
+              f"page at {args.width}px too")
+        for t in tap_noted[:8]:
+            print(f"          {t['box']:<10} .{t['cls'][:28]:<28} {t['txt']!r}")
 
     lefts = sorted(((int(k), v) for k, v in mob["lefts"].items()),
                    key=lambda kv: -kv[1])
@@ -4311,10 +4354,22 @@ def cmd_mobile(args):
     if lefts:
         print("gutter    " + "  ".join(f"{x}px×{n_}" for x, n_ in lefts[:4]))
         jammed = [(x, n_) for x, n_ in lefts if x < 12]
+        # Content the original sat just as close to the edge is its own
+        # design. The reference has the same tally's inputs: a run wider than
+        # 120px, its element's left edge (box_x; x for a run measured without
+        # one). An edge offset within 1px of one of those is a note.
+        edge = {round(r.get("box_x", r.get("x", 99))) for r in
+                (el_ref or {}).get("texts") or [] if (r.get("w") or 0) > 120}
+        shared = [(x, n_) for x, n_ in jammed if any(abs(x - e) <= 1 for e in edge)]
+        jammed = [j for j in jammed if j not in shared]
         if jammed:
             bad += 1
             print("          content against the edge: "
                   + ", ".join(f"{x}px × {n_}" for x, n_ in jammed[:4]))
+        if shared:
+            print("          note: against the edge on the original page at "
+                  f"{args.width}px too: "
+                  + ", ".join(f"{x}px × {n_}" for x, n_ in shared[:4]))
 
     # A square box is only wrong when the file is not square — three 60x60
     # icons drawn 60x60 are fine, a 467x67 wordmark drawn 240x240 is not.
@@ -4334,8 +4389,6 @@ def cmd_mobile(args):
     # narrower and an English one wraps differently, so a text-by-text position
     # check would flag every string. What must still hold is the page's
     # rhythm: where each section starts and how tall it is.
-    cp = load_copy(out)
-    translated = bool(cp) and cp["mode"] == "translated"
     if el:
         label = "sections" if translated else "positions"
         if not el_ref:
@@ -4419,8 +4472,11 @@ def cmd_preview(args):
         # shows its content, not the behaviour the file's own comment asks for
         # ("click a title to open, the previous one closes"). Open them for the
         # measurement only, so the two sides describe the same content; the
-        # page keeps shipping one-at-a-time.
-        page = re.sub(r'(<div class="acc-item)(")', r'\1 open\2', page)
+        # page keeps shipping one-at-a-time. An Elementor reference is the
+        # page as it loads (usually one item open), so there the build's own
+        # state is the one to compare.
+        if (read_design(root).get("source") or {}).get("type") != "elementor":
+            page = re.sub(r'(<div class="acc-item)(")', r'\1 open\2', page)
         return re.sub(r'src="(assets/[^"?]+)"', bust, page)
 
     # Claim the port first. Writing preview.html before binding means a second
@@ -5701,13 +5757,35 @@ def cmd_elementor_restore(args):
                         modified_gmt=page["modified_gmt"])
         write_wp_meta(out, rest)
         print("wp.json   replaced/replacing removed")
+    # The restore itself moved the original's modified_gmt, which is what
+    # --replace holds against the extract (PAGE_MOVED_ON). When the backup is
+    # of exactly the state extract read, and _elementor_data was just checked
+    # to still equal the backup, the page is that state again: re-stamp the
+    # extract instead of making the next replace extract a second time.
+    dpath = os.path.join(out, "design.json")
+    design = read_design(out)
+    src = design.get("source") or {}
+    restamped = (src.get("type") == "elementor" and src.get("post_id") == orig
+                 and rec.get("modified_gmt") and
+                 rec["modified_gmt"] == src.get("modified_gmt"))
+    if restamped:
+        src["modified_gmt"] = page["modified_gmt"]
+        src["restored_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(dpath, "w", encoding="utf-8") as fh:
+            json.dump(design, fh, ensure_ascii=False, indent=1)
+        print("design.json  source.modified_gmt moved to the restored page's stamp")
+    if meta.get("replaced") or meta.get("replacing"):
+        first = ("it is the state extract read, so no new extract is needed: "
+                 if restamped else
+                 "extract it again first (the page's edit time moved, so --replace "
+                 "would stop with PAGE_MOVED_ON), then ")
         if meta.get("post_id") == orig:
             # push updates whatever post_id names, and the draft is in the trash.
-            print(f"to replace it again: drop \"post_id\" from build/{args.slug}/"
-                  f"wp.json, push a fresh draft (push {args.slug} --title ...), "
-                  f"then push {args.slug} --replace {orig}")
+            print(f"to replace it again: {first}drop \"post_id\" from build/"
+                  f"{args.slug}/wp.json, push a fresh draft (push {args.slug} "
+                  f"--title ...), then push {args.slug} --replace {orig}")
         else:
-            print(f"to replace it again: push {args.slug} --replace {orig}")
+            print(f"to replace it again: {first}push {args.slug} --replace {orig}")
 
 
 def main():

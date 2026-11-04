@@ -1122,6 +1122,53 @@ class RestoreElementor(unittest.TestCase):
         self.assertNotIn("post_id", out)              # the draft is still there
         self.assertIn("push p --replace 50", out)
 
+    def design_json(self, **src):
+        path = os.path.join(self.out, "design.json")
+        with open(path, "w") as fh:
+            json.dump({"source": {"type": "elementor", "post_id": self.ORIG,
+                                  "modified_gmt": "2026-02-02T00:00:00", **src},
+                       "texts": []}, fh)
+        return path
+
+    def test_restore_of_the_extracted_state_moves_design_json_to_the_new_stamp(self):
+        path = self.design_json()
+        out = self.run_restore()
+        with open(path) as fh:
+            d = json.load(fh)
+        self.assertEqual(d["source"]["modified_gmt"], "2026-04-04T00:00:00")
+        self.assertRegex(d["source"]["restored_at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        self.assertEqual(d["source"]["post_id"], self.ORIG)      # the rest is untouched
+        self.assertIn("no new extract", out)
+        self.assertNotIn("extract it again first", out)
+        self.assertIn("push p --replace 50", out)
+
+    def test_restore_of_another_state_leaves_design_json_and_says_extract_again(self):
+        path = self.design_json(modified_gmt="2026-03-03T00:00:00")   # not what was backed up
+        before = _read(path)
+        out = self.run_restore()
+        self.assertEqual(_read(path), before)
+        self.assertIn("extract it again first", out)
+        self.assertNotIn("no new extract", out)
+        self.assertIn("push p --replace 50", out)
+
+    def test_restore_without_a_design_json_says_extract_again(self):
+        out = self.run_restore()
+        self.assertFalse(os.path.exists(os.path.join(self.out, "design.json")))
+        self.assertIn("extract it again first", out)
+
+    def test_restore_of_another_pages_design_json_is_left_alone(self):
+        path = self.design_json(post_id=99)
+        before = _read(path)
+        self.run_restore()
+        self.assertEqual(_read(path), before)
+
+    def test_restore_does_not_touch_design_json_when_the_front_end_check_fails(self):
+        path = self.design_json()
+        before = _read(path)
+        self.fetched = ["<p>not elementor</p>"]
+        self.dies("RESTORE_FAILED")
+        self.assertEqual(_read(path), before)
+
     def test_backup_elementor_keeps_the_page_js(self):
         out = os.path.join(self.tmp, "b")
         self.metas.update({"_elementor_edit_mode": "builder", "_wpbuddy_page_js": "x();"})
@@ -1594,11 +1641,12 @@ class MeasureJs(unittest.TestCase):
 
 
 
-def _measure_dom(runs, root, sections=(), fonts=("Roboto",), vw=1440, small=()):
+def _measure_dom(runs, root, sections=(), fonts=("Roboto",), vw=1440, small=(), tap=(),
+                 lefts=None):
     data = {"runs": runs, "sections": list(sections), "boxes": [], "fontOK": {},
             "fonts": list(fonts), "root": root,
-            "mobile": {"vw": vw, "scrollW": vw, "over": [], "small": list(small), "tap": [],
-                       "lefts": {}, "imgs": []}}
+            "mobile": {"vw": vw, "scrollW": vw, "over": [], "small": list(small),
+                       "tap": list(tap), "lefts": lefts or {}, "imgs": []}}
     return ('<html><body><script type="application/json" id="fw-measure">%s'
             '</script></body></html>' % json.dumps(data))
 
@@ -2452,9 +2500,134 @@ class MobileDiffElementor(unittest.TestCase):
             bad = fw.cmd_mobile(args)
         return bad, buf.getvalue()
 
-    def dom(self, small=(), runs=(), root=None):
+    def dom(self, small=(), runs=(), root=None, tap=(), lefts=None):
         return _measure_dom(list(runs), root or {"x": 0, "y": 0, "w": 390, "h": 1000},
-                            vw=390, small=small)
+                            vw=390, small=small, tap=tap, lefts=lefts)
+
+    def ref(self, *texts):
+        self.design["widths"]["390"]["texts"] += list(texts)
+        _write(os.path.join(self.out, "design.json"), json.dumps(self.design))
+
+    # tap < 40: a link the original has at that size too is the design's own
+
+    def test_tap_target_the_original_has_too_is_a_note(self):
+        self.ref(_rec("Book a demo", 20, 500, tag="a", h=30))
+        tap = [{"cls": "cta", "txt": "Book a demo", "box": "120x30"}]
+        bad, text = self.mobile(self.dom(tap=tap))
+        self.assertEqual(bad, 0)
+        self.assertRegex(text, r"tap < 40\s+none")
+        self.assertIn("note: 1 more", text)
+        self.assertIn("Book a demo", text)
+
+    def test_tap_target_missing_from_the_original_is_a_finding(self):
+        tap = [{"cls": "cta", "txt": "Book a demo", "box": "120x30"}]
+        bad, text = self.mobile(self.dom(tap=tap))
+        self.assertEqual(bad, 1)
+        self.assertIn("tap < 40  1 link(s)/button(s)", text)
+
+    def test_tap_target_is_a_finding_when_the_original_one_was_big_enough(self):
+        self.ref(_rec("Book a demo", 20, 500, tag="a", h=48))
+        tap = [{"cls": "cta", "txt": "Book a demo", "box": "120x30"}]
+        bad, _ = self.mobile(self.dom(tap=tap))
+        self.assertEqual(bad, 1)
+
+    def test_tap_target_is_a_finding_when_the_reference_text_is_not_the_link(self):
+        # Elementor puts a button's label in a span inside the <a>: the run's
+        # box is the span's, which says nothing about the link, so it decides nothing
+        self.ref(_rec("Book a demo", 20, 500, tag="span", h=20))
+        tap = [{"cls": "cta", "txt": "Book a demo", "box": "120x30"}]
+        bad, _ = self.mobile(self.dom(tap=tap))
+        self.assertEqual(bad, 1)
+
+    def test_figma_build_counts_every_small_tap_target(self):
+        self.design["source"] = {"width": 1440}
+        self.ref(_rec("Book a demo", 20, 500, tag="a", h=30))
+        tap = [{"cls": "cta", "txt": "Book a demo", "box": "120x30"}]
+        bad, _ = self.mobile(self.dom(tap=tap))
+        self.assertEqual(bad, 1)
+
+    # gutter: content against the screen edge that the original has too
+
+    def test_gutter_against_the_edge_on_the_original_too_is_a_note(self):
+        self.ref(_rec("Edge hugging banner line", 4, 700, w=380, box_x=4))
+        bad, text = self.mobile(self.dom(lefts={"4": 2, "20": 9}))
+        self.assertEqual(bad, 0)
+        self.assertNotIn("content against the edge:", text)
+        self.assertIn("note", text)
+        self.assertIn("4px", text)
+
+    def test_gutter_edge_hugger_missing_from_the_original_is_a_finding(self):
+        self.ref(_rec("Edge hugging banner line", 4, 700, w=380, box_x=4))
+        bad, text = self.mobile(self.dom(lefts={"0": 1, "4": 2, "20": 9}))
+        self.assertEqual(bad, 1)
+        self.assertIn("content against the edge: 0px × 1", text)
+        finding = text.split("content against the edge:")[1].split("\n")[0]
+        self.assertNotIn("4px", finding)                 # that one is a note
+        self.assertIn("4px × 2", text)
+
+    def test_gutter_ignores_a_narrow_reference_run(self):
+        # measure.js only tallies elements wider than 120px; a 90px label at 4px
+        # on the original says nothing about a 380px block at 4px on the rebuild
+        self.ref(_rec("Narrow label", 4, 700, w=90, box_x=4))
+        bad, _ = self.mobile(self.dom(lefts={"4": 2}))
+        self.assertEqual(bad, 1)
+
+    def test_gutter_falls_back_to_x_for_a_reference_without_box_x(self):
+        self.ref(_rec("Edge hugging banner line", 4, 700, w=380))
+        bad, _ = self.mobile(self.dom(lefts={"4": 2}))
+        self.assertEqual(bad, 0)
+
+    # translated: the original's string is paired with the page's through copy.json
+
+    def copy_json(self, entries, mode="translated"):
+        _write(os.path.join(self.out, "copy.json"), json.dumps(
+            {"mode": mode, "source": "user", "approved": True, "entries": entries}))
+
+    def test_translated_small_text_is_paired_by_the_copy_entry(self):
+        self.copy_json([{"i": 7, "from": "Tiny legal line that is small",
+                         "to": "細小的法律聲明文字"}])
+        small = [{"cls": "legal", "fs": "12px",
+                  "txt": "細小的法律聲明文字"}]
+        bad, text = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 0)
+        self.assertIn("note: 1 more", text)
+
+    def test_translated_small_text_without_an_entry_is_a_finding(self):
+        self.copy_json([])
+        small = [{"cls": "legal", "fs": "12px",
+                  "txt": "細小的法律聲明文字"}]
+        bad, _ = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 1)
+
+    def test_translated_small_text_is_a_finding_when_it_is_another_string(self):
+        self.copy_json([{"i": 7, "from": "Tiny legal line that is small",
+                         "to": "細小的法律聲明文字"}])
+        small = [{"cls": "x", "fs": "12px", "txt": "另一段很小的字"}]
+        bad, _ = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 1)
+
+    def test_translated_entry_matches_a_reference_run_cut_short_of_the_string(self):
+        # the run is cut at 90 characters; the entry's `from` is the whole string
+        long_from = "Tiny legal line that is small " + "and keeps going " * 8
+        self.design["widths"]["390"]["texts"][0] = _rec(long_from[:90], 20, 900, size=12)
+        _write(os.path.join(self.out, "design.json"), json.dumps(self.design))
+        self.copy_json([{"i": 7, "from": long_from, "to": "譯文法律聲明行"}])
+        small = [{"cls": "legal", "fs": "12px", "txt": "譯文法律聲明行"}]
+        bad, _ = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 0)
+
+    def test_translated_tap_target_is_paired_by_the_copy_entry(self):
+        self.ref(_rec("Book a demo", 20, 500, tag="a", h=30))
+        self.copy_json([{"i": 2, "from": "Book a demo", "to": "預約示範"}])
+        tap = [{"cls": "cta", "txt": "預約示範", "box": "120x30"}]
+        bad, _ = self.mobile(self.dom(tap=tap))
+        self.assertEqual(bad, 0)
+
+    def test_verbatim_copy_json_pairs_by_the_text_itself(self):
+        self.copy_json([], mode="verbatim")
+        small = [{"cls": "legal", "fs": "12px", "txt": "Tiny legal line that is sma"}]
+        bad, _ = self.mobile(self.dom(small=small))
+        self.assertEqual(bad, 0)
 
     def test_small_text_present_in_reference_is_a_note_not_a_finding(self):
         small = [{"cls": "legal", "fs": "12px", "txt": "Tiny legal line that is sma"}]
@@ -2845,6 +3018,41 @@ class PreviewFonts(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             fw.cmd_preview(args)
         self.assertIn("family=Raleway", _read(os.path.join(self.out, "preview.html")))
+
+
+class PreviewAccordions(unittest.TestCase):
+    """The preview opens every accordion for a Figma frame (drawn all-open);
+    an Elementor reference shows the page as it loads, so it must not."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.out = os.path.join(self.tmp, "build", "p")
+        os.makedirs(self.out)
+        _write(os.path.join(self.out, "page.html"),
+               '<div class="acc"><div class="acc-item open"><b>a</b></div>'
+               '<div class="acc-item"><b>b</b></div></div>')
+
+    def preview(self, design):
+        import http.server
+        _write(os.path.join(self.out, "design.json"), json.dumps(design))
+        args = fw.argparse.Namespace(slug="p", port=0, bare=True)
+        with mock.patch.object(fw, "BUILD", os.path.join(self.tmp, "build")), \
+                mock.patch.object(http.server, "ThreadingHTTPServer"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            fw.cmd_preview(args)
+        return _read(os.path.join(self.out, "preview.html"))
+
+    def test_elementor_build_keeps_the_accordions_as_the_page_loads(self):
+        page = self.preview({"source": {"type": "elementor"}})
+        self.assertEqual(page.count('class="acc-item open"'), 1)    # the one already open
+        self.assertIn('<div class="acc-item"><b>b</b>', page)
+
+    def test_figma_and_claude_design_builds_open_every_accordion(self):
+        for design in ({}, {"source": {"type": "figma"}}, {"source": {"type": "claude-design"}}):
+            page = self.preview(design)
+            self.assertEqual(page.count('class="acc-item open"'), 2)
+            self.assertNotIn('<div class="acc-item"', page)
 
 
 class PullElementorPage(unittest.TestCase):
