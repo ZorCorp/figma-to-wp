@@ -90,6 +90,35 @@ class WpHelpers(unittest.TestCase):
             self.assertEqual(a.call_args[0][1],
                              {"post_id": 5, "meta_key": "_elementor_edit_mode"})
 
+    def test_get_meta_real_flat_shape(self):
+        # What mc/get-meta really answers: flat, field meta_value.
+        res = {"id": 5, "type": "page", "status": "draft", "title": "T",
+               "meta_key": "_elementor_edit_mode", "meta_value": "builder"}
+        with mock.patch.object(fw, "ability", return_value=res):
+            self.assertEqual(fw.get_meta(5, "_elementor_edit_mode"), "builder")
+
+    def test_get_meta_structured_value_is_returned_unchanged(self):
+        settings = {"hide_title": "yes", "nested": {"a": [1, 2]}}
+        res = {"id": 5, "meta_key": "_elementor_page_settings",
+               "meta_value": settings}
+        with mock.patch.object(fw, "ability", return_value=res):
+            got = fw.get_meta(5, "_elementor_page_settings")
+        self.assertEqual(got, settings)
+        self.assertIsInstance(got, dict)
+        with mock.patch.object(fw, "ability", return_value={"output": {"meta_value": [1]}}):
+            self.assertEqual(fw.get_meta(5, "k"), [1])
+
+    def test_get_meta_null_or_absent_is_none(self):
+        for res in ({"id": 5, "meta_key": "k", "meta_value": None},
+                    {"id": 5, "meta_key": "k"}):
+            with mock.patch.object(fw, "ability", return_value=res):
+                self.assertIsNone(fw.get_meta(5, "k"))
+
+    def test_get_meta_empty_meta_value_stays_empty(self):
+        with mock.patch.object(fw, "ability",
+                               return_value={"id": 5, "meta_key": "k", "meta_value": ""}):
+            self.assertEqual(fw.get_meta(5, "k"), "")
+
     def test_get_meta_missing_is_none(self):
         with mock.patch.object(fw, "ability", return_value={"output": {"id": 5}}):
             self.assertIsNone(fw.get_meta(5, "_nope"))

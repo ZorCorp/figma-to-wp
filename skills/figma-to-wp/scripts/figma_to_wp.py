@@ -3578,19 +3578,22 @@ def ability_destructive(name, payload, creds=None):
 
 
 def get_meta(post_id, key, creds=None):
-    """One post meta value via mc/get-meta, or None if the answer has none.
+    """One post meta value via mc/get-meta: str, dict/list for structured meta
+    (e.g. _elementor_page_settings), "" when empty, None when absent.
 
     The ability's input is {post_id: integer (required), meta_key: string}.
-    Its output_schema is empty, so the value's field name is not documented:
-    take `value` (or `meta_value`), inside {"output": {...}} or flat — the
-    same two shapes push accepts for a created post's id.
+    It answers flat {id, type, status, title, meta_key, meta_value}; an
+    {"output": {...}} wrapper is accepted too, the same two shapes push takes
+    for a created post's id. The value is returned as the site sent it: str()
+    on a dict is a Python repr, not JSON, and would corrupt the meta if
+    written back. `value` is a fallback name, in case an older build used it.
     """
     res = ability("mc/get-meta", {"post_id": int(post_id), "meta_key": key},
                   creds=creds)
     o = res.get("output") or res if isinstance(res, dict) else {}
-    for field in ("value", "meta_value"):
+    for field in ("meta_value", "value"):
         if o.get(field) is not None:
-            return str(o[field])
+            return o[field]
     return None
 
 
