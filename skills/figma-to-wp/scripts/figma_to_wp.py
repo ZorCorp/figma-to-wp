@@ -3400,14 +3400,29 @@ def cmd_audit(args):
           + f"\n          {len(sure)} of them unique on both sides and used "
             f"to place it\n")
 
+    def frag(el, t):
+        return (el.get("by") is not None
+                and len(norm_text(el["text"])) + 4 < len(norm_text(t["text"])))
+
     def rect(el, t):
         """Where to measure this pair. A page run that carries only part of
         the design string is an inline fragment of a bigger block — the design
         node covers the whole block, so compare block to block. Otherwise the
         run's own rect is the tighter, better answer."""
-        if el.get("by") is not None and len(norm_text(el["text"])) + 4 < len(norm_text(t["text"])):
+        if frag(el, t):
             return el["by"], el["bh"]
+        # An Elementor reference's y is where the text starts, so measure the
+        # page the same way; the element's own top says nothing once padding
+        # or a wrapper span differs. Older runs and Figma designs: the box.
+        if "box_y" in t and el.get("ty") is not None:
+            return el["ty"], el["h"]
         return el["y"], el["h"]
+
+    def ry(el, t):
+        """The reference's y on the same footing as rect(): a block-to-block
+        comparison takes the design element's own top, which an Elementor
+        design.json keeps as box_y while its y is where the text starts."""
+        return t["box_y"] if frag(el, t) and "box_y" in t else t["y"]
 
     rows = []
     prev = None
@@ -3427,7 +3442,7 @@ def cmd_audit(args):
                    and lcount[norm_text(el["text"])[:40]] == 1
                    and 0 <= t["x"] < fw_w)
         if certain and not el.get("inner"):
-            dy = rect(el, t)[0] - t["y"]
+            dy = rect(el, t)[0] - ry(el, t)
             if prev is not None and abs(dy - prev) > args.tolerance:
                 bad.append(("gap above", f"{dy - prev:+d}px"))
             prev = dy
@@ -3547,18 +3562,18 @@ def cmd_audit(args):
         # further down the frame, and the section read -197px when its own
         # content was within 30. Every honest pair in a section shares roughly
         # one offset, so keep the ones near the median and say how many went.
-        offs = sorted(rect(e, t)[0] - t["y"] for e, t in mine)
+        offs = sorted(rect(e, t)[0] - ry(e, t) for e, t in mine)
         med = offs[len(offs) // 2]
         dev = sorted(abs(o - med) for o in offs)
         tol = max(150.0, 4 * dev[len(dev) // 2])
-        keep = [(e, t) for e, t in mine if abs((rect(e, t)[0] - t["y"]) - med) <= tol]
+        keep = [(e, t) for e, t in mine if abs((rect(e, t)[0] - ry(e, t)) - med) <= tol]
         outliers = len(mine) - len(keep)
         if len(keep) >= 2:
             mine = keep
         mine = mine + segs
-        dy0 = min(t["y"] for _, t in mine)
-        dy1 = max(t["y"] + (t.get("h") or (t.get("type") or {}).get("lh") or 0)
-                  for _, t in mine)
+        dy0 = min(ry(e, t) for e, t in mine)
+        dy1 = max(ry(e, t) + (t.get("h") or (t.get("type") or {}).get("lh") or 0)
+                  for e, t in mine)
         py0 = min(rect(e, t)[0] for e, t in mine)
         py1 = max(sum(rect(e, t)) for e, t in mine)
         smap[sec["name"]] = {"page_y": sec["y"], "page_box_h": sec["h"],

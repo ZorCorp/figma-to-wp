@@ -2397,6 +2397,30 @@ class AuditElementorAlignment(unittest.TestCase):
         self.assertNotIn("x -", out)
         self.assertNotIn("x +", out)
 
+    def padded(self, text, y, ty, h=48):
+        """A run in a padded button box (24px side padding, 12px top/bottom):
+        the element's top is y, where its text starts is ty."""
+        return _run(text, 100, y, w=200, h=h, align="left", padl=24, padr=24, padt=12,
+                    padb=12, cls="btn", tx=124, ty=ty)
+
+    def test_padded_element_placed_right_has_no_vertical_offset(self):
+        # The reference measured the text inside a padding-free span (box top
+        # == ink top); the live raw build has it in the padded link (box 12px
+        # above the ink). Same ink, so no finding.
+        ref = _run("Get started now", 124, 700, w=120, h=24, align="left", padl=0,
+                   padr=0, padt=0, padb=0, cls="t", tx=124, ty=700)
+        out = self.audit([ref], [self.padded("Get started now", 688, 700)])
+        self.assertNotIn("gap above", out)
+        self.assertIn("strings compared", out)
+        self.assertIn("0 of 7 strings differ", out)
+
+    def test_padded_element_moved_down_is_still_reported(self):
+        ref = _run("Get started now", 124, 700, w=120, h=24, align="left", padl=0,
+                   padr=0, padt=0, padb=0, cls="t", tx=124, ty=700)
+        out = self.audit([ref], [self.padded("Get started now", 718, 730)])
+        self.assertIn("gap above", out)
+        self.assertIn("+30px", out)
+
     def test_left_aligned_text_still_compares_the_ink_start(self):
         ref = self.wide("Left aligned in a box", "left", 140)
         out = self.audit([ref], [self.wide("Left aligned in a box", "left", 100)])
