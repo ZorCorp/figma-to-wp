@@ -154,6 +154,91 @@ def page_doc(html, post_id):
     return (p[0], p[1]) if p else None
 
 
+# --- copy -----------------------------------------------------------------------
+
+# Phrasing elements: their text belongs to the element around them. Every
+# other element (headings, p, li, td, button, div, …) is a copy unit of its own.
+INLINE = {"a", "abbr", "b", "bdi", "bdo", "cite", "code", "data", "del", "dfn", "em",
+          "font", "i", "ins", "kbd", "mark", "q", "s", "samp", "small", "span",
+          "strong", "sub", "sup", "time", "u", "var"}
+NOT_COPY = {"script", "style", "noscript", "template", "svg", "iframe"}
+
+
+class _Copy(HTMLParser):
+    """Copy strings in document order. A string is the text of one unit, its
+    inline descendants included; a nested unit ends the string before it and
+    starts a fresh one after it, so text never runs across a block boundary."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []            # [tag, is_unit, widget]
+        self.buf = []              # text of the innermost open unit so far
+        self.skip = 0
+        self.out = []              # (text, widget)
+
+    def _widget(self):
+        return self.stack[-1][2] if self.stack else None
+
+    def _flush(self):
+        t = " ".join("".join(self.buf).split())
+        self.buf = []
+        if not t:
+            return
+        w = self._widget()
+        # Elementor prints some labels twice in one widget (a tab title for
+        # desktop and again for the phone accordion); that is one string.
+        if self.out and self.out[-1] == (t, w):
+            return
+        self.out.append((t, w))
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            self.buf.append(" ")
+            return
+        if tag in VOID:
+            return
+        a = dict(attrs)
+        widget = a.get("data-id") if a.get("data-element_type") == "widget" else self._widget()
+        unit = tag not in INLINE
+        if unit and not self.skip:
+            self._flush()
+        if tag in NOT_COPY:
+            self.skip += 1
+        self.stack.append([tag, unit, widget])
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, -1, -1):
+            if self.stack[i][0] == tag:
+                break
+        else:
+            return
+        while len(self.stack) > i:
+            t, unit, _ = self.stack[-1]
+            if t in NOT_COPY:
+                self.skip -= 1
+            elif unit and not self.skip:
+                self._flush()
+            self.stack.pop()
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.buf.append(data)
+
+
+def copy_texts(html, post_id):
+    """Every string of copy in the page body, whole and in document order —
+    hidden tab panels and phone-only blocks included, since the rebuilt page
+    has to carry them too. [] when the page renders no doc of its own."""
+    rng = page_doc(html, post_id)
+    if not rng:
+        return []
+    p = _Copy()
+    p.feed(html[rng[0]:rng[1]])
+    p.close()
+    p._flush()                 # a doc cut off before its close tag
+    return [t for t, _ in p.out]
+
+
 # --- inventory ----------------------------------------------------------------
 
 def _popup_ids(text):

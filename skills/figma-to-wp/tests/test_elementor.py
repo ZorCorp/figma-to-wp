@@ -692,6 +692,9 @@ class MeasureJs(unittest.TestCase):
         self.assertIn("document.querySelector('[data-fw-root]')||document.querySelector('.mc-page')||document.body", js)
         self.assertIn("fonts:", js)
         self.assertIn("status==='loaded'", js)
+        # a second run replaces the first report instead of adding another
+        self.assertIn("getElementById('fw-measure')", js)
+        self.assertIn("getElementById('fw-measure')", fw.MOBILE_WRAP)
 
 
 
@@ -790,7 +793,7 @@ class ElementorDocCss(unittest.TestCase):
         self.assertEqual(el.responsive_rules(out)["767"], [".elementor-5 .e{x:5}"])
 
 
-class ExtractElementor(unittest.TestCase):
+class ExtractFixture(unittest.TestCase):
     """extract --from elementor: every network and browser call mocked."""
 
     URL = "https://example.test/example/"
@@ -810,6 +813,8 @@ class ExtractElementor(unittest.TestCase):
         self.media = {"hero": [{"id": 55, "source_url":
                                 "https://example.test/wp-content/uploads/hero.png"}]}
         self.calls, self.dumps, self.shots = [], [], []
+        self.grow = {}        # dump_dom window width -> px the page grows by on the shot run
+        self.no_ink = set()   # dump_dom window widths whose shot has nothing where the text is
         for name, repl in (
                 ("BUILD", self.build),
                 ("wp_creds", lambda: ("https://example.test", "u", "p")),
@@ -857,23 +862,35 @@ class ExtractElementor(unittest.TestCase):
         return url, b"\x89PNG fake " + url.encode()
 
     def fake_shoot(self, url, png, width, tall=14000):
-        from PIL import Image
         self.shots.append((url, os.path.basename(png), width))
-        Image.new("RGB", (width, 3000), "white").save(png)
-        return Image.open(png)       # what the real shoot() hands back
+        raise AssertionError("the references come out of the measuring run")
 
-    def fake_dump_dom(self, url, width=1440, timeout=180):
-        self.dumps.append((url, width))
+    def fake_dump_dom(self, url, width=1440, timeout=180, tall=20000, budget=6000, png=None):
+        from PIL import Image
+        self.dumps.append({"url": url, "width": width, "tall": tall, "budget": budget,
+                           "png": os.path.basename(png) if png else None})
+        grow = self.grow.get(width, 0) if png else 0
         if width == 1440:
-            return _measure_dom(
-                [_run("Example heading", 40, 300),
-                 _run("Contact us", 60, 900, tag="span", size=16.0, lh="normal",
-                      ls="0.5px", weight="400", sec="s2", align="start")],
-                {"x": 0, "y": 100, "w": 1440, "h": 2000},
-                [{"name": "s1", "y": 100, "h": 600}, {"name": "s2", "y": 700, "h": 400}])
-        return _measure_dom([_run("Example heading", 16, 140, size=30.0)],
-                            {"x": 0, "y": 20, "w": width, "h": 2400},
-                            [{"name": "s1", "y": 20, "h": 900}], vw=width)
+            runs = [_run("Example heading", 40, 300),
+                    _run("Contact us", 60, 900, tag="span", size=16.0, lh="normal",
+                         ls="0.5px", weight="400", sec="s2", align="start")]
+            root = {"x": 0, "y": 100, "w": 1440, "h": 2000 + grow}
+            secs = [{"name": "s1", "y": 100, "h": 600}, {"name": "s2", "y": 700, "h": 400}]
+            vw = 1440
+        else:
+            vw = {888: 768, 800: 390}[width]
+            runs = [_run("Example heading", 16, 140, size=30.0)]
+            root = {"x": 0, "y": 20, "w": vw, "h": 2400 + grow}
+            secs = [{"name": "s1", "y": 20, "h": 900}]
+        if png:              # the same run's screenshot, glyphs where the runs are
+            im = Image.new("RGB", (width, tall), "white")
+            if width not in self.no_ink:
+                from PIL import ImageDraw
+                d = ImageDraw.Draw(im)
+                for r in runs:
+                    d.rectangle((r["x"] + 2, r["y"] + 2, r["x"] + 30, r["y"] + r["h"] - 2), "black")
+            im.save(png)
+        return _measure_dom(runs, root, secs, vw=vw)
 
     def args(self, **kw):
         a = dict(source=self.URL, slug="ex", from_="elementor", force=False,
@@ -899,6 +916,9 @@ class ExtractElementor(unittest.TestCase):
     def design(self):
         return json.loads(_read(os.path.join(self.out, "design.json")))
 
+
+
+class ExtractElementor(ExtractFixture):
     def test_extract_writes_three_references_and_design_json(self):
         printed = self.extract()
         for f in ("design.png", "design-768.png", "design-390.png", "design.json",
@@ -921,9 +941,21 @@ class ExtractElementor(unittest.TestCase):
                          (1, "Example heading", 40, 200, "h1"))   # relative to data-fw-root
         self.assertEqual(t["type"], {"family": "Roboto", "size": 32.0, "weight": 700,
                                      "lh": 41.6, "ls": 0, "fill": "#111111"})
-        self.assertEqual(d["texts"][1]["type"]["ls"], 0.5)
-        self.assertEqual(d["texts"][1]["align"], "left")     # computed "start", design.json's word
-        self.assertIsNone(d["texts"][1]["type"]["lh"])
+        # The copy comes from the page's HTML, all of it; positions from the runs.
+        self.assertEqual([x["text"] for x in d["texts"]],
+                         ["Example heading", "One", "Two", "Contact us", "First post", "42"])
+        self.assertEqual([x["i"] for x in d["texts"]], [1, 2, 3, 4, 5, 6])
+        c = d["texts"][3]
+        self.assertEqual((c["x"], c["y"], c["type"]["ls"], c["align"]), (60, 800, 0.5, "left"))
+        self.assertIsNone(c["type"]["lh"])
+        self.assertNotIn("hidden", c)
+        for x in d["texts"][1:3]:       # no rendered run: kept, flagged, at the text above it
+            self.assertEqual((x["hidden"], x["y"]), (True, 200))
+        self.assertEqual((d["texts"][4]["hidden"], d["texts"][4]["y"]), (True, 800))
+        # measure.js reports nothing under 3 characters, so "42" has no run
+        # without being hidden: it is placed the same way, flagged for what it is
+        self.assertEqual((d["texts"][5].get("unmeasured"), d["texts"][5]["y"]), (True, 800))
+        self.assertNotIn("hidden", d["texts"][5])
         self.assertEqual(d["widths"]["390"]["texts"][0]["y"], 120)
         self.assertEqual(d["widths"]["390"]["sections"], [{"name": "s1", "y": 0, "h": 900}])
         self.assertEqual((d["frames"], d["tokens"], d["comments"]), ([], {}, []))
@@ -931,10 +963,19 @@ class ExtractElementor(unittest.TestCase):
         self.assertEqual(_size(os.path.join(self.out, "design-390.png"))[0], 390)
         self.assertEqual(_size(os.path.join(self.out, "design-768.png"))[0], 768)
         self.assertEqual(_size(os.path.join(self.out, "design.png")), (1440, 2000))
-        self.assertEqual(self.dumps[0], ("http://127.0.0.1:1/live.html", 1440))
-        self.assertEqual([u for u, w in self.dumps[1:]],
-                         ["http://127.0.0.1:2/frame.html?w=768",
-                          "http://127.0.0.1:2/frame.html?w=390"])
+        # Per width: a sizing run, then one run that both measures and shoots.
+        self.assertEqual([(x["url"], x["png"]) for x in self.dumps],
+                         [("http://127.0.0.1:1/live.html", None),
+                          ("http://127.0.0.1:1/live.html", "design.png"),
+                          ("http://127.0.0.1:2/frame.html?w=768", None),
+                          ("http://127.0.0.1:2/frame.html?w=768", "design-768.png"),
+                          ("http://127.0.0.1:2/frame.html?w=390", None),
+                          ("http://127.0.0.1:2/frame.html?w=390", "design-390.png")])
+        self.assertEqual({x["budget"] for x in self.dumps}, {fw.EL_BUDGET})
+        self.assertFalse(self.shots)
+        self.assertEqual(src["ref_drift"], {"1440": 0, "768": 0, "390": 0})
+        self.assertEqual(src["ref_blank"], {"1440": 0, "768": 0, "390": 0})
+        self.assertNotIn("drift", printed.lower())
         self.assertEqual(self.serve_live.call_args.kwargs.get("viewport_h"), 1000)
         self.assertEqual(self.serve_live.call_args.args[0], os.path.join(self.out, "elementor"))
         inv = json.loads(_read(os.path.join(self.out, "elementor.json")))
@@ -952,6 +993,9 @@ class ExtractElementor(unittest.TestCase):
         self.assertIn("data-fw-root", live)
         self.assertIn(".full{height:1000px}", live)
         self.assertIn("fwMeasure", live)
+        # measured again as the body settles, so the last report is the shot's layout
+        self.assertIn("ResizeObserver", live)
+        self.assertLess(live.index("function fwMeasure"), live.index("ResizeObserver"))
 
     def test_extract_by_post_id_uses_the_rest_link(self):
         self.extract(source="1234")
@@ -1045,7 +1089,7 @@ class ExtractElementor(unittest.TestCase):
         _write(os.path.join(self.out, "design.json"), json.dumps({"source": {"file_key": "k"}}))
         self.dies("NOT_AN_ELEMENTOR_BUILD")
         self.assertEqual(_read(os.path.join(self.out, "page.html")), "<p>figma work</p>")
-        self.assertFalse(self.shots)
+        self.assertFalse(self.dumps)
         self.extract(force=True)
         self.assertEqual(self.design()["source"]["type"], "elementor")
         self.assertEqual(_read(os.path.join(self.out, "page.html")), "<p>figma work</p>")
@@ -1059,29 +1103,112 @@ class ExtractElementor(unittest.TestCase):
     def test_fonts_without_roboto_or_raleway_warn(self):
         real = self.fake_dump_dom
 
-        def dump(url, width=1440, timeout=180):
-            return real(url, width, timeout).replace('"Roboto"]', '"Inter"]')
+        def dump(url, width=1440, timeout=180, **kw):
+            return real(url, width, timeout, **kw).replace('"Roboto"]', '"Inter"]')
         fw.dump_dom = dump
         self.assertIn("fonts", self.extract())
         self.assertRegex(self.extract(), r"(?i)warn.*neither Roboto nor Raleway")
+
+
+class ExtractElementorRender(ExtractFixture):
+    """The references and the measurements are one render."""
+
+    def test_window_is_sized_from_the_measured_root(self):
+        self.extract()
+        # root y + h + margin: 100 + 2000 at 1440, 20 + 2400 in the frames
+        tall = [x["tall"] for x in self.dumps if x["png"]]
+        self.assertEqual(tall, [2100 + fw.REF_MARGIN, 2420 + fw.REF_MARGIN, 2420 + fw.REF_MARGIN])
+        for probe, shot in zip(self.dumps[::2], self.dumps[1::2]):
+            self.assertEqual((probe["url"], probe["width"], probe["budget"]),
+                             (shot["url"], shot["width"], shot["budget"]))
+
+    def test_ref_drift_is_recorded_and_loud_beyond_6px(self):
+        self.grow = {800: 700, 888: 5}      # the page grew on the shot run
+        printed = self.extract()
+        drift = self.design()["source"]["ref_drift"]
+        self.assertEqual(drift["1440"], 0)
+        self.assertEqual(drift["768"], 0)    # 5px grew inside the margin; png still whole
+        self.assertEqual(drift["390"], fw.REF_MARGIN - 700)
+        self.assertRegex(printed, r"(?i)warn.*390.*%d ?px" % (fw.REF_MARGIN - 700))
+        self.assertNotRegex(printed, r"(?i)warn.*\b768\b.*px")
+        self.assertEqual(self.design()["source"]["render_drift"]["390"], 700)
+
+    def test_text_boxes_with_nothing_drawn_under_them_warn(self):
+        self.no_ink = {800}                  # the 390 shot does not show the measured layout
+        printed = self.extract()
+        src = self.design()["source"]
+        self.assertEqual(src["ref_blank"], {"1440": 0, "768": 0, "390": 1})
+        self.assertEqual(src["ref_drift"]["390"], 0)
+        self.assertRegex(printed, r"(?i)warn.*390.*1 of 1 text box")
+        self.assertNotRegex(printed, r"(?i)warn.*(1440|768)")
+
+    def test_no_render_and_no_assets_say_they_are_ignored(self):
+        printed = self.extract(no_render=True, no_assets=True)
+        self.assertIn("ignored with --from elementor", printed)
+        self.assertNotIn("ignored with --from elementor", self.extract())
+
+
+class ElementorCopyTexts(unittest.TestCase):
+    def doc(self, body):
+        return ('<div data-elementor-type="header" data-elementor-id="1"><p>Header copy</p></div>'
+                '<div data-elementor-type="wp-page" data-elementor-id="7">%s</div>'
+                '<div data-elementor-type="footer" data-elementor-id="2"><p>Footer</p></div>' % body)
+
+    def test_long_paragraph_survives_whole(self):
+        long = "word " * 40
+        self.assertEqual(el.copy_texts(self.doc("<p>%s</p>" % long), 7), [long.strip()])
+
+    def test_short_strings_and_inline_runs(self):
+        out = el.copy_texts(self.doc(
+            '<div class="ekit"><span class="number">42</span></div>'
+            "<p>A <b>B</b> C</p><h2>$9</h2><p>x&amp;y&nbsp;z</p>"), 7)
+        self.assertEqual(out, ["42", "A B C", "$9", "x&y z"])
+
+    def test_scripts_styles_and_other_documents_are_not_copy(self):
+        out = el.copy_texts(self.doc(
+            "<style>.a{}</style><script>var s='no';</script><noscript>no</noscript><p>yes</p>"), 7)
+        self.assertEqual(out, ["yes"])
+
+    def test_text_around_a_nested_block_is_split_not_glued(self):
+        self.assertEqual(el.copy_texts(self.doc("<div>Intro <p>para</p> tail</div>"), 7),
+                         ["Intro", "para", "tail"])
+
+    def test_hidden_panel_and_adjacent_repeats(self):
+        w = ('<div data-element_type="widget" data-id="%s"><div class="tabs">'
+             '<button>One</button><div class="t-mobile">One</div>'
+             '<div class="panel" hidden><p>Hidden panel copy</p></div></div></div>')
+        out = el.copy_texts(self.doc(w % "a" + w % "b"), 7)
+        # the same title twice in one widget is one string; another widget's is its own
+        self.assertEqual(out, ["One", "Hidden panel copy", "One", "Hidden panel copy"])
+
+    def test_no_page_doc_is_empty(self):
+        self.assertEqual(el.copy_texts(self.doc("<p>x</p>"), 8), [])
 
 
 class ElementorFramed(unittest.TestCase):
     def test_measure_at_narrow_width_uses_the_iframe_wrapper(self):
         seen = {}
 
-        def dump(url, width=1440, timeout=180):
+        def dump(url, width=1440, timeout=180, tall=20000, budget=6000, png=None):
             with urllib.request.urlopen(url, timeout=5) as r:
                 seen["wrap"] = r.read().decode()
-            seen["width"] = width
+            seen.update(width=width, tall=tall, budget=budget)
+            if png:
+                from PIL import Image
+                Image.new("RGB", (width, tall), "white").save(png)
             return _measure_dom([], {"x": 0, "y": 0, "w": 390, "h": 10}, vw=390)
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        png = os.path.join(tmp, "d.png")
         with mock.patch.object(fw, "dump_dom", dump):
-            m = fw.measure_at("http://127.0.0.1:1/live.html", 390)
+            m = fw.measure_at("http://127.0.0.1:1/live.html", 390, png=png, tall=3000)
         self.assertEqual(m["mobile"]["vw"], 390)
         self.assertIn('src="http://127.0.0.1:1/live.html"', seen["wrap"])
-        self.assertIn('width="390"', seen["wrap"])
+        self.assertIn('width="390" height="3000"', seen["wrap"])
         self.assertIn("fwMeasure", seen["wrap"])
         self.assertGreaterEqual(seen["width"], 500)
+        self.assertEqual((seen["tall"], seen["budget"]), (3000, fw.EL_BUDGET))
+        self.assertEqual(_size(png), (390, 3000))      # the same run's shot, frame width
 
     def test_measure_at_1440_measures_the_page_itself(self):
         with mock.patch.object(fw, "dump_dom", return_value=_measure_dom(

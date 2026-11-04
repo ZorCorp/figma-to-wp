@@ -1504,6 +1504,22 @@ def extract_claude_design(args):
 # 96vh hero renders 13440px tall there and nowhere else.
 VIEWPORT_H = 1000
 SHOT_TALL = 14000
+# One virtual-time budget for every render of the snapshot, and room below the
+# measured body so position:fixed furniture lands outside the crop.
+EL_BUDGET = 6000
+REF_MARGIN = 400
+DRIFT_TOL = 6
+# measure.js runs once, when the fonts are ready; a snapshot keeps moving after
+# that (images arrive, widget scripts lay out tables and card grids), and the
+# screenshot is taken at the end of the budget. Measure again whenever the body
+# changes size and after load, so the last report is of what the shot shows.
+EL_REMEASURE = """
+(function(){
+  var t, root=document.querySelector('[data-fw-root]');
+  function again(){ clearTimeout(t); t=setTimeout(fwMeasure, 300); }
+  addEventListener('load', again);
+  if (root && window.ResizeObserver) new ResizeObserver(again).observe(root);
+})();"""
 EL_WIDTHS = (768, 390)
 IMG_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".avif")
 
@@ -1551,13 +1567,21 @@ def _framed(url, width, height):
         shutil.rmtree(tmp, True)
 
 
-def measure_at(url, width):
-    """measure.js's report for url rendered width px wide."""
+def measure_at(url, width, png=None, tall=SHOT_TALL, budget=EL_BUDGET):
+    """measure.js's report for url rendered width px wide, in a window (or
+    iframe) tall px high. With png, a screenshot of that very render, cropped
+    to the iframe's width when there is one."""
     if width >= 1440:
-        return _fw_measure(dump_dom(url, width=width), url)
-    with _framed(url, width, SHOT_TALL) as wrap:
-        return _fw_measure(dump_dom(wrap, width=max(width + 120, 800)),
-                           f"{url} at {width}px")
+        return _fw_measure(dump_dom(url, width=width, tall=tall, budget=budget, png=png), url)
+    with _framed(url, width, tall) as wrap:
+        m = _fw_measure(dump_dom(wrap, width=max(width + 120, 800), tall=tall,
+                                 budget=budget, png=png), f"{url} at {width}px")
+    if png:
+        from PIL import Image
+        with Image.open(png) as im:
+            cut = im.crop((0, 0, min(width, im.width), im.height))
+        cut.save(png)
+    return m
 
 
 def shoot_framed(url, png, width, height):
@@ -1581,6 +1605,26 @@ def _crop_to_root(png, root):
     cut.save(png)
 
 
+def _blank_boxes(png, texts):
+    """The texts whose box has nothing drawn in it on the reference: the
+    measurement put copy there and the picture did not. A box with any glyph
+    in it spans a wide range of grey; an empty one is flat."""
+    from PIL import Image
+    out = []
+    with Image.open(png) as im:
+        g = im.convert("L")
+        for t in texts:
+            if t.get("hidden") or t.get("clipped") or not t.get("w") or not t.get("h"):
+                continue
+            box = (t["x"] + 1, t["y"] + 1, t["x"] + t["w"] - 1, t["y"] + t["h"] - 1)
+            if box[2] <= box[0] or box[3] <= box[1] or box[1] >= g.height or box[0] >= g.width:
+                continue
+            lo, hi = g.crop(box).getextrema()
+            if hi - lo < 40:
+                out.append(t)
+    return out
+
+
 def _css_fill(v):
     """A computed colour in design.json's own spelling: #RRGGBB, or
     rgba(r,g,b,a) when it is not opaque."""
@@ -1594,24 +1638,60 @@ def _css_fill(v):
     return f"rgba({r},{g},{b},{round(float(a), 3)})"
 
 
+def _el_text(r, ox, oy):
+    """One measure.js run in design.json's text shape, relative to the root."""
+    w = str(r.get("weight") or "")
+    rec = {"text": r.get("text", ""), "x": r["x"] - ox, "y": r["y"] - oy,
+           "w": r.get("w"), "h": r.get("h"),
+           "align": {"start": "left", "end": "right"}.get(r.get("align"), r.get("align") or "left"),
+           "type": {"family": r.get("family"), "size": r.get("size"),
+                    "weight": int(w) if w.isdigit() else w or None,
+                    "lh": css_px(r.get("lh")), "ls": css_px(r.get("ls")) or 0,
+                    "fill": _css_fill(r.get("color"))},
+           "tag": r.get("tag"), "sec": r.get("sec")}
+    # A collapsed accordion answer is copy all the same, but its position is
+    # the closed state's, not a place anything should be put.
+    if r.get("clipped"):
+        rec["clipped"] = True
+    return rec
+
+
 def el_texts(m):
-    """measure.js runs as design.json texts, relative to the root's top-left."""
+    """measure.js runs as design.json texts, relative to the root's top-left.
+    Used for widths[w].texts, which serve position checks only: a run is the
+    first text node of an element, cut at 90 chars, and nothing unrendered."""
     root = m.get("root") or {}
     ox, oy = root.get("x", 0), root.get("y", 0)
-    out = []
-    for i, r in enumerate(m.get("runs") or [], 1):
-        w = str(r.get("weight") or "")
-        rec = {"i": i, "text": r.get("text", ""), "x": r["x"] - ox, "y": r["y"] - oy,
-               "w": r.get("w"), "h": r.get("h"), "align": {"start": "left", "end": "right"}.get(r.get("align"), r.get("align") or "left"),
-               "type": {"family": r.get("family"), "size": r.get("size"),
-                        "weight": int(w) if w.isdigit() else w or None,
-                        "lh": css_px(r.get("lh")), "ls": css_px(r.get("ls")) or 0,
-                        "fill": _css_fill(r.get("color"))},
-               "tag": r.get("tag"), "sec": r.get("sec")}
-        # A collapsed accordion answer is copy all the same, but its position
-        # is the closed state's, not a place anything should be put.
-        if r.get("clipped"):
-            rec["clipped"] = True
+    return [{"i": i, **_el_text(r, ox, oy)}
+            for i, r in enumerate(m.get("runs") or [], 1)]
+
+
+def el_copy(copy, m, window=60):
+    """design.json texts: every copy string whole (copy_texts), placed by the
+    1440 run that renders it. Runs are matched in order, an exact string
+    first, else a run whose text the string starts with. A string with no run
+    is not rendered at 1440 (a closed tab, a phone-only block): it is kept,
+    flagged hidden, at the position of the text above it, so a section-scoped
+    verify still finds it in its section. measure.js skips strings under 3
+    characters, so those ("42", a ✅ cell) are flagged unmeasured instead."""
+    root = m.get("root") or {}
+    ox, oy = root.get("x", 0), root.get("y", 0)
+    runs = [(norm_text(r.get("text", "")), r) for r in m.get("runs") or []]
+    out, cur, last = [], 0, {"x": 0, "y": 0}
+    for i, s in enumerate(copy, 1):
+        cand = range(cur, min(len(runs), cur + window))
+        hit = next((j for j in cand if runs[j][0] == s), None)
+        if hit is None:
+            hit = next((j for j in cand if len(runs[j][0]) >= 3
+                        and s.startswith(runs[j][0])), None)
+        if hit is None:
+            out.append({"i": i, "text": s, "x": last["x"], "y": last["y"], "w": 0, "h": 0,
+                        "align": "left", "type": {}, "tag": None,
+                        "unmeasured" if len(s) < 3 else "hidden": True})
+            continue
+        cur = hit + 1
+        rec = {"i": i, **_el_text(runs[hit][1], ox, oy), "text": s}
+        last = rec
         out.append(rec)
     return out
 
@@ -1828,6 +1908,9 @@ def extract_elementor(args):
         die("NO_ELEMENTOR_DOC", f"{url} renders no Elementor document with id "
                                 f"{post_id}; it is showing some other page's.")
 
+    for flag in ("no_render", "no_assets"):
+        if getattr(args, flag, False):
+            print(f"note      --{flag.replace('_', '-')} ignored with --from elementor")
     slug = args.slug or post.get("slug") or slugify(target)
     out = os.path.join(BUILD, slug)
     dj = os.path.join(out, "design.json")
@@ -1858,20 +1941,33 @@ def extract_elementor(args):
     os.makedirs(live_dir, exist_ok=True)
     with open(os.path.join(live_dir, "live.html"), "w", encoding="utf-8") as fh:
         fh.write(elementor.pin_vh_html(
-            elementor.snapshot(html, origin, post_id, MEASURE_SRC), VIEWPORT_H))
+            elementor.snapshot(html, origin, post_id, MEASURE_SRC + EL_REMEASURE),
+            VIEWPORT_H))
     write_json(os.path.join(out, "elementor.json"), inv)
 
+    # Per width, one sizing run, then one run that measures and shoots the
+    # same render: same window, same budget, same moment. The window is the
+    # measured body plus a margin, so a long page is never cut at a fixed
+    # height. What still differs is reported, not corrected: ref_drift is the
+    # reference's height against the body measured in that run (a body that
+    # grew past the window is cut), render_drift is how far the body moved
+    # between the two runs (a widget that settles differently each load).
+    from PIL import Image
+    meas, ref_drift, render_drift, blank = {}, {}, {}, {}
     srv = elementor.serve_live(live_dir, origin, ua=UA, viewport_h=VIEWPORT_H)
     try:
         base = f"http://127.0.0.1:{srv.server_port}/live.html"
-        meas = {1440: measure_at(base, 1440)}
-        shoot(base, os.path.join(out, "design.png"), 1440).close()
-        _crop_to_root(os.path.join(out, "design.png"), meas[1440].get("root") or {})
-        for w in EL_WIDTHS:
-            meas[w] = measure_at(base, w)
-            png = os.path.join(out, f"design-{w}.png")
-            shoot_framed(base, png, w, SHOT_TALL)
-            _crop_to_root(png, meas[w].get("root") or {})
+        for w in (1440,) + EL_WIDTHS:
+            probe = (measure_at(base, w).get("root") or {})
+            tall = max(VIEWPORT_H, probe.get("y", 0) + probe.get("h", 0) + REF_MARGIN)
+            png = os.path.join(out, "design.png" if w == 1440 else f"design-{w}.png")
+            meas[w] = measure_at(base, w, png=png, tall=tall)
+            root = meas[w].get("root") or {}
+            _crop_to_root(png, root)
+            with Image.open(png) as im:
+                ref_drift[str(w)] = im.height - root.get("h", im.height)
+            render_drift[str(w)] = root.get("h", 0) - probe.get("h", 0)
+            blank[str(w)] = _blank_boxes(png, el_texts(meas[w]))
     finally:
         stop_server(srv)
 
@@ -1880,12 +1976,15 @@ def extract_elementor(args):
     assets, matched, failed = el_assets(out, urls, creds)
 
     fonts = meas[1440].get("fonts") or []
+    texts = el_copy(elementor.copy_texts(html, post_id), meas[1440])
     write_json(dj, {
         "source": {"type": "elementor", "post_id": post_id, "url": url,
                    "modified_gmt": post.get("modified_gmt"), "width": 1440,
                    "viewport_h": VIEWPORT_H, "fonts": fonts,
+                   "ref_drift": ref_drift, "render_drift": render_drift,
+                   "ref_blank": {w: len(b) for w, b in blank.items()},
                    "shot_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
-        "texts": el_texts(meas[1440]), "sections": el_sections(meas[1440]),
+        "texts": texts, "sections": el_sections(meas[1440]),
         "widths": {str(w): {"texts": el_texts(meas[w]), "sections": el_sections(meas[w])}
                    for w in EL_WIDTHS},
         "frames": [], "tokens": {}, "comments": [], "assets": assets})
@@ -1893,8 +1992,31 @@ def extract_elementor(args):
     print(f"snapshot  build/{slug}/elementor/live.html (vh pinned to {VIEWPORT_H}px)")
     print(f"design    design.png 1440, " + ", ".join(f"design-{w}.png" for w in EL_WIDTHS)
           + " — header, footer, popups hidden")
-    print("texts     " + ", ".join(f"{len(meas[w].get('runs') or [])} at {w}"
+    hidden = sum(1 for t in texts if t.get("hidden"))
+    short = sum(1 for t in texts if t.get("unmeasured"))
+    print(f"copy      {len(texts)} string(s) from the page's HTML: {hidden} not "
+          f"rendered at 1440 (flagged hidden), {short} too short to measure "
+          f"(flagged unmeasured)")
+    print("runs      " + ", ".join(f"{len(meas[w].get('runs') or [])} at {w}"
                                    for w in (1440,) + EL_WIDTHS))
+    for w in (1440,) + EL_WIDTHS:
+        d, r = ref_drift[str(w)], render_drift[str(w)]
+        if abs(d) > DRIFT_TOL:
+            print(f"WARN      ref drift at {w}: design{'' if w == 1440 else '-%d' % w}.png "
+                  f"is {d:+d}px against the body measured in the same render — the "
+                  f"body outgrew the window and the reference is cut; positions "
+                  f"below that point have no picture.")
+        if blank[str(w)]:
+            b = blank[str(w)]
+            print(f"WARN      ref mismatch at {w}: {len(b)} of "
+                  f"{len(meas[w].get('runs') or [])} text boxes have nothing drawn "
+                  f"under them in design{'' if w == 1440 else '-%d' % w}.png, first "
+                  f"{b[0]['text'][:30]!r} at y={b[0]['y']} — the picture and the "
+                  f"numbers disagree from there down.")
+        if abs(r) > DRIFT_TOL:
+            print(f"WARN      render drift at {w}: the body measured {r:+d}px "
+                  f"between two loads — some widget settles differently each time; "
+                  f"positions below it are not reliable to {DRIFT_TOL}px.")
     print(f"fonts     {', '.join(fonts) or '(none reported)'}")
     if not {"Roboto", "Raleway"} & set(fonts):
         print("warn      fonts: neither Roboto nor Raleway loaded on this page — "
@@ -2832,14 +2954,17 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 MEASURE_JS = "<script>\n" + MEASURE_SRC + "</script>"
 
 
-def dump_dom(url, width=1440, timeout=180):
-    """The page's DOM after its scripts have run."""
+def dump_dom(url, width=1440, timeout=180, tall=20000, budget=6000, png=None):
+    """The page's DOM after its scripts have run. With png, the same run also
+    saves a screenshot of the window, so the picture and the numbers describe
+    one render rather than two that may have settled differently."""
     # Without a window size Chrome uses its default width, the page reflows to
     # something no one will ever see, and every measurement describes that
     # instead. The design's own width is the only one worth measuring at.
+    shot = ["--force-device-scale-factor=1", f"--screenshot={png}"] if png else []
     r = subprocess.run([chrome("audit"), *CHROME_FLAGS,
-                        f"--window-size={width},20000",
-                        "--virtual-time-budget=6000", "--dump-dom", url],
+                        f"--window-size={width},{tall}",
+                        f"--virtual-time-budget={budget}", *shot, "--dump-dom", url],
                        capture_output=True, timeout=timeout)
     return r.stdout.decode("utf-8", "replace")
 
@@ -3680,7 +3805,7 @@ MOBILE_WRAP = """<!doctype html><meta charset="utf-8"><title>mobile</title>
 // top document only, so republish what the frame sends up.
 addEventListener('message', function (e) {
   if (!e.data || !e.data.fwMeasure) { return; }
-  var s = document.createElement('script');
+  var s = document.getElementById('fw-measure') || document.createElement('script');
   s.type = 'application/json'; s.id = 'fw-measure';
   s.textContent = e.data.fwMeasure;
   document.body.appendChild(s);

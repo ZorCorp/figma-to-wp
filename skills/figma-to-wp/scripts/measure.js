@@ -208,6 +208,9 @@ function fwMeasure(){
                                 root:{x:Math.round(rr.left+window.scrollX),
                                       y:Math.round(rr.top+window.scrollY),
                                       w:Math.round(rr.width), h:Math.round(rr.height)}});
+  // Run again (an Elementor snapshot re-measures as it settles), the newest
+  // report replaces the last one rather than sitting behind it.
+  var prev=document.getElementById('fw-measure'); if(prev) prev.remove();
   document.body.appendChild(s);
   // Headless Chrome will not open a window narrower than 500px, so a real
   // phone width can only be had by rendering into an iframe of that width.
