@@ -940,11 +940,12 @@ an Elementor build `extract` downloads the files behind `design.json` →
 URLs from the page's own `@font-face` rules — its inline `<style>` and the
 stylesheets it links, one `@import` deep — and only the weights and styles
 those declare (woff2 preferred; masterconcept.ai declares Roboto as ttf from
-fonts.gstatic.com). `preview` then serves exactly those files, with no
-network, instead of Raleway; Figma builds still get Raleway. A family `extract`
-printed `warn fonts: no @font-face file found` for has no file and the preview
-cannot reproduce its glyph widths: put a `<family>.woff2` in that folder by
-hand. When a whole block is off by the same few px, check which face the
+fonts.gstatic.com). `preview` then serves exactly those files instead of
+Raleway, declared after the site's cached CSS so they win over its own gstatic
+URLs; Figma builds still get Raleway. Only http(s) URLs are fetched, and a
+family split by script with no latin slice (CJK) is not downloaded. A family
+`extract` printed a `warn fonts:` line for has no file and the preview cannot
+reproduce its glyph widths: put a `<family>.woff2` in that folder by hand. When a whole block is off by the same few px, check which face the
 preview actually rendered before moving anything; the draft's front end has
 the last word.
 

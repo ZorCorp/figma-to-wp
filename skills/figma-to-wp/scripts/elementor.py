@@ -525,19 +525,31 @@ def font_faces(css):
     return faces
 
 
-def _font_ext(url, fmt=""):
+_FMT_EXT = {"woff2": "woff2", "woff": "woff", "truetype": "ttf", "opentype": "otf"}
+
+
+def font_ext(url, fmt=""):
+    """The file extension of a font source: the URL's own when it is a font
+    one, else what its format() hint says (a css?id=7 URL declared as
+    format('truetype') is a .ttf), else ''."""
     ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lstrip(".").lower()
-    if ext in FONT_PREFERENCE:
-        return ext
-    return {"truetype": "ttf", "opentype": "otf"}.get(fmt, fmt)
+    return ext if ext in FONT_PREFERENCE else _FMT_EXT.get(fmt, "")
+
+
+def best_font(face):
+    """(url, extension) to download for a face: woff2, else woff, else ttf/otf.
+    None when it only offers eot or svg."""
+    ranked = [(FONT_PREFERENCE.index(e), u, e) for u, f in face["srcs"]
+              for e in [font_ext(u, f)] if e]
+    if not ranked:
+        return None
+    _, url, ext = min(ranked)
+    return url, ext
 
 
 def best_font_src(face):
-    """The url to download for a face: woff2, else woff, else ttf/otf. None when
-    it only offers eot or svg."""
-    ranked = [(FONT_PREFERENCE.index(e), u) for u, f in face["srcs"]
-              for e in [_font_ext(u, f)] if e in FONT_PREFERENCE]
-    return min(ranked)[1] if ranked else None
+    b = best_font(face)
+    return b[0] if b else None
 
 
 def style_sources(html):

@@ -153,6 +153,9 @@ below and a non-empty `title`.
 taxonomy, term, count and order the widget used; the front end does not carry
 them). For example `[wpb_post_list tax="post_tag" term="<term>" count="3"
 columns="3"]`. The card styling is page CSS over the shortcode's markup.
+`term` is the **target language's** term slug, not the original's: WPML gives
+a translated term its own slug, often with a language suffix (`news-zh-hk`).
+`push --language` warns for each term it cannot find in that language.
 
 The list is per language. A language with no matching term, or no posts on it,
 renders the list empty — and an empty list under a heading reads as broken.

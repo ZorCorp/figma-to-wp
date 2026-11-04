@@ -1,5 +1,5 @@
 import contextlib, io, json, os, re, shutil, sys, tempfile, unittest
-import urllib.parse, urllib.request
+import http.client, urllib.error, urllib.parse, urllib.request
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -292,6 +292,21 @@ class PushElementor(unittest.TestCase):
         self.posts_json([{"posts_post_type": "post", "posts_include_term_ids": ["12"]}])
         self.term_routes(found_in_target=True)
         self.assertEqual(self.warns(self.push(language="zh-hk")), [])
+
+    def test_update_push_makes_no_term_lookup(self):
+        self.posts_json([{"posts_post_type": "post", "posts_include_term_ids": ["12"]}])
+        self.term_routes(found_in_target=False)
+        self.wp_json()                                   # the build already has a page: an update
+        out = self.push(language="zh-hk", title=None)
+        self.assertEqual(self.warns(out), [])
+        self.assertFalse([c for c in self.calls if "taxonomies" in str(c[1]) or "lang=" in str(c[1])])
+
+    def test_term_lookup_waits_for_the_local_refusals(self):
+        self.posts_json([{"posts_post_type": "post", "posts_include_term_ids": ["12"]}])
+        self.term_routes(found_in_target=False)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            self.push(language="zh-hk", title=None)      # a new page with no title: NO_TITLE
+        self.assertEqual([c for c in self.calls if "taxonomies" in str(c[1])], [])
 
     def test_no_posts_queries_means_no_term_lookup(self):
         self.posts_json([])
@@ -2055,6 +2070,54 @@ class ExtractElementorFonts(ExtractFixture):
         self.assertEqual(self.fonts(), [])
         self.assertRegex(printed, r"(?m)^warn\s+fonts: no @font-face file found for 'Roboto'")
 
+    def test_urls_that_blow_up_or_are_not_http_never_stop_extract(self):
+        B = "https://f.example.test/"
+        self.page("@font-face{font-family:Roboto;font-weight:100;src:url(%sa b.ttf)}"
+                  "@font-face{font-family:Roboto;font-weight:200;src:url(%s\u00e9.woff2)}"
+                  "@font-face{font-family:Roboto;font-weight:300;src:url(%scut.woff2)}"
+                  "@font-face{font-family:Roboto;font-weight:400;src:url(file:///etc/passwd.woff2)}"
+                  "@font-face{font-family:Roboto;font-weight:500;src:url(data:font/woff2;base64,AAAA)}"
+                  "@font-face{font-family:Roboto;font-weight:700;src:url(%sok.woff2)}" % (B, B, B, B),
+                  [self.ORIGIN + "/broken.css"])
+        self.http_files[B + "a b.ttf"] = http.client.InvalidURL("nonnumeric port")
+        self.http_files[B + "\u00e9.woff2"] = UnicodeEncodeError("ascii", "\u00e9", 0, 1, "ordinal")
+        self.http_files[B + "cut.woff2"] = http.client.IncompleteRead(b"x")
+        self.http_files[self.ORIGIN + "/broken.css"] = http.client.IncompleteRead(b"")
+        self.http_files[B + "ok.woff2"] = b"OK"
+        with contextlib.redirect_stderr(io.StringIO()):
+            printed = self.extract()
+        self.assertEqual(self.fonts(), ["roboto-700.woff2"])
+        self.assertEqual([c for c in self.calls if str(c[1]).startswith(("file:", "data:"))], [])
+        self.assertTrue(os.path.exists(os.path.join(self.out, "design.json")))
+
+    def test_every_download_failing_is_a_warn_for_the_family(self):
+        self.page("@font-face{font-family:Roboto;font-weight:400;src:url(https://f.example.test/r 4.ttf)}")
+        self.http_files["https://f.example.test/r 4.ttf"] = http.client.InvalidURL("x")
+        with contextlib.redirect_stderr(io.StringIO()):
+            printed = self.extract()
+        self.assertRegex(printed, r"(?m)^warn\s+fonts: .*'Roboto'")
+
+    def test_a_weight_that_is_not_a_number_is_skipped(self):
+        self.page("@font-face{font-family:Roboto;font-weight:lighter;src:url(https://f.example.test/l.woff2)}"
+                  "@font-face{font-family:Roboto;font-weight:400;src:url(https://f.example.test/r.woff2)}")
+        self.extract()
+        self.assertEqual(self.fonts(), ["roboto-400.woff2"])
+        self.assertNotIn(("http_get", "https://f.example.test/l.woff2"), self.calls)
+
+    def test_format_hint_names_the_extension_when_the_url_has_none(self):
+        self.page("@font-face{font-family:Roboto;font-weight:400;"
+                  "src:url(https://f.example.test/css?id=7) format('truetype')}")
+        self.extract()
+        self.assertEqual(self.fonts(), ["roboto-400.ttf"])
+
+    def test_family_split_by_script_with_no_latin_slice_is_not_downloaded(self):
+        self.page("@font-face{font-family:Roboto;font-weight:400;unicode-range:U+4E00-9FFF;"
+                  "src:url(https://f.example.test/cjk.woff2)}")
+        printed = self.extract()
+        self.assertEqual(self.fonts(), [])
+        self.assertNotIn(("http_get", "https://f.example.test/cjk.woff2"), self.calls)
+        self.assertRegex(printed, r"(?m)^warn\s+fonts: .*'Roboto'.*latin")
+
     def test_duplicate_weight_subsets_keep_the_latin_one(self):
         self.page("@font-face{font-family:Roboto;font-weight:400;unicode-range:U+0400-045F;"
                   "src:url(https://f.example.test/cyr.woff2)}"
@@ -2553,6 +2616,26 @@ class PreviewFonts(unittest.TestCase):
                       "font-weight:400;font-style:italic", html)
         self.assertIn("font-weight:100 900;font-style:normal", html)
 
+    def test_icon_families_are_never_loaded(self):
+        self.assertEqual(fw.el_font_families(["elementskit", "eicons", "Roboto"]), ["Roboto"])
+
+    def test_local_faces_come_after_the_cached_site_css(self):
+        import http.server
+        self.face("roboto-400.ttf")
+        _write(os.path.join(self.out, "page.html"), "<p>hi</p>")
+        _write(os.path.join(self.out, "design.json"), json.dumps(self.elementor(["Roboto"])))
+        args = fw.argparse.Namespace(slug="p", port=0, bare=False, refresh_site=False,
+                                     site_sample=None)
+        with mock.patch.object(fw, "BUILD", os.path.join(self.tmp, "build")), \
+                mock.patch.object(fw, "site_shell", return_value=("a{}", {})), \
+                mock.patch.object(fw, "site_behaviour_js", return_value=None), \
+                mock.patch.object(http.server, "ThreadingHTTPServer"), \
+                contextlib.redirect_stdout(io.StringIO()):
+            fw.cmd_preview(args)
+        page = _read(os.path.join(self.out, "preview.html"))
+        self.assertGreater(page.index("@font-face{font-family:'Roboto'"),
+                           page.index('href="site/site.css"'))
+
     def test_a_family_without_files_still_gets_the_link(self):
         self.face("roboto-400.ttf")
         html = fw.preview_font_html(self.out, self.elementor(["Roboto", "Inter"]))
@@ -2600,10 +2683,12 @@ class PullElementorPage(unittest.TestCase):
                 "content": {"raw": "[elementor-template id=\"7\"]"}}
         args = fw.argparse.Namespace(target="7", post_type="page", slug=None)
         err = io.StringIO()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         with mock.patch.object(fw, "wp_creds", lambda: ("https://x", "u", "p")), \
                 mock.patch.object(fw, "find_page", return_value=[{"id": 7}]), \
                 mock.patch.object(fw, "wp", return_value=page), \
-                mock.patch.object(fw, "BUILD", tempfile.mkdtemp()), \
+                mock.patch.object(fw, "BUILD", tmp), \
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err), \
                 self.assertRaises(SystemExit):
             fw.cmd_pull(args)

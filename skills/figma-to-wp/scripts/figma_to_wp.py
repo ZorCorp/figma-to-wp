@@ -1908,59 +1908,85 @@ def el_assets(out, urls, creds):
     return assets, matched, failed
 
 
+def _font_get(url):
+    """Body of a font or stylesheet URL, or None. Only http(s) is fetched (a
+    page's CSS can name file: or data: URLs), and anything that goes wrong —
+    InvalidURL, a non-ASCII URL, a cut-off read — is a skip, not a traceback."""
+    if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+        return None
+    try:
+        return http_get(url)
+    except Exception as e:
+        print(f"fonts     download failed: {url} ({type(e).__name__}: {e})",
+              file=sys.stderr)
+        return None
+
+
 def el_fonts(out, html, base, families):
     """Download the font files behind `families` into assets/fonts, from the
     page's own @font-face rules: its inline <style> blocks and the stylesheets
     it links, plus what those @import (one level). Only the weights and styles
     declared are fetched, woff2 preferred; where a weight is split by script,
-    the latin file. Returns (files written, families with none). Nothing here
-    is allowed to stop an extract: a stylesheet or file that will not load is
-    skipped."""
+    the latin file, and a family with no latin slice gets nothing.
+    Returns (files written by family, {family: why it has none}). Nothing here
+    is allowed to stop an extract."""
     inline, links = elementor.style_sources(html)
     sheets = [(c, base) for c in inline]
 
     def add(url, depth):
-        try:
-            final, body = http_get(urllib.parse.urljoin(base, url) if depth == 0 else url)
-        except (urllib.error.URLError, OSError, ValueError):
+        got = _font_get(url)
+        if not got:
             return
+        final, body = got
         css = body.decode("utf-8", "replace")
         sheets.append((css, final))
         if depth == 0:
             for imp in elementor.css_imports(css):
                 add(urllib.parse.urljoin(final, imp), 1)
     for href in links:
-        add(href, 0)
+        add(urllib.parse.urljoin(base, href), 0)
 
     want = {f.lower(): f for f in families}
-    chosen = {}                      # (family, weight, style) -> (rank, url)
+    chosen, nolatin = {}, set()      # (family, weight, style) -> (rank, url, ext)
     for css, where in sheets:
         for face in elementor.font_faces(css):
             fam = want.get(face["family"].lower())
-            src = elementor.best_font_src(face)
-            if not fam or not src:
+            best = elementor.best_font(face)
+            if not fam or not best or not re.fullmatch(r"\d+(-\d+)?", face["weight"]):
                 continue
             rng = face["range"].upper().replace(" ", "")
-            rank = 0 if not rng else (0 if "U+0000-00FF" in rng else 1)
+            rank = 0 if not rng or "U+0000-00FF" in rng else 1
             key = (fam, face["weight"], face["style"])
             if key not in chosen or rank < chosen[key][0]:
-                chosen[key] = (rank, urllib.parse.urljoin(where, src), src)
-    written = {}
+                chosen[key] = (rank, urllib.parse.urljoin(where, best[0]), best[1])
+    written, why = {}, {}
     d = os.path.join(out, "assets", "fonts")
-    for (fam, weight, style), (_, url, src) in sorted(chosen.items()):
-        ext = elementor._font_ext(src) or "woff2"
+    for (fam, weight, style), (rank, url, ext) in sorted(chosen.items()):
+        if rank:
+            nolatin.add(fam)
+            continue
         name = (f"{font_slug(fam)}-{weight}" + ("-italic" if style == "italic" else "")
                 + "." + ext)
+        got = _font_get(url)
+        if not got:
+            continue
         try:
-            _, body = http_get(url)
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, name), "wb") as fh:
-                fh.write(body)
-        except (urllib.error.URLError, OSError) as e:
-            print(f"fonts     download failed: {url} ({e})", file=sys.stderr)
+                fh.write(got[1])
+        except OSError as e:
+            print(f"fonts     could not write {name} ({e})", file=sys.stderr)
             continue
         written.setdefault(fam, []).append(name)
-    return written, [f for f in families if f not in written]
+    for fam in families:
+        if fam in nolatin:
+            why[fam] = (f"{fam!r} is split by unicode-range with no latin slice (CJK?), so "
+                        "nothing was downloaded — the preview falls back to the "
+                        "system face, as the live site does")
+        elif fam not in written:
+            why[fam] = (f"no @font-face file found for {fam!r} that could be downloaded "
+                        f"from the page's styles — the preview will not have its glyph widths")
+    return written, why
 
 
 def extract_elementor(args):
@@ -2143,9 +2169,8 @@ def extract_elementor(args):
     if n:
         print(f"fonts     {n} file(s) -> build/{slug}/assets/fonts "
               f"({', '.join(sorted(got))}); the preview serves them, no network")
-    for fam in lacking:
-        print(f"warn      fonts: no @font-face file found for {fam!r} in the page's "
-              f"styles — the preview will not have its glyph widths")
+    for fam, why in lacking.items():
+        print(f"warn      fonts: {why}")
     if not {"Roboto", "Raleway"} & set(fonts):
         print("warn      fonts: neither Roboto nor Raleway loaded on this page — "
               "the raw page only gets the fonts the site's header and kit load, "
@@ -4011,7 +4036,7 @@ def local_font_css(out, families=("Raleway",)):
 
 # Icon faces are in document.fonts too, but Google Fonts does not host them and
 # one unknown family makes the whole css2 request fail.
-ICON_FONT = re.compile(r"icon|awesome|dashicons|swiper|glyph|symbol", re.I)
+ICON_FONT = re.compile(r"icon|awesome|dashicons|swiper|glyph|symbol|elementskit", re.I)
 WEIGHTED = {"Roboto", "Raleway"}
 FONT_MIME = {"woff2": "woff2", "woff": "woff", "ttf": "truetype", "otf": "opentype"}
 FONT_FILE = re.compile(r"^(?P<fam>.+?)-(?P<w>\d+(?:-\d+)?)(?P<it>-italic)?\.(?P<ext>woff2|woff|ttf|otf)$")
@@ -4056,8 +4081,8 @@ def downloaded_font_css(out, family):
     return f"<style>{css}</style>" if css else ""
 
 
-def preview_font_html(out, design):
-    """The preview's font <link> and local faces. Figma and Claude Design
+def preview_fonts(out, design):
+    """The preview's (font <link>, local faces). Figma and Claude Design
     builds get Raleway, as they always did. An Elementor build gets what the
     reference actually loaded (design.json source.fonts): the site names Raleway
     in its stylesheets and loads Roboto, so a Raleway preview measures glyph
@@ -4069,7 +4094,7 @@ def preview_font_html(out, design):
     if src.get("type") != "elementor":
         return ('<link href="https://fonts.googleapis.com/css2?family=Raleway:'
                 'wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700'
-                '&display=swap" rel="stylesheet">' + local_font_css(out))
+                '&display=swap" rel="stylesheet">', local_font_css(out))
     local, linked = "", []
     for fam in el_font_families(src.get("fonts")):
         css = downloaded_font_css(out, fam) or local_font_css(out, [fam])
@@ -4084,7 +4109,11 @@ def preview_font_html(out, design):
                             for f in linked)
         link = ('<link href="https://fonts.googleapis.com/css2?family=' + q +
                 '&display=swap" rel="stylesheet">')
-    return link + local
+    return link, local
+
+
+def preview_font_html(out, design):
+    return "".join(preview_fonts(out, design))
 
 
 MOBILE_WRAP = """<!doctype html><meta charset="utf-8"><title>mobile</title>
@@ -4366,6 +4395,7 @@ def cmd_preview(args):
                           for w in reversed(wraps))
 
     def write_preview():
+        fonts_link, fonts_local = preview_fonts(root, read_design(root))
         with open(os.path.join(root, "preview.html"), "w", encoding="utf-8") as fh:
             fh.write('<!doctype html><html lang="en"><head><meta charset="utf-8">'
                      '<meta name="viewport" content="width=device-width,initial-scale=1">'
@@ -4376,9 +4406,12 @@ def cmd_preview(args):
                      # were being widened to compensate for a font that was
                      # never missing on the site itself. Serve the face out of
                      # the build when it is there.
-                     + preview_font_html(root, read_design(root)) +
+                     + fonts_link +
                      (f'<link rel="stylesheet" href="site/site.css">'
                       if site_css else "") +
+                     # After the site's CSS, so these faces win over any the
+                     # cached stylesheet declares for the same family.
+                     fonts_local +
                      "<style>body{margin:0}</style></head>"
                      f'<body class="{body_cls}">' + open_wraps + build_page() +
                      close_wraps + MEASURE_JS +
@@ -5244,15 +5277,15 @@ def cmd_push(args):
         src = _replace_gate(out, meta, replace, args)
         draft_id, post_id = int(post_id), replace
 
-    if not replace:
-        warn_posts_terms(out, args.language, creds)
-
     if not post_id and not args.title:
         die("NO_TITLE", "--title is required when creating a page")
     if post_id and translation_of:
         die("TRANSLATION_OF_ON_UPDATE",
             f"--translation-of only applies when a page is created, and "
             f"#{post_id} already exists. WPML groups are not changed by push.")
+    # Only a new page picks its language here; an update keeps the one it has.
+    if not post_id:
+        warn_posts_terms(out, args.language, creds)
 
     # Resolve every taxonomy term ONCE, before the page-moved-on check, the
     # media upload, or any write. Catching a bad slug after ewpa/create-post
