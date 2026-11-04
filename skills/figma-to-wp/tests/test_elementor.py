@@ -684,7 +684,8 @@ class PushReplace(unittest.TestCase):
     def write_wp_json(self, **extra):
         meta = {"post_id": self.DRAFT, "post_type": "page", "slug": "p-draft",
                 "status": "draft", "modified_gmt": "2026-03-03T00:00:00",
-                "body_sha": self.body_sha()}
+                "body_sha": self.body_sha(),
+                "js_sha": hashlib.sha256(fw.page_js(self.out).encode("utf-8")).hexdigest()}
         meta.update(extra)
         meta = {k: v for k, v in meta.items() if v is not None}
         with open(os.path.join(self.out, "wp.json"), "w") as fh:
@@ -1050,6 +1051,32 @@ class PushReplace(unittest.TestCase):
     def test_replace_refuses_a_wp_json_without_body_sha(self):
         self.write_wp_json(body_sha=None)
         self.assertIn("re-push the draft", self.dies("REPLACE_DRAFT_STALE"))
+        self.no_writes()
+
+    def test_replace_refuses_when_page_js_changed_since_the_draft(self):
+        put(os.path.join(self.out, "page.js"), "console.log('added after review');\n")
+        self.assertIn("page.js", self.dies("REPLACE_DRAFT_STALE"))
+        self.no_writes()
+
+    def test_replace_refuses_a_wp_json_without_js_sha(self):
+        self.write_wp_json(js_sha=None)
+        self.assertIn("page.js", self.dies("REPLACE_DRAFT_STALE"))
+        self.no_writes()
+
+    def test_replace_takes_a_draft_in_no_group(self):
+        # what a usage-B draft really answers: no group at all
+        self.groups[self.DRAFT]["translations"] = []
+        self.replace()
+        self.assertEqual(self.wp_json()["post_id"], self.ORIG)
+
+    def test_replace_refuses_a_group_entry_it_cannot_read(self):
+        self.groups[self.ORIG]["translations"].append({"language": "zh-hk"})
+        self.dies("REPLACE_NOT_A_DRAFT")
+        self.no_writes()
+
+    def test_replace_refuses_when_a_language_is_unknown(self):
+        self.groups[self.DRAFT]["language"] = ""
+        self.assertIn("could not be read", self.dies("REPLACE_NOT_A_DRAFT"))
         self.no_writes()
 
     def test_replace_refuses_a_draft_edited_in_wordpress_since_the_push(self):

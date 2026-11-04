@@ -4714,12 +4714,14 @@ def wpml_group(post_id, creds=None):
         tr = list(tr.values())
     if not isinstance(tr, list):
         return None
+    # This feeds a safety gate: an entry it cannot read means the group is
+    # not known, not that the entry is absent.
     ids = set()
     for t in tr:
         try:
             ids.add(int(t["post_id"]))
         except (TypeError, ValueError, KeyError):
-            pass
+            return None
     return str(o.get("language") or "").lower(), ids
 
 
@@ -5315,7 +5317,12 @@ def _replace_draft_check(out, meta, orig, draft, html, args, creds):
             f"#{draft} is in #{orig}'s WPML group: it is a translation of the "
             f"original, not a draft of it. Replacing would put that page's "
             f"language on the original. Nothing was changed.")
-    if og[0] and dg[0] and og[0] != dg[0]:
+    if not og[0] or not dg[0]:
+        die("REPLACE_NOT_A_DRAFT",
+            f"the language of #{orig if not og[0] else draft} could not be read, "
+            f"so #{draft} is not known to be in the original's language. "
+            f"Nothing was changed.")
+    if og[0] != dg[0]:
         die("REPLACE_NOT_A_DRAFT",
             f"#{draft} is in {dg[0]!r} and #{orig} in {og[0]!r}; a replace keeps "
             f"the original's language. Nothing was changed.")
@@ -5334,6 +5341,12 @@ def _replace_draft_check(out, meta, orig, draft, html, args, creds):
         die("REPLACE_DRAFT_STALE",
             f"the build is no longer the body the draft #{draft} was pushed with. "
             f"{again}")
+    # The page JS goes onto the original too, so it is held to the draft the
+    # same way. A wp.json from before js_sha has none and is refused like one
+    # without body_sha.
+    if body_sha(page_js(out)) != meta.get("js_sha"):
+        die("REPLACE_DRAFT_STALE",
+            f"page.js is no longer what the draft #{draft} was pushed with. {again}")
     if page.get("modified_gmt") != meta.get("modified_gmt"):
         die("REPLACE_DRAFT_STALE",
             f"the draft #{draft} was edited in WordPress after it was pushed "
@@ -5762,7 +5775,7 @@ def cmd_push(args):
                  "parent": after.get("parent"), "link": after["link"],
                  "status": after["status"],
                  "modified_gmt": after["modified_gmt"], "post_type": post_type,
-                 "body_sha": body_sha(html),
+                 "body_sha": body_sha(html), "js_sha": body_sha(page_js(out)),
                  "pushed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
         write_wp_meta(out, final)
 

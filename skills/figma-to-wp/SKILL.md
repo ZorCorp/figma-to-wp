@@ -1058,8 +1058,8 @@ there.
 
    The user checks it logged in at `?page_id=N&preview=true`. Nothing goes
    further until they say it is right. The draft push records the sha of the
-   body it sent (`wp.json` → `body_sha`) and the draft's `modified_gmt`:
-   `--replace` swaps in exactly that. Change the build, an asset, or the draft
+   body it sent (`wp.json` → `body_sha`), of `page.js` (`js_sha`) and the draft's `modified_gmt`:
+   `--replace` swaps in exactly that. Change the build, an asset, `page.js`, or the draft
    in WordPress after the sign-off, and the draft is pushed and reviewed again.
 
 2. **Replace.** Then, and only then:
