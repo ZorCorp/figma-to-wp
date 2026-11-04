@@ -12,7 +12,12 @@ function cls(el){
 function fwMeasure(){
   var out=[], secs=[], seen=new Set(),
       root=document.querySelector('[data-fw-root]')||document.querySelector('.mc-page')||document.body;
-  root.querySelectorAll('section,[data-section]').forEach(function(el){
+  // On an Elementor snapshot the root is [data-fw-root] and only its
+  // top-level sections carry data-section. Its legacy inner sections are real
+  // <section> elements too; counting them (or stopping sectionOf at one)
+  // labels runs "elementor-section" instead of the "s<n>" inventory() uses.
+  var secSel=root.hasAttribute&&root.hasAttribute('data-fw-root')?'[data-section]':'section,[data-section]';
+  root.querySelectorAll(secSel).forEach(function(el){
     var r=el.getBoundingClientRect();
     if(r.height>40) secs.push({
       name:(el.getAttribute('data-section')||(el.getAttribute('class')||'').split(' ')[0]||'section'),
@@ -21,7 +26,7 @@ function fwMeasure(){
   function sectionOf(el){
     var p=el;
     while(p&&p!==root){
-      if(p.tagName==='SECTION'||p.hasAttribute('data-section'))
+      if(p.hasAttribute('data-section')||(p.tagName==='SECTION'&&secSel!=='[data-section]'))
         return (p.getAttribute('data-section')||(p.getAttribute('class')||'').split(' ')[0]||'section');
       p=p.parentElement;
     }

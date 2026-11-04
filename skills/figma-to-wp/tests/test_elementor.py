@@ -1,4 +1,4 @@
-import contextlib, io, json, os, shutil, sys, tempfile, unittest
+import contextlib, io, json, os, re, shutil, sys, tempfile, unittest
 from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -551,7 +551,7 @@ class ElementorSnapshot(unittest.TestCase):
 
     def test_snapshot_marks_root_and_sections(self):
         s = self.snap()
-        self.assertEqual(s.count("data-fw-root"), 1)
+        self.assertEqual(len(re.findall(r"<[^>]*\sdata-fw-root[\s>=]", s)), 1)
         self.assertIn('<div data-fw-root data-elementor-type="wp-page" data-elementor-id="1234"', s)
         for n in (1, 2, 3):
             self.assertEqual(s.count('data-section="s%d"' % n), 1, n)
@@ -653,6 +653,35 @@ class ElementorServeLive(unittest.TestCase):
         with mock.patch("urllib.request.urlopen", side_effect=urllib.error.URLError("down")):
             status, _, _ = self.get("/x")
         self.assertEqual(status, 502)
+
+
+@unittest.skipUnless(any(os.path.exists(c) for c in fw.CHROME), "Chrome not installed")
+class MeasureJsInSnapshot(unittest.TestCase):
+    """Run the real measure.js over a snapshot in headless Chrome."""
+
+    def test_inner_section_runs_are_labelled_with_the_top_section(self):
+        html = ('<html><head></head><body>'
+                '<div data-elementor-type="wp-page" data-elementor-id="5">'
+                '<section class="elementor-section elementor-top-section" data-element_type="section">'
+                '<div class="elementor-container"><div class="elementor-column" data-element_type="column">'
+                '<section class="elementor-section elementor-inner-section" data-element_type="section">'
+                '<div style="height:120px"><p>Inside the inner section</p></div></section>'
+                '</div></div></section></div></body></html>')
+        with open(os.path.join(HERE, "..", "scripts", "measure.js"), encoding="utf-8") as f:
+            js = f.read()
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with open(os.path.join(tmp, "live.html"), "w", encoding="utf-8") as f:
+            f.write(el.snapshot(html, "https://example.test", 5, js))
+        srv = fw.serve_dir(tmp)
+        self.addCleanup(fw.stop_server, srv)
+        dom = fw.dump_dom("http://127.0.0.1:%d/live.html" % srv.server_address[1], width=800)
+        m = re.search(r'<script type="application/json" id="fw-measure">(.*?)</script>', dom, re.S)
+        self.assertTrue(m, "no fw-measure block in the DOM")
+        data = json.loads(m.group(1))
+        self.assertEqual([x["name"] for x in data["sections"]], ["s1"])
+        run = [r for r in data["runs"] if "inner section" in r["text"]][0]
+        self.assertEqual(run["sec"], "s1")
 
 
 class MeasureJs(unittest.TestCase):
