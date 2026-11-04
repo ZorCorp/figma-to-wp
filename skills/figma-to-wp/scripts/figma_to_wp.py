@@ -3564,6 +3564,70 @@ def ability(name, payload, creds=None):
               body={"input": payload}, creds=creds)
 
 
+def ability_destructive(name, payload, creds=None):
+    """Run an ability the site marks destructive.
+
+    Those refuse POST (rest_ability_invalid_method) and a JSON `input=` param
+    ("not of type object"); they want DELETE with the input spelled as
+    bracketed query params, input[key]=value.
+    """
+    qs = "&".join(f"input[{k}]={urllib.parse.quote(str(v), safe='')}"
+                  for k, v in payload.items())
+    return wp("DELETE", f"/wp-json/wp-abilities/v1/abilities/{name}/run?{qs}",
+              creds=creds)
+
+
+def get_meta(post_id, key, creds=None):
+    """One post meta value via mc/get-meta, or None if the answer has none.
+
+    The ability's input is {post_id: integer (required), meta_key: string}.
+    Its output_schema is empty, so the value's field name is not documented:
+    take `value` (or `meta_value`), inside {"output": {...}} or flat — the
+    same two shapes push accepts for a created post's id.
+    """
+    res = ability("mc/get-meta", {"post_id": int(post_id), "meta_key": key},
+                  creds=creds)
+    o = res.get("output") or res if isinstance(res, dict) else {}
+    for field in ("value", "meta_value"):
+        if o.get(field) is not None:
+            return str(o[field])
+    return None
+
+
+def set_meta(post_id, key, value, creds=None):
+    """Write one post meta value. ewpa/update-post-meta is destructive, so it
+    goes through ability_destructive."""
+    ability_destructive("ewpa/update-post-meta",
+                        {"post_id": int(post_id), "meta_key": key,
+                         "meta_value": value}, creds=creds)
+
+
+def wpml_languages(creds=None):
+    """The site's WPML language codes, read off the home page's hreflang links.
+
+    A public front-end page, not REST, so no auth header. WPML gives each
+    language a URL prefix (/zh-hk/); the default language has none, which is
+    `en` here. x-default repeats one of the others and is skipped.
+    """
+    base = creds[0] if creds else wp_creds()[0]
+    with urllib.request.urlopen(
+            urllib.request.Request(base + "/", headers={"User-Agent": UA}),
+            timeout=60) as r:
+        html = r.read().decode("utf-8", "replace")
+    langs = []
+    for tag in re.findall(r"<link\b[^>]*>", html, re.I):
+        attr = {k.lower(): v for k, _, v in
+                re.findall(r'([\w-]+)\s*=\s*(["\'])(.*?)\2', tag)}
+        if attr.get("rel", "").lower() != "alternate" or \
+                attr.get("hreflang", "").lower() in ("", "x-default"):
+            continue
+        seg = urllib.parse.urlparse(attr.get("href", "")).path.strip("/").split("/")[0]
+        code = (seg or "en").lower()
+        if code not in langs:
+            langs.append(code)
+    return langs
+
+
 def cmd_setup(args):
     os.makedirs(HOME, mode=0o700, exist_ok=True)
     tok = env("FIGMA_TOKEN") or die("NO_FIGMA_TOKEN", f"put FIGMA_TOKEN in {HOME}/.env")
