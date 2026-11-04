@@ -382,6 +382,301 @@ class PushElementor(unittest.TestCase):
         self.assertNotIn("assets/a.png", html)
 
 
+def identity_page(title="Example", desc="About it", canon="https://x/example/",
+                  alts=(("en", "https://x/example/"), ("zh-hk", "https://x/zh-hk/example/")),
+                  body="", head=""):
+    links = "".join(f'<link rel="alternate" hreflang="{c}" href="{h}" />' for c, h in alts)
+    return (f'<html><head><title>{title}</title>'
+            f'<meta name="description" content="{desc}">'
+            f'<link rel="canonical" href="{canon}" />{links}{head}</head>'
+            f'<body>{body}</body></html>')
+
+
+class PushReplace(unittest.TestCase):
+    """push usage B: --replace swaps a live Elementor page for the reviewed
+    draft. Everything that touches the site is mocked."""
+
+    ORIG, DRAFT = 50, 60
+    STAMP = "2026-02-02T00:00:00"
+    META = {"_elementor_edit_mode": "builder", "_elementor_data": '[{"id":"a"}]',
+            "_elementor_page_settings": {"hide_title": "yes"},
+            "_wp_page_template": "elementor_header_footer", "_elementor_version": "3.2"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cwd = os.getcwd()
+        os.chdir(self.tmp)
+        self.addCleanup(os.chdir, self.cwd)
+        self.build = os.path.join(self.tmp, "build")
+        self.out = os.path.join(self.build, "p")
+        os.makedirs(self.out)
+        with open(os.path.join(self.out, "page.html"), "w") as fh:
+            fh.write('<!-- wp:html -->\n<div class="mc-page gehk-page"><p>a</p></div>\n'
+                     '<!-- /wp:html -->\n')
+        self.write_design()
+        self.write_wp_json()
+        self.calls = []
+        self.orig_mod = self.STAMP
+        self.metas = {k: (dict(v) if isinstance(v, dict) else v)
+                      for k, v in self.META.items()}
+        self.fetched = [identity_page(body='<div class="elementor">x</div>'),
+                        identity_page(body='<div class="mc-page gehk-page">a</div>')]
+        self.backup_seen = None
+        for name, repl in (
+                ("BUILD", self.build),
+                ("wp_creds", lambda: ("https://x", "u", "p")),
+                ("wpml_languages", lambda creds=None: ["en", "zh-hant", "zh-hk"]),
+                ("run_checks", lambda out, **kw: ([], [])),
+                ("wp", self.fake_wp), ("ability", self.fake_ability),
+                ("get_meta", self.fake_get_meta), ("set_meta", self.fake_set_meta),
+                ("fetch_live", self.fake_fetch_live)):
+            p = mock.patch.object(fw, name, repl)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def write_design(self, **source):
+        src = {"type": "elementor", "post_id": self.ORIG, "url": "https://x/example/",
+               "modified_gmt": self.STAMP}
+        src.update(source)
+        with open(os.path.join(self.out, "design.json"), "w") as fh:
+            json.dump({"source": src, "texts": []}, fh)
+
+    def write_wp_json(self, **extra):
+        meta = {"post_id": self.DRAFT, "post_type": "page", "slug": "p-draft",
+                "status": "draft", "modified_gmt": "2026-03-03T00:00:00"}
+        meta.update(extra)
+        meta = {k: v for k, v in meta.items() if v is not None}
+        with open(os.path.join(self.out, "wp.json"), "w") as fh:
+            json.dump(meta, fh)
+
+    def backups(self):
+        d = os.path.join(self.out, "backups")
+        return sorted(f for f in os.listdir(d) if "elementor" in f) \
+            if os.path.isdir(d) else []
+
+    def note_write(self, what):
+        # the first write must find the Elementor backup already on disk
+        if self.backup_seen is None:
+            self.backup_seen = self.backups()
+        self.calls.append(what)
+
+    def fake_wp(self, method, path, **kw):
+        if method == "GET":
+            self.calls.append((method, path))
+            return {"id": self.ORIG, "slug": "example", "status": "publish",
+                    "link": "https://x/example/", "title": {"raw": "Example"},
+                    "parent": 0, "modified_gmt": self.orig_mod,
+                    "content": {"raw": "<p>old</p>", "rendered": "<p>old</p>"}}
+        self.note_write((method, path))
+        return {"id": 9, "source_url": "https://x/u.png"}
+
+    def fake_ability(self, name, payload, creds=None):
+        self.note_write((name, payload))
+        return {}
+
+    def fake_get_meta(self, post_id, key, creds=None):
+        self.calls.append(("get_meta", key))
+        return self.metas.get(key)
+
+    def fake_set_meta(self, post_id, key, value, creds=None):
+        self.note_write(("set_meta", key, value))
+        self.metas[key] = value
+
+    def fake_fetch_live(self, url):
+        self.calls.append(("fetch_live", url))
+        return url, self.fetched.pop(0)
+
+    def args(self, **kw):
+        a = dict(slug="p", title=None, parent=None, parent_path=None, page_slug=None,
+                 post_id=None, language="en", force=False, no_webp=True,
+                 post_type="page", category=[], region=[], translation_of=None,
+                 replace=self.ORIG)
+        a.update(kw)
+        return type("A", (), a)()
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+    def replace(self, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            fw.cmd_push(self.args(**kw))
+        return buf.getvalue()
+
+    def dies(self, code, **kw):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaises(SystemExit):
+            fw.cmd_push(self.args(**kw))
+        self.assertIn(code, err.getvalue())
+        return err.getvalue()
+
+    def no_writes(self):
+        self.assertFalse([c for c in self.calls
+                          if c[0] in ("mc/set-post-html", "set_meta", "POST", "PUT",
+                                      "DELETE") or c[0].startswith("ewpa/")])
+        self.assertEqual(self.backups(), [])
+
+    def wp_json(self):
+        with open(os.path.join(self.out, "wp.json")) as fh:
+            return json.load(fh)
+
+    def test_replace_refuses_without_draft(self):
+        self.write_wp_json(post_id=None)
+        self.dies("REPLACE_NO_DRAFT")
+        self.no_writes()
+
+    def test_replace_refuses_when_draft_is_original(self):
+        self.write_wp_json(post_id=self.ORIG)
+        self.dies("REPLACE_DRAFT_IS_ORIGINAL")
+        self.no_writes()
+
+    def test_replace_refuses_when_already_replaced(self):
+        self.write_wp_json(replaced={"draft": 1, "backup": "x"})
+        self.dies("ALREADY_REPLACED")
+        self.no_writes()
+
+    def test_replace_refuses_other_page_than_the_source(self):
+        self.write_design(post_id=999)
+        self.dies("REPLACE_WRONG_PAGE")
+        self.no_writes()
+
+    def test_replace_refuses_when_original_moved_on(self):
+        self.orig_mod = "2026-04-04T00:00:00"
+        self.dies("PAGE_MOVED_ON")
+        self.no_writes()
+
+    def test_replace_moved_on_is_not_forced_past(self):
+        self.orig_mod = "2026-04-04T00:00:00"
+        self.dies("PAGE_MOVED_ON", force=True)
+        self.no_writes()
+
+    def test_replace_refuses_with_post_id_or_translation_of(self):
+        self.dies("REPLACE_CONFLICT", post_id=7)
+        self.dies("REPLACE_CONFLICT", translation_of=7)
+        self.no_writes()
+
+    def test_replace_backs_up_before_any_write(self):
+        self.replace()
+        self.assertEqual(len(self.backup_seen), 1)
+        path = os.path.join(self.out, "backups", self.backup_seen[0])
+        self.assertTrue(self.backup_seen[0].startswith(f"{self.ORIG}-elementor-"))
+        with open(path) as fh:
+            b = json.load(fh)
+        self.assertEqual((b["post_id"], b["modified_gmt"], b["content_raw"]),
+                         (self.ORIG, self.STAMP, "<p>old</p>"))
+        for k, v in self.META.items():
+            self.assertEqual(b["meta"][k], v)              # dict stays a dict
+        self.assertEqual(set(b["meta"]), set(fw.ELEMENTOR_META))
+        self.assertIsNone(b["meta"]["_elementor_css"])     # absent stays null
+
+    def test_replace_clears_edit_mode_only(self):
+        self.replace()
+        sets = [c for c in self.calls if c[0] == "set_meta"]
+        self.assertEqual(sets, [("set_meta", "_elementor_edit_mode", "")])
+
+    def test_replace_writes_the_normal_push_body_to_the_original(self):
+        self.replace()
+        body = [c for c in self.calls if c[0] == "mc/set-post-html"][0][1]
+        self.assertEqual(body["post_id"], self.ORIG)
+        self.assertIn("gehk-page", body["content"])
+        self.assertIn(("POST", f"/wp-json/wp/v2/pages/{self.ORIG}"), self.calls)  # page js
+        self.assertFalse([c for c in self.calls if c[0] == "mc/create-localized-page"])
+
+    def test_replace_dies_on_identity_change(self):
+        self.fetched[1] = identity_page(title="Other", body='<div class="gehk-page">a</div>')
+        err = self.dies("IDENTITY_CHANGED")
+        self.assertIn("elementor-restore", err)
+        self.assertIn("title", err)
+        self.assertNotIn(("DELETE", f"/wp-json/wp/v2/pages/{self.DRAFT}"), self.calls)
+        self.assertEqual(self.wp_json()["post_id"], self.DRAFT)
+
+    def test_replace_dies_on_lost_hreflang(self):
+        self.fetched[1] = identity_page(alts=(("en", "https://x/example/"),),
+                                        body='<div class="gehk-page">a</div>')
+        self.assertIn("hreflang", self.dies("IDENTITY_CHANGED"))
+
+    def test_replace_dies_when_front_end_still_elementor(self):
+        self.fetched[1] = identity_page(body='<div class="elementor">x</div>')
+        self.dies("STILL_ELEMENTOR")
+        self.assertNotIn(("DELETE", f"/wp-json/wp/v2/pages/{self.DRAFT}"), self.calls)
+
+    def test_replace_trashes_draft_and_rewrites_wp_json(self):
+        self.replace()
+        n = self.calls
+        purge = ("PUT", "/wp-json/siteground-optimizer/v1/purge-cache")
+        trash = ("DELETE", f"/wp-json/wp/v2/pages/{self.DRAFT}")   # no ?force
+        self.assertIn(purge, n)
+        self.assertIn(trash, n)
+        self.assertLess(n.index(("set_meta", "_elementor_edit_mode", "")), n.index(purge))
+        self.assertLess(n.index(purge), [i for i, c in enumerate(n)
+                                         if c[0] == "fetch_live"][1])
+        self.assertLess(n.index(purge), n.index(trash))
+        w = self.wp_json()
+        self.assertEqual(w["post_id"], self.ORIG)
+        self.assertEqual(w["replaced"]["draft"], self.DRAFT)
+        self.assertTrue(os.path.isfile(w["replaced"]["backup"]))
+        self.assertEqual(w["modified_gmt"], self.orig_mod)
+        self.assertEqual(w["slug"], "example")
+
+    def test_replace_front_end_fetch_is_cache_busted_after_purge(self):
+        self.replace()
+        urls = [c[1] for c in self.calls if c[0] == "fetch_live"]
+        self.assertEqual(urls[0], "https://x/example/")
+        self.assertRegex(urls[1], r"^https://x/example/\?[\w=.-]+$")
+
+    def test_replace_tolerates_a_style_block_before_the_json(self):
+        real = self.fake_wp
+
+        def styled(method, path, **kw):
+            r = real(method, path, **kw)
+            return "<style>.x{}</style>" + json.dumps(r) if method == "GET" else r
+        with mock.patch.object(fw, "wp", styled):
+            self.replace()
+        self.assertEqual(self.wp_json()["post_id"], self.ORIG)
+
+    def test_backup_failure_stops_everything(self):
+        with open(os.path.join(self.out, "backups"), "w") as fh:
+            fh.write("a file, not a folder")
+        self.dies("BACKUP_FAILED")
+        self.assertNotIn("mc/set-post-html", self.names())
+        self.assertNotIn("set_meta", self.names())
+
+    def test_backup_elementor_dies_when_read_back_differs(self):
+        real = json.load
+
+        def tampered(fh):
+            d = real(fh)
+            d["content_raw"] = "different"
+            return d
+        with mock.patch.object(fw, "wp", self.fake_wp), \
+                mock.patch.object(fw.json, "load", tampered), \
+                contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit):
+            fw.backup_elementor(self.ORIG, self.out, creds=("https://x", "u", "p"))
+        self.assertIn("BACKUP_FAILED", err.getvalue())
+
+    def test_public_identity_reads_title_description_hreflang_canonical(self):
+        self.fetched = [identity_page()]
+        self.assertEqual(fw.public_identity("https://x/example/"), {
+            "title": "Example", "description": "About it",
+            "hreflang": {"en": "https://x/example/",
+                         "zh-hk": "https://x/zh-hk/example/"},
+            "canonical": "https://x/example/"})
+
+    def test_plain_update_of_builder_page_still_refused(self):
+        self.write_wp_json(post_id=self.ORIG, modified_gmt=self.STAMP)
+        self.dies("ELEMENTOR_PAGE", replace=None)
+        self.no_writes()
+
+    def test_argparse_replace_is_an_int(self):
+        with mock.patch.object(sys, "argv", ["figma_to_wp", "push", "p", "--replace", "50"]), \
+                mock.patch.object(fw, "cmd_push") as cp:
+            fw.main()
+        self.assertEqual(cp.call_args[0][0].replace, 50)
+
+
 MINI = os.path.join(HERE, "fixtures", "elementor-mini")
 
 
